@@ -22,6 +22,7 @@ echo "================================"
 # Environment setup (uncomment and modify as needed)
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate mezo
+pip install evaluate
 # module load python/3.8
 # module load cuda/11.7
 
@@ -47,16 +48,20 @@ MODEL_NAME="facebook/opt-125m"
 EPOCHS=1
 BATCH_SIZE=16  # Small for testing
 MAX_LENGTH=512  # Short for speed
-LR=1e-3
+LR=1e-1
 ZOO_LR=1e-2
 EPS=1e-1        # ZOO epsilon (perturbation scale)
 SEED=0          # Random seed
-TRAIN=1000      # Training examples
+TRAIN=2000      # Training examples
 DEV=500         # Dev examples
-EVAL=1000       # Evaluation examples
+EVAL=2000       # Evaluation examples
 STEPS=2000      # Training steps
 EVAL_STEPS=2000 # Evaluation steps
 NUM_PERT=10
+NUM_PREFIX=5
+DATASET="xsum"
+FT_TASK="prefix"
+SEED=0
 
 
 echo "Configuration:"
@@ -65,10 +70,12 @@ echo "   Epochs: $EPOCHS"
 echo "   Batch Size: $BATCH_SIZE"
 echo "   Max Length: $MAX_LENGTH"
 echo "   Learning Rate: $LR"
-echo ""
+echo "   Dataset: $DATASET"
+echo "   Fine Tuning: $FT_TASK"
 
 # Start server in background
 echo "Starting server..."
+
 python3 server.py \
     --model_name $MODEL_NAME \
     --epochs $EPOCHS \
@@ -76,16 +83,13 @@ python3 server.py \
     --train_batch_size $BATCH_SIZE \
     --test_batch_size $BATCH_SIZE \
     --max_length $MAX_LENGTH \
-    --zoo_lr $ZOO_LR \
-    --use_zeroth_order \
-    --seed 0 \
-    --train_examples $TRAIN \
-    --dev_examples $DEV \
-    --eval_examples $EVAL \
+    --lr $LR \
+    --seed $SEED \
+    --task $DATASET \
     --max_steps $STEPS \
     --eval_steps $EVAL_STEPS \
-    --use_zeroth_order \
-    --num_pert $NUM_PERT &    
+    --tuning_mode $FT_TASK \
+    --num_prefix $NUM_PREFIX &
 
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -113,8 +117,11 @@ python3 client.py \
     --test_batch_size $BATCH_SIZE \
     --max_length $MAX_LENGTH \
     --lr $LR \
-    --seed 0 \
-    --max_steps $STEPS
+    --seed $SEED \
+    --max_steps $STEPS \
+    --tuning_mode $FT_TASK \
+    --num_prefix $NUM_PREFIX \
+    --task $DATASET &
 
 CLIENT_EXIT_CODE=$?
 

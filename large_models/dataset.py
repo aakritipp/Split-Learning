@@ -6,201 +6,12 @@ import json
 import re
 from collections import Counter
 import string
-from enum import Enum
-from functools import cached_property
-from pydantic import Field, AliasChoices
-from pydantic_settings import BaseSettings, CliImplicitFlag, SettingsConfigDict
 
 
-class LmGenerationTask(Enum):
-    squad = "squad"
-    drop = "drop" 
-    xsum = "xsum"
-
-
-class LmClassificationTask(Enum):
-    sst2 = "sst2"
-
-
-# Dataset mapping for different tasks
-LM_DATASET_MAP = {
-    "squad": "squad",
-    "drop": "drop", 
-    "xsum": "xsum",
-    "sst2": "glue"
-}
-
-
-class BaseTemplate:
-    """Base template class for different tasks"""
-    def verbalize(self, example):
-        raise NotImplementedError
-    
-    def encode(self, example):
-        raise NotImplementedError
-
-
-class SQuADTemplate(BaseTemplate):
-    def verbalize(self, example):
-        context = example['context']
-        question = example['question']
-        if isinstance(example['answers']['text'], list) and len(example['answers']['text']) > 0:
-            answer = example['answers']['text'][0]
-        else:
-            answer = ""
-        return f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
-    
-    def encode(self, example):
-        context = example['context']
-        question = example['question']
-        return f"Context: {context}\nQuestion: {question}\nAnswer:"
-
-
-class DropTemplate(BaseTemplate):
-    def verbalize(self, example):
-        passage = example['passage']
-        question = example['question']
-        if isinstance(example['answers_spans']['spans'], list) and len(example['answers_spans']['spans']) > 0:
-            answer = example['answers_spans']['spans'][0]
-        else:
-            answer = ""
-        return f"Passage: {passage}\nQuestion: {question}\nAnswer: {answer}"
-    
-    def encode(self, example):
-        passage = example['passage']
-        question = example['question']
-        return f"Passage: {passage}\nQuestion: {question}\nAnswer:"
-
-
-class XSumTemplate(BaseTemplate):
-    def verbalize(self, example):
-        document = example['document']
-        summary = example['summary']
-        return f"Document: {document}\nSummary: {summary}"
-    
-    def encode(self, example):
-        document = example['document']
-        return f"Document: {document}\nSummary:"
-
-
-class SST2Template(BaseTemplate):
-    def verbalize(self, example):
-        sentence = example['sentence']
-        label = "positive" if example['label'] == 1 else "negative"
-        return f"Sentence: {sentence}\nSentiment: {label}"
-    
-    def encode(self, example):
-        sentence = example['sentence']
-        return f"Sentence: {sentence}\nSentiment:"
-
-
-# Template mapping
-LM_TEMPLATE_MAP = {
-    "squad": SQuADTemplate,
-    "drop": DropTemplate,
-    "xsum": XSumTemplate,
-    "sst2": SST2Template
-}
-
-
-class CustomLMDataset(Dataset):
-    """Dataset for language modeling tasks (classification/generation)"""
-    def __init__(self, texts, tokenizer, max_length=512):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': encoding['input_ids'].squeeze()
-        }
-
-
-class CustomLMGenerationDataset(Dataset):
-    """Dataset specifically for generation tasks with separate inputs and gold outputs"""
-    def __init__(self, input_texts, gold_outputs, tokenizer, max_length=512):
-        self.input_texts = input_texts
-        self.gold_outputs = gold_outputs
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.input_texts)
-    
-    def __getitem__(self, idx):
-        input_text = self.input_texts[idx]
-        gold_output = self.gold_outputs[idx]
-        
-        # Encode input text
-        encoding = self.tokenizer(
-            input_text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': encoding['input_ids'].squeeze(),
-            'gold_output': gold_output,
-            'input_text': input_text
-        }
-
-
-def get_collate_fn(tokenizer, max_length):
-    """Collate function for batching"""
-    def collate_fn(batch):
-        return {
-            'input_ids': torch.stack([item['input_ids'] for item in batch]),
-            'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-            'labels': torch.stack([item['labels'] for item in batch])
-        }
-    return collate_fn
-
-
-def get_collate_fn_for_gen_model(tokenizer, max_length):
-    """Collate function for generation models"""
-    def collate_fn(batch):
-        return {
-            'input_ids': torch.stack([item['input_ids'] for item in batch]),
-            'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-            'labels': torch.stack([item['labels'] for item in batch]),
-            'gold_outputs': [item['gold_output'] for item in batch],
-            'input_texts': [item['input_text'] for item in batch]
-        }
-    return collate_fn
-
-
-def get_hf_tokenizer(model_name):
-    """Get HuggingFace tokenizer"""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
-
-# Legacy SQuAD functions for backward compatibility
 class SQuADDataset(Dataset):
     """
-    SQuAD dataset for question answering with MeZO-style formatting
-    Formats data as: "Context: ... Question: ... Answer: ..."
+    KEEP YOUR EXISTING SQUAD DATASET CLASS EXACTLY AS IS
+    This is your working version - don't change it!
     """
     def __init__(self, split='train', tokenizer=None, max_length=512, num_examples=None):
         self.tokenizer = tokenizer
@@ -235,7 +46,9 @@ class SQuADDataset(Dataset):
                 'context': context,
                 'question': question,
                 'answer': answer,
-                'id': example['id']
+                'id': example['id'],
+                'formatted_text': formatted_text,  # Add this for consistency
+                'original_example': example  # Add this for metrics
             })
         
         print(f"Loaded {len(self.examples)} SQuAD examples")
@@ -261,10 +74,199 @@ class SQuADDataset(Dataset):
             'attention_mask': encoding['attention_mask'].squeeze(),
             'labels': encoding['input_ids'].squeeze(),  # For language modeling
             'example_id': example['id'],
-            'answer': example['answer']
+            'answer': example['answer'],
+            'formatted_text': example['formatted_text'],
+            'original_example': example['original_example']
         }
 
 
+class MultiTaskDataset(Dataset):
+    """
+    NEW: Multi-task dataset that maintains SQuAD compatibility
+    """
+    def __init__(self, task='squad', split='train', tokenizer=None, max_length=512, num_examples=None):
+        self.task = task
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+        print(f"Loading {task.upper()} {split} dataset...")
+        
+        if task == 'squad':
+            # Use existing SQuAD logic - don't change!
+            dataset = load_dataset('squad', split=split)
+        elif task == 'drop':
+            dataset = load_dataset('drop', split=split)
+        elif task == 'xsum':
+            # Fix XSum dataset loading to follow reference pattern
+            try:
+                # Try the standard XSum dataset first
+                dataset = load_dataset('EdinburghNLP/xsum', split='train' if split == 'train' else 'test')
+            except:
+                try:
+                    # Try alternative XSum loading
+                    dataset = load_dataset('xsum', split='train' if split == 'train' else 'test', revision='main')
+                except:
+                    # Last resort: try CNN/DailyMail
+                    print(f"Warning: XSum loading failed, using CNN/DailyMail as fallback")
+                    dataset = load_dataset('cnn_dailymail', '3.0.0', split='train' if split == 'train' else 'test')
+        elif task == 'sst2':
+            dataset = load_dataset('glue', 'sst2', split='train' if split == 'train' else 'validation')
+        else:
+            raise ValueError(f"Task {task} not supported")
+        
+        if num_examples:
+            dataset = dataset.select(range(min(num_examples, len(dataset))))
+        
+        self.examples = []
+        print(f"Processing {len(dataset)} {task} examples...")
+        
+        for example in dataset:
+            formatted_example = self._format_example(example, task)
+            self.examples.append(formatted_example)
+        
+        print(f"Loaded {len(self.examples)} {task} examples")
+    
+    def _format_example(self, example, task):
+        """Format example based on task - maintains SQuAD format structure"""
+        if task == 'squad':
+            # EXACT same formatting as your working version
+            context = example['context']
+            question = example['question']
+            
+            if isinstance(example['answers']['text'], list) and len(example['answers']['text']) > 0:
+                answer = example['answers']['text'][0]
+            else:
+                answer = ""
+            
+            formatted_text = f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
+            
+            return {
+                'text': formatted_text,
+                'context': context,
+                'question': question,
+                'answer': answer,
+                'id': example['id'],
+                'formatted_text': formatted_text,
+                'original_example': example
+            }
+            
+        elif task == 'drop':
+            # Similar format to SQuAD
+            passage = example['passage']
+            question = example['question']
+            
+            # DROP has different answer structure - debug first few examples
+            if len(self.examples) < 3:
+                print(f"DEBUG DROP example {len(self.examples)}: keys = {list(example.keys())}")
+                if 'answers_spans' in example:
+                    print(f"  answers_spans keys: {list(example['answers_spans'].keys())}")
+                    print(f"  answers_spans content: {example['answers_spans']}")
+            
+            # Extract answer from DROP format
+            answer = ""
+            if 'answers_spans' in example and 'spans' in example['answers_spans']:
+                spans = example['answers_spans']['spans']
+                if isinstance(spans, list) and len(spans) > 0:
+                    answer = spans[0]  # Take first span
+            elif 'answer' in example:
+                # Some DROP examples might have direct answer field
+                answer = example['answer']
+            
+            formatted_text = f"Context: {passage}\nQuestion: {question}\nAnswer: {answer}"
+            
+            return {
+                'text': formatted_text,
+                'context': passage,
+                'question': question,
+                'answer': answer,
+                'id': example.get('query_id', ''),
+                'formatted_text': formatted_text,
+                'original_example': example
+            }
+            
+        elif task == 'xsum':
+            # Handle XSum format following reference implementation pattern
+            # XSum: 'document' and 'summary' fields
+            # CNN/DailyMail fallback: 'article' and 'highlights' fields
+            
+            if 'document' in example:
+                # Standard XSum format
+                document = example['document']
+                summary = example['summary']
+            elif 'article' in example:
+                # CNN/DailyMail fallback format
+                document = example['article'] 
+                summary = example['highlights']
+            else:
+                # Debug unknown format
+                if len(self.examples) < 3:
+                    print(f"DEBUG XSum example {len(self.examples)}: keys = {list(example.keys())}")
+                raise ValueError(f"Unknown XSum format - available keys: {list(example.keys())}")
+            
+            # Use simple Document/Summary format like reference templates
+            formatted_text = f"Document: {document}\nSummary: {summary}"
+            
+            return {
+                'text': formatted_text,
+                'context': document,
+                'question': '',
+                'answer': summary,
+                'id': example.get('id', example.get('idx', '')),
+                'formatted_text': formatted_text,
+                'original_example': example
+            }
+            
+        elif task == 'sst2':
+            sentence = example['sentence']
+            label = example['label']  # 0 = negative, 1 = positive
+            
+            # Use completion format inspired by reference templates
+            # This is much more natural for language models than classification format
+            verbalizer = {0: "terrible", 1: "great"}  # Maps labels to completion words
+            completion_word = verbalizer[label]
+            
+            # Format: "Sentence It was word" instead of "Sentence: X\nSentiment: label"
+            formatted_text = f"{sentence} It was {completion_word}"
+            
+            return {
+                'text': formatted_text,
+                'context': sentence,
+                'question': '',
+                'answer': completion_word,  # Use completion word as answer
+                'id': example.get('idx', ''),
+                'formatted_text': formatted_text,
+                'original_example': example  # Keep original for ground truth mapping
+            }
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        example = self.examples[idx]
+        text = example['text']
+        
+        # Same tokenization as your working SQuAD version
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        # Return SAME structure as working SQuAD version
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'labels': encoding['input_ids'].squeeze(),
+            'example_id': example['id'],
+            'answer': example['answer'],
+            'formatted_text': example['formatted_text'],
+            'original_example': example['original_example']
+        }
+
+
+# KEEP your existing functions exactly as they are
 def normalize_answer(s):
     """Normalize answer for F1 computation (from SQuAD evaluation script)"""
     def remove_articles(text):
@@ -309,274 +311,114 @@ def exact_match_score(prediction, ground_truth):
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
 
-def get_lm_dataloaders(task, tokenizer, train_batch_size=2, test_batch_size=2, 
-                       max_length=512, num_train_examples=1000, num_eval_examples=200, seed=42):
+# NEW: Enhanced dataloader function that maintains backward compatibility
+def get_enhanced_dataloaders(task='squad', tokenizer=None, train_batch_size=2, test_batch_size=2, 
+                           max_length=512, num_train_examples=1000, num_eval_examples=200):
     """
-    Create dataloaders for various LM tasks (classification and generation)
+    Enhanced version that supports multiple tasks but maintains SQuAD compatibility
     """
+    if task == 'squad':
+        # Use your existing working SQuAD logic
+        train_dataset = SQuADDataset('train', tokenizer, max_length, num_train_examples)
+        test_dataset = SQuADDataset('validation', tokenizer, max_length, num_eval_examples)
+    else:
+        # Use new multi-task dataset for other tasks
+        train_dataset = MultiTaskDataset(task, 'train', tokenizer, max_length, num_train_examples)
+        test_dataset = MultiTaskDataset(task, 'validation', tokenizer, max_length, num_eval_examples)
     
-    if isinstance(task, str):
-        if task in ["squad", "drop", "xsum"]:
-            task = LmGenerationTask(task)
-        elif task in ["sst2"]:
-            task = LmClassificationTask(task)
-        else:
-            raise ValueError(f"Unknown task: {task}")
+    # Use your existing collate function
+    def squad_collate_fn(batch):
+        input_ids = []
+        attention_masks = []
+        labels = []
+        formatted_texts = []
+        original_examples = []
+        
+        for item in batch:
+            input_ids.append(item['input_ids'])
+            attention_masks.append(item['attention_mask'])
+            labels.append(item['labels'])
+            formatted_texts.append(item['formatted_text'])
+            original_examples.append(item['original_example'])
+        
+        return {
+            'input_ids': torch.stack(input_ids),
+            'attention_mask': torch.stack(attention_masks),
+            'labels': torch.stack(labels),
+            'formatted_text': formatted_texts,
+            'original_example': original_examples
+        }
     
-    # Load dataset
-    if task.value == "squad":
-        dataset = load_dataset(LM_DATASET_MAP[task.value])
-        raw_train_dataset = dataset["train"].select(range(min(num_train_examples, len(dataset["train"])))).shuffle(seed)
-        raw_test_dataset = dataset["validation"].select(range(min(num_eval_examples, len(dataset["validation"])))).shuffle(seed)
-    elif task.value == "drop":
-        dataset = load_dataset(LM_DATASET_MAP[task.value])
-        raw_train_dataset = dataset["train"].select(range(min(num_train_examples, len(dataset["train"])))).shuffle(seed)
-        raw_test_dataset = dataset["validation"].select(range(min(num_eval_examples, len(dataset["validation"])))).shuffle(seed)
-    elif task.value == "xsum":
-        dataset = load_dataset(LM_DATASET_MAP[task.value])
-        raw_train_dataset = dataset["train"].select(range(min(num_train_examples, len(dataset["train"])))).shuffle(seed)
-        raw_test_dataset = dataset["test"].select(range(min(num_eval_examples, len(dataset["test"])))).shuffle(seed)
-    elif task.value == "sst2":
-        dataset = load_dataset(LM_DATASET_MAP[task.value], task.value)
-        raw_train_dataset = dataset["train"].select(range(min(num_train_examples, len(dataset["train"])))).shuffle(seed)
-        raw_test_dataset = dataset["validation"].select(range(min(num_eval_examples, len(dataset["validation"])))).shuffle(seed)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=train_batch_size, 
+        shuffle=True,
+        collate_fn=squad_collate_fn
+    )
     
-    # Get template
-    template = LM_TEMPLATE_MAP[task.value]()
-    
-    if isinstance(task, LmClassificationTask):
-        # Classification task
-        encoded_train_texts = list(map(template.verbalize, raw_train_dataset))
-        encoded_test_texts = list(map(template.verbalize, raw_test_dataset))
-        train_dataset = CustomLMDataset(encoded_train_texts, tokenizer, max_length=max_length)
-        test_dataset = CustomLMDataset(encoded_test_texts, tokenizer, max_length=max_length)
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            shuffle=True,
-            collate_fn=get_collate_fn(tokenizer, max_length)
-        )
-        
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=test_batch_size,
-            shuffle=False,
-            collate_fn=get_collate_fn(tokenizer, max_length)
-        )
-        
-    elif isinstance(task, LmGenerationTask):
-        # Generation task
-        encoded_train_texts = list(map(template.verbalize, raw_train_dataset))
-        encoded_test_texts = list(map(template.encode, raw_test_dataset))
-        
-        # Extract gold outputs
-        if task == LmGenerationTask.squad:
-            test_golds = list(map(lambda d: d["answers"]["text"][0], raw_test_dataset))
-        elif task == LmGenerationTask.drop:
-            test_golds = list(map(lambda d: d["answers_spans"]["spans"][0], raw_test_dataset))
-        elif task == LmGenerationTask.xsum:
-            test_golds = list(map(lambda d: d["summary"], raw_test_dataset))
-        
-        train_dataset = CustomLMDataset(encoded_train_texts, tokenizer, max_length=max_length)
-        test_dataset = CustomLMGenerationDataset(encoded_test_texts, test_golds, tokenizer, max_length=max_length)
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            shuffle=True,
-            collate_fn=get_collate_fn(tokenizer, max_length)
-        )
-        
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=test_batch_size,
-            shuffle=False,
-            collate_fn=get_collate_fn_for_gen_model(tokenizer, max_length)
-        )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=test_batch_size, 
+        shuffle=False,
+        collate_fn=squad_collate_fn
+    )
     
     return train_loader, test_loader
 
 
+# KEEP this function for backward compatibility with your working version
 def get_squad_dataloaders(tokenizer, train_batch_size=2, test_batch_size=2, 
                          max_length=512, num_train_examples=1000, num_eval_examples=200):
     """
-    Legacy function for backward compatibility
+    Your existing working function - don't change this!
     """
-    return get_lm_dataloaders(
-        LmGenerationTask.squad, tokenizer, train_batch_size, test_batch_size,
-        max_length, num_train_examples, num_eval_examples
-    )
+    return get_enhanced_dataloaders('squad', tokenizer, train_batch_size, test_batch_size,
+                                   max_length, num_train_examples, num_eval_examples)
 
 
-def extract_answer_from_generation(generated_text, question=None):
-    """
-    Extract answer from generated text for evaluation
-    Looks for text after "Answer:" or "Summary:" in the generation
-    """
-    # Different patterns for different tasks
-    patterns = ["Answer:", "Summary:", "Sentiment:"]
-    
-    for pattern in patterns:
-        if pattern in generated_text:
-            answer_part = generated_text.split(pattern)[-1].strip()
-            # Take only the first sentence/line as the answer
-            answer = answer_part.split('\n')[0].split('.')[0].strip()
-            return answer
-    
-    # If no pattern found, return the generated text as is
-    return generated_text.strip()
-
-
-def calculate_generation_metrics(model, tokenizer, batch, device, max_new_tokens=50):
-    """
-    Calculate generation-specific metrics (F1, Exact Match, ROUGE for summarization)
-    Also calculates accuracy from the forward pass
-    """
-    model.eval()
-    
-    input_ids = batch['input_ids'].to(device)
-    attention_mask = batch['attention_mask'].to(device)
-    labels = batch['labels'].to(device)
-    gold_outputs = batch.get('gold_outputs', batch.get('answers', []))
-    
-    f1_scores = []
-    em_scores = []
-    
-    with torch.no_grad():
-        # Forward pass for accuracy calculation
-        forward_outputs = model(input_ids, attention_mask, labels)
-        
-        # Calculate accuracy from forward pass
-        logits = forward_outputs.logits
-        if logits.shape[1] != labels.shape[1]:
-            min_len = min(logits.shape[1], labels.shape[1])
-            logits = logits[:, :min_len, :]
-            labels_aligned = labels[:, :min_len]
-        else:
-            labels_aligned = labels
-        
-        # For next token prediction: predict token i+1 from tokens 0:i
-        if logits.shape[1] > 1:
-            pred_logits = logits[:, :-1, :].contiguous()
-            target_labels = labels_aligned[:, 1:].contiguous()
-        else:
-            pred_logits = logits.contiguous()
-            target_labels = labels_aligned.contiguous()
-        
-        predictions = torch.argmax(pred_logits, dim=-1)
-        mask = (target_labels != -100)
-        
-        if mask.sum() > 0:
-            if predictions.shape != target_labels.shape:
-                min_len = min(predictions.shape[1], target_labels.shape[1])
-                predictions = predictions[:, :min_len]
-                target_labels = target_labels[:, :min_len]
-                mask = mask[:, :min_len]
-            
-            correct_predictions = (predictions == target_labels)[mask]
-            accuracy = correct_predictions.float().mean().item()
-        else:
-            accuracy = 0.0
-        
-        # Generate outputs for F1/EM calculation
-        if len(gold_outputs) > 0:  # Only if we have gold outputs
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            
-            # Decode generated outputs
-            for i, output in enumerate(outputs):
-                if i < len(gold_outputs):
-                    generated_text = tokenizer.decode(output, skip_special_tokens=True)
-                    predicted_answer = extract_answer_from_generation(generated_text)
-                    ground_truth = gold_outputs[i]
-                    
-                    # Calculate metrics
-                    f1 = f1_score(predicted_answer, ground_truth)
-                    em = exact_match_score(predicted_answer, ground_truth)
-                    
-                    f1_scores.append(f1)
-                    em_scores.append(em)
-    
-    avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-    avg_em = sum(em_scores) / len(em_scores) if em_scores else 0.0
-    
-    return avg_f1, avg_em, accuracy
-
-
-# Legacy function for backward compatibility - now returns accuracy too
-def calculate_squad_metrics(model, tokenizer, batch, device, max_new_tokens=50):
-    """Legacy function for SQuAD metrics - now includes accuracy"""
-    return calculate_generation_metrics(model, tokenizer, batch, device, max_new_tokens)
-
-
-def create_squad_training_setup(model_name='gpt2', num_train_examples=1000, num_eval_examples=200):
-    """Legacy function for backward compatibility"""
-    tokenizer = get_hf_tokenizer(model_name)
-    train_loader, test_loader = get_lm_dataloaders(
-        LmGenerationTask.squad, tokenizer, 
-        train_batch_size=2, test_batch_size=2, max_length=512,
-        num_train_examples=num_train_examples, num_eval_examples=num_eval_examples
-    )
-    return train_loader, test_loader, tokenizer
+def get_hf_tokenizer(model_name):
+    """Get HuggingFace tokenizer"""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 if __name__ == "__main__":
-    # Test the enhanced dataset loading
-    print("Testing enhanced LM dataset loading...")
-    
+    # Test that SQuAD still works exactly as before
+    print("Testing SQuAD compatibility...")
     tokenizer = get_hf_tokenizer('gpt2')
     
-    # Test SQuAD generation task
-    print("\n=== Testing SQuAD Generation Task ===")
-    train_loader, test_loader = get_lm_dataloaders(
-        LmGenerationTask.squad, tokenizer,
-        train_batch_size=2, test_batch_size=2, max_length=128,
+    # Test with your existing function
+    train_loader, test_loader = get_squad_dataloaders(
+        tokenizer, train_batch_size=2, test_batch_size=2, max_length=128,
         num_train_examples=10, num_eval_examples=5
     )
     
-    print(f"Train loader: {len(train_loader)} batches")
-    print(f"Test loader: {len(test_loader)} batches")
+    print(f"SQuAD - Train: {len(train_loader)}, Test: {len(test_loader)}")
     
-    # Print sample from training set
+    # Test sample batch
     for batch in train_loader:
-        print("\nTraining batch sample:")
-        print(f"Input shape: {batch['input_ids'].shape}")
-        print(f"Sample text: {tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)[:200]}...")
+        print(f"Batch keys: {list(batch.keys())}")
+        print(f"Batch shapes: {[f'{k}: {v.shape if torch.is_tensor(v) else len(v)}' for k, v in batch.items()]}")
+        print(f"Sample text: {batch['formatted_text'][0][:100]}...")
         break
     
-    # Print sample from test set (generation)
-    for batch in test_loader:
-        print("\nTest batch sample (generation):")
-        print(f"Input shape: {batch['input_ids'].shape}")
-        print(f"Gold outputs: {batch['gold_outputs'][0]}")
-        print(f"Input text: {batch['input_texts'][0][:100]}...")
-        break
-    
-    # Test other tasks
-    print("\n=== Testing DROP Generation Task ===")
-    try:
-        train_loader, test_loader = get_lm_dataloaders(
-            LmGenerationTask.drop, tokenizer,
-            train_batch_size=1, test_batch_size=1, max_length=128,
-            num_train_examples=2, num_eval_examples=2
-        )
-        print(f"DROP - Train: {len(train_loader)}, Test: {len(test_loader)}")
-    except Exception as e:
-        print(f"DROP loading failed: {e}")
-    
-    print("\n=== Testing XSum Generation Task ===")
-    try:
-        train_loader, test_loader = get_lm_dataloaders(
-            LmGenerationTask.xsum, tokenizer,
-            train_batch_size=1, test_batch_size=1, max_length=128,
-            num_train_examples=2, num_eval_examples=2
-        )
-        print(f"XSum - Train: {len(train_loader)}, Test: {len(test_loader)}")
-    except Exception as e:
-        print(f"XSum loading failed: {e}")
+    # Test new datasets
+    print("\nTesting new datasets...")
+    for task in ['drop', 'xsum', 'sst2']:
+        try:
+            print(f"\nTesting {task}...")
+            train_loader, test_loader = get_enhanced_dataloaders(
+                task, tokenizer, train_batch_size=1, test_batch_size=1, max_length=128,
+                num_train_examples=2, num_eval_examples=2
+            )
+            print(f"{task} - Train: {len(train_loader)}, Test: {len(test_loader)}")
+            
+            # Test batch structure is same as SQuAD
+            for batch in train_loader:
+                print(f"{task} batch keys: {list(batch.keys())}")
+                print(f"Sample text: {batch['formatted_text'][0][:100]}...")
+                break
+        except Exception as e:
+            print(f"{task} failed: {e}")
