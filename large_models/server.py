@@ -1,6 +1,7 @@
 import socket
 import pickle
 import torch
+from torch import nn
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -11,8 +12,249 @@ import argparse
 import sys
 import traceback
 from SGDGradientEst import StochasticGradientApproximator
-
+import torch.nn.functional as F
 from prefix_kv import PrefixKV, load_grad_state_into
+
+def _neg_inf(dtype: torch.dtype) -> float:
+    # Use the representable minimum as the additive mask value
+    return torch.finfo(dtype).min
+def _refresh_eval_prefixes(full_model, server_model, trainer):
+    """
+    Pull the latest client prefix snapshot for eval,
+    attach live server prefixes, and enable prefix-aware eval.
+    Safe fallback to legacy eval if anything fails.
+    """
+    full_model.attach_live_server_kv(server_model.kv)
+    try:
+        trainer.send_data({"type": "get_client_kv_state"})
+        resp = trainer.receive_data()
+        if isinstance(resp, dict) and resp.get("type") == "client_kv_state":
+            full_model.load_client_kv_state(resp["state"])
+            full_model.enable_prefix_eval(True)
+            return True
+    except Exception as e:
+        print(f"⚠️ Eval prefixes not refreshed: {e}")
+    full_model.enable_prefix_eval(False)   # fallback to legacy eval
+    return False
+
+def _build_self_attn_mask(attention_mask: torch.Tensor,
+                          tgt_len: int,
+                          prefix_len: int,
+                          dtype: torch.dtype,
+                          device: torch.device) -> torch.Tensor:
+    """
+    Construct OPT-style additive attention mask with:
+      - causal masking over current tokens
+      - left prefix KV of length P (always visible)
+      - padding masking from `attention_mask` (0 -> masked)
+    Returns shape [B, 1, tgt_len, prefix_len + tgt_len] with 0 for allowed, -inf for masked.
+    """
+    bsz = attention_mask.size(0)
+
+    # Causal part over current tokens (S x S): 0 on/below diag, -inf above
+    causal = torch.triu(
+        torch.full((tgt_len, tgt_len), _neg_inf(dtype), device=device),
+        diagonal=1
+    )
+    # Prepend prefix block (always visible -> zeros)
+    if prefix_len > 0:
+        prefix_block = torch.zeros((tgt_len, prefix_len), dtype=dtype, device=device)
+        base = torch.cat([prefix_block, causal], dim=-1)  # [S, P+S]
+    else:
+        base = causal  # [S, S]
+
+    # Expand to [B,1,S,P+S]
+    attn = base.unsqueeze(0).unsqueeze(1).expand(bsz, 1, tgt_len, prefix_len + tgt_len)
+
+    # Source-side padding: broadcast to [B,1,1,P+S] and add
+    pad = (1.0 - attention_mask.to(dtype))  # [B,S], 1 where pad
+    if prefix_len > 0:
+        src_pad = torch.cat([torch.zeros((bsz, prefix_len), dtype=dtype, device=device), pad], dim=-1)
+    else:
+        src_pad = pad
+    attn = attn + src_pad.view(bsz, 1, 1, prefix_len + tgt_len) * _neg_inf(dtype)
+    return attn
+
+
+def _resolve_base_lm(model_like):
+    def _looks_like_hf_lm(x):
+        return hasattr(x, "model") and hasattr(x.model, "decoder") and hasattr(x, "lm_head")
+    obj = model_like
+    for _ in range(6):
+        if _looks_like_hf_lm(obj): return obj
+        for name in ("base_model","hf_model","model","module","net","inner","wrapped","lm"):
+            if hasattr(obj, name):
+                obj = getattr(obj, name); break
+        else: break
+    if _looks_like_hf_lm(model_like): return model_like
+    raise AttributeError(f"Could not resolve HF LM from {type(model_like).__name__}")
+
+import torch
+import torch.nn.functional as F
+
+def _right_trim(input_ids, attention_mask, labels):
+    with torch.no_grad():
+        seq_lens = attention_mask.sum(dim=1)
+        max_len = int(seq_lens.max().item())
+    return (
+        input_ids[:, :max_len],
+        attention_mask[:, :max_len],
+        labels[:, :max_len] if labels is not None else None,
+    )
+
+def _server_forward_to_cut_payload(
+    server_wrap,                    # ServerKVOnly instance
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    send_fp16: bool = True,):
+    """
+    Run embeddings + layers [0..cut-1] with server prefixes as per-layer past_key_value to produce h_cut.
+    Returns (h_cut_live, payload_to_client).
+    """
+    base_model = server_wrap.base_model
+    decoder    = base_model.model.decoder
+    cut        = server_wrap.cut_layer
+    dtype      = next(base_model.parameters()).dtype
+
+    input_ids, attention_mask, labels = _right_trim(input_ids, attention_mask, labels)
+
+    # Embeddings + positions (OPT expects mask-based positions)
+    # x = decoder.embed_tokens(input_ids) * decoder.embed_scale
+    x = decoder.embed_tokens(input_ids)
+    scale = getattr(decoder, "embed_scale", None)
+    if scale is not None:
+        x = x * scale  # only scale when attribute exists
+
+    pos = None
+    embed_pos = getattr(decoder, "embed_positions", None)
+    if embed_pos is not None:
+        try:
+            # some forks accept attention_mask (your earlier ZeroPositionalEmbedding matched this)
+            pos = embed_pos(attention_mask, position_ids=None, past_key_values_length=0)
+        except TypeError:
+            # stock HF OPT uses (input_shape, past_key_values_length)
+            pos = embed_pos(input_ids.shape, past_key_values_length=0)
+
+
+    # pos = decoder.embed_positions(attention_mask, position_ids=None, past_key_values_length=0)
+    if pos is not None:
+        x = x + pos
+    if getattr(decoder, "layernorm_embedding", None) is not None:
+        x = decoder.layernorm_embedding(x)
+    # x = decoder.dropout(x)
+    # Dropout can be either a module or a float p in some OPT forks
+    drop_attr = getattr(decoder, "dropout", None)
+    if callable(drop_attr):
+        # Standard HF: decoder.dropout is nn.Dropout
+        x = drop_attr(x)
+    else:
+        # Some forks store p as a float (e.g., decoder.dropout == 0.1)
+        if isinstance(drop_attr, (float, int)):
+            p = float(drop_attr)
+        else:
+            # Fallbacks: try decoder.dropout_p or config.dropout, else 0.0
+            p = getattr(decoder, "dropout_p", None)
+            if p is None:
+                p = float(getattr(getattr(server_wrap.base_model, "config", object()), "dropout", 0.0))
+        if p and p > 0.0:
+            x = F.dropout(
+                x,
+                p=p,
+                training=decoder.training if hasattr(decoder, "training") else server_wrap.base_model.training,
+            )
+        # else: no-op if p == 0.0
+
+
+    # 4D attn mask
+    # attn_mask_4d = decoder._prepare_decoder_attention_mask(
+    #     attention_mask, (x.shape[0], x.shape[1]), x, 0
+    # )
+    # Determine prefix length P from your server PrefixKV
+    try:
+        prefix_len = int(server_wrap.kv.k.shape[-2])  # [L, H, P, D] -> P
+    except Exception:
+        prefix_len = 0
+
+    tgt_len = x.shape[1]
+    attn_mask_4d = _build_self_attn_mask(
+        attention_mask=attention_mask,
+        tgt_len=tgt_len,
+        prefix_len=prefix_len,
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+    # Build per-layer past_kv from server prefixes
+    bsz = input_ids.size(0)
+    server_past = server_wrap.kv.get_local_past(bsz)  # {layer_idx: (k,v)} with [B,H,P,D]
+
+    # Run server side layers [0..cut-1]
+    for li in range(cut):
+        layer = decoder.layers[li]
+        pkv   = server_past.get(li, None)
+        # pkv = server_past.get(li, None)
+        if pkv is not None:
+            # pkv is (k,v) shaped [B,H,P,D] each — wrap to cache-like object
+            pkv = _PrefixConcatCache(pkv[0], pkv[1])
+
+        layer_out = layer(
+            x,
+            attention_mask=attn_mask_4d,
+            layer_head_mask=None,
+            past_key_value=pkv,        # _PrefixConcatCache or None
+            output_attentions=False,
+            use_cache=False,
+        )
+        # HF may return Tensor or a tuple; when use_cache=False & output_attentions=False it's often a Tensor
+        x = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
+
+
+    # Keep live tensor for SGD backprop
+    h_cut_live = x
+    if not h_cut_live.requires_grad:
+        # if prefixes aren’t yet in graph, still make it trainable to unblock
+        h_cut_live = x.detach().requires_grad_(True)
+
+    # Detached payload (wire-friendly)
+    h_cut_send = h_cut_live.detach()
+    h_cut_send = (h_cut_send.to(torch.float16) if send_fp16 else h_cut_send.to(dtype)).cpu()
+
+    payload = {
+        "h_cut": h_cut_send,
+        "attention_mask": attention_mask.cpu(),
+        "labels": labels.cpu() if labels is not None else None,
+        "meta": {"cut_layer": cut},
+    }
+    return h_cut_live, payload
+
+class _PrefixConcatCache:
+    """
+    Minimal cache adapter for HF SelfAttention that expects an object with .update(...)
+    It concatenates the stored prefix (k,v) along the sequence length dimension.
+    """
+    def __init__(self, k_prefix: torch.Tensor, v_prefix: torch.Tensor):
+        # Expect [B, H, P, D]
+        self.kp = k_prefix
+        self.vp = v_prefix
+
+    def update(self, *args, **kwargs):
+        # Works with either positional or keyword signatures used by HF
+        if len(args) >= 2:
+            key_states, value_states = args[0], args[1]
+        else:
+            key_states  = kwargs.get("key_states")
+            value_states = kwargs.get("value_states")
+
+        # Move/cast prefix to match current states
+        kp = self.kp.to(device=key_states.device, dtype=key_states.dtype)
+        vp = self.vp.to(device=value_states.device, dtype=value_states.dtype)
+
+        # Concat along seq-len axis (dim=2): [B,H,P+S,D]
+        k_cat = torch.cat([kp, key_states], dim=2)
+        v_cat = torch.cat([vp, value_states], dim=2)
+        return (k_cat, v_cat)
+
 
 class ServerKVOnly(nn.Module):
     """
@@ -26,9 +268,28 @@ class ServerKVOnly(nn.Module):
         self.total_layers = tmp.config.num_hidden_layers
         self.cut_layer = cut_layer
         self.kv = PrefixKV(tmp.config, list(range(0, cut_layer)), num_prefix=num_prefix, device=tmp.device)
+        self.attach_partial_model(model_name)
         # we do not keep the full model in memory here to save RAM
         del tmp
         torch.cuda.empty_cache()
+    
+    def attach_partial_model(self, model_name: str):
+        """
+        Load an OPT-style LM and keep only embeddings + first `cut_layer` decoder blocks.
+        Enough to produce h_cut on the server.
+        """
+        from transformers import AutoModelForCausalLM
+        import torch.nn as nn
+
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map=None
+        )
+        dec = base.model.decoder
+        # keep only [0..cut_layer-1]
+        dec.layers = nn.ModuleList(list(dec.layers[: self.cut_layer]))
+        self.base_model = base.eval()
 
     def state_dict_kv(self):
         # minimal state dict to send to client
@@ -383,125 +644,127 @@ class ServerLLMModel(nn.Module):
             print(f"❌ Server model forward pass failed: {e}")
             raise
 
-
-# class FullLLMModel(nn.Module):
-#     """Complete model for evaluation and ZOO training"""
-#     def __init__(self, model_name, num_prefix=5):
-#         super(FullLLMModel, self).__init__()
-#         try:
-#             self.base_model = AutoModelForCausalLM.from_pretrained(
-#                 model_name,
-#                 torch_dtype=torch.float32,
-#                 device_map=None
-#             )
-#             self.num_prefix = num_prefix
-            
-#             # Freeze base model parameters
-#             for param in self.base_model.parameters():
-#                 param.requires_grad = False
-                
-#             print(f"Full model created successfully")
-#         except Exception as e:
-#             print(f"❌ Failed to create full model: {e}")
-#             raise
-    
-#     def forward(self, input_ids, attention_mask, labels=None):
-#         """Complete forward pass through the model"""
-#         try:
-#             batch_size, seq_len = input_ids.shape
-            
-#             # Get embeddings
-#             inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-            
-#             # Concatenate prefix with input embeddings
-#             inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
-            
-#             # Extend attention mask for prefix tokens
-#             prefix_mask = torch.ones(batch_size, self.num_prefix, device=attention_mask.device, dtype=attention_mask.dtype)
-#             attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-            
-#             # Handle labels for prefix tokens
-#             if labels is not None:
-#                 # Prefix tokens don't predict next tokens, so label = -100 (ignored)
-#                 prefix_labels = torch.full((batch_size, self.num_prefix), -100, device=labels.device, dtype=labels.dtype)
-#                 labels = torch.cat([prefix_labels, labels], dim=1)
-                
-#                 # Ensure length consistency between inputs and labels
-#                 input_len = inputs_embeds.shape[1]
-#                 if labels.shape[1] != input_len:
-#                     if labels.shape[1] > input_len:
-#                         labels = labels[:, :input_len]
-#                     else:
-#                         pad_len = input_len - labels.shape[1]
-#                         padding = torch.full((batch_size, pad_len), -100, device=labels.device, dtype=labels.dtype)
-#                         labels = torch.cat([labels, padding], dim=1)
-            
-#             # Forward through base model
-#             outputs = self.base_model(
-#                 inputs_embeds=inputs_embeds,
-#                 attention_mask=attention_mask,
-#                 labels=labels,
-#                 use_cache=False
-#             )
-            
-#             return outputs
-#         except Exception as e:
-#             print(f"❌ Full model forward pass failed: {e}")
-#             raise
-    
-#     def generate(self, input_ids, attention_mask, **kwargs):
-#         """Generation method for evaluation"""
-#         try:
-#             batch_size, seq_len = input_ids.shape
-            
-#             # Get embeddings with prefix
-#             inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-#             inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
-            
-#             # Extend attention mask
-#             prefix_mask = torch.ones(batch_size, self.num_prefix, device=attention_mask.device, dtype=attention_mask.dtype)
-#             attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-            
-#             # Generate
-#             return self.base_model.generate(
-#                 inputs_embeds=inputs_embeds,
-#                 attention_mask=attention_mask,
-#                 **kwargs
-#             )
-#         except Exception as e:
-#             print(f"❌ Generation failed: {e}")
-#             raise
-
-
 class FullLLMModel(nn.Module):
     """Frozen full model used only for monitoring/evaluation."""
-    def __init__(self, model_name, num_prefix=5):
+    def __init__(self, model_name, cut_layer, num_prefix=5):
         super(FullLLMModel, self).__init__()
         self.base_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.float32, device_map=None
         )
+        self.total_layers = self.base_model.config.num_hidden_layers
+        self.cut_layer    = int(cut_layer)
         self.num_prefix = num_prefix
         for p in self.base_model.parameters():
             p.requires_grad = False
-        print("Full model created successfully (no prefix concat during eval)")
+        self._use_prefix_eval = False
+        self._server_kv_live  = None            # live reference (server side)
+        self._client_kv_eval  = None            # local PrefixKV snapshot for client side
+
+        print("Full model ready; prefix-aware eval OFF by default (legacy behavior).")
+
+    def attach_live_server_kv(self, server_kv_module: PrefixKV):
+        """Point eval model to the live server PrefixKV (no copy)."""
+        self._server_kv_live = server_kv_module
+
+    @torch.no_grad()
+    def load_client_kv_state(self, state: dict):
+        """
+        Load a snapshot of client prefixes into a local PrefixKV for eval.
+        Expects {'k': tensor[Lc,H,P,D], 'v': tensor[Lc,H,P,D]} for layers [cut..L-1].
+        """
+        device = next(self.base_model.parameters()).device
+        dtype  = next(self.base_model.parameters()).dtype
+
+        if self._client_kv_eval is None:
+            # Build eval-side PrefixKV container for client half
+            self._client_kv_eval = PrefixKV(
+                self.base_model.config,
+                list(range(self.cut_layer, self.total_layers)),
+                num_prefix=state["k"].shape[-2],
+                device=device,
+                dtype=dtype,
+            )
+        # Copy weights
+        self._client_kv_eval.k.copy_(state["k"].to(device=device, dtype=self._client_kv_eval.k.dtype))
+        self._client_kv_eval.v.copy_(state["v"].to(device=device, dtype=self._client_kv_eval.v.dtype))
+
+    def enable_prefix_eval(self, flag: bool = True):
+        """Turn prefix-aware eval on/off."""
+        self._use_prefix_eval = bool(flag)
 
     def forward(self, input_ids, attention_mask, labels=None):
-        # No prefix concat; just evaluate the frozen base model for a stable loss/metric.
+        """
+        If prefix-aware eval is enabled and both halves are present,
+        evaluate with merged past_key_values + explicit position_ids.
+        Otherwise, fall back to the legacy frozen no-prefix path.
+        """
+        # Happy-path: prefix-aware eval
+        if self._use_prefix_eval and self._server_kv_live is not None and self._client_kv_eval is not None:
+            bsz, seq_len = input_ids.size(0), input_ids.size(1)
+
+            # Build per-layer K/V caches from both halves
+            server_past = self._server_kv_live.get_local_past(bsz)   # {layer_idx: (k,v)}
+            client_past = self._client_kv_eval.get_local_past(bsz)   # {layer_idx: (k,v)}
+            cache       = merge_past_key_values(self.total_layers, server_past, client_past)
+
+            # Infer prefix length P from any present layer
+            past_len = 0
+            for kv in cache:
+                if kv is not None:
+                    past_len = kv[0].shape[-2]  # [B,H,P,D]
+                    break
+
+            # Use explicit positions (matches client forward_full)
+            position_ids = torch.arange(
+                past_len, past_len + seq_len, device=input_ids.device, dtype=torch.long
+            ).unsqueeze(0).expand(bsz, -1)
+
+            return self.base_model(
+                input_ids=input_ids,
+                attention_mask=None,            # use explicit positions instead
+                position_ids=position_ids,
+                labels=labels,
+                past_key_values=cache,
+                use_cache=False,
+            )
+
+        # Legacy fallback: frozen, no prefixes
         return self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            use_cache=False
+            use_cache=False,
         )
 
-    def generate(self, input_ids, attention_mask, **kwargs):
-        # Safe generation without manual prefix handling
-        return self.base_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **kwargs
-        )
+    # --- server.py (inside class FullLLMModel) ---
+    def generate(self, input_ids, attention_mask=None, **kwargs):
+        # Prefix-aware generate (matches your prefix-aware forward)
+        if self._use_prefix_eval and self._server_kv_live is not None and self._client_kv_eval is not None:
+            bsz, seq_len = input_ids.shape
+            server_past = self._server_kv_live.get_local_past(bsz)
+            client_past = self._client_kv_eval.get_local_past(bsz)
+            cache       = merge_past_key_values(self.total_layers, server_past, client_past)
 
+            # infer prefix length P
+            past_len = 0
+            for kv in cache:
+                if kv is not None:
+                    past_len = kv[0].shape[-2]  # [B,H,P,D]
+                    break
+
+            position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
+
+            # Let HF generate with the prefilled cache; attention_mask becomes unnecessary
+            return self.base_model.generate(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=cache,
+                **kwargs
+            )
+
+        # Fallback: no prefixes known
+        return self.base_model.generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
 
 class Trainer:
@@ -689,6 +952,9 @@ def squad_f1_score(prediction, ground_truth):
         print(f"❌ F1 calculation error: {e}")
         return 0.0
 
+def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
+    # ...
+    
 
 def evaluate_model(model, test_loader, device, tokenizer, args):
     """SQUAD-specific evaluation with imported metrics"""
@@ -705,13 +971,30 @@ def evaluate_model(model, test_loader, device, tokenizer, args):
     total_f1 = 0.0
     total_em = 0.0
     num_batches = 0
-    
+
     with torch.no_grad():
+        # just before: for batch in eval_loader:
+        # _refreshed = _refresh_eval_prefixes(full_model, server_model, trainer)
+        if server_model is not None and trainer is not None:
+            _refreshed = _refresh_eval_prefixes(model, server_model, trainer)
+            if not _refreshed:
+                print("⚠️ Prefix-aware eval unavailable; falling back to frozen no-prefix eval.")
+
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="SQUAD Evaluation")):
             try:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
+                # labels = batch['labels'].to(device)
+                # --- server.py (inside evaluate_model(...) before the forward) ---
+                labels = input_ids.clone()
+                labels[attention_mask == 0] = -100
+                pad_id = getattr(tokenizer, 'pad_token_id', None)
+                if pad_id is not None:
+                    labels[input_ids == pad_id] = -100
+                labels = labels.long()
+
+                outputs = model(input_ids, attention_mask, labels)  # proceed as before
+
                 
                 # Debug: Check data structure for first batch
                 if batch_idx == 0:
@@ -759,6 +1042,73 @@ def evaluate_model(model, test_loader, device, tokenizer, args):
     
     return avg_loss, avg_answer_accuracy, avg_f1, avg_em
 
+
+def evaluate_model_via_client(server_model, test_loader, trainer, device, tokenizer, args):
+    """
+    SQUAD evaluation using client for forward pass (has both server and client prefixes)
+    This gives accurate evaluation of the actual trained model.
+    """
+    print("  Starting SQUAD evaluation via client...")
+    
+    server_model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc="SQUAD Evaluation")):
+            try:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                
+                # Build labels just like in training
+                labels = input_ids.clone()
+                labels[attention_mask == 0] = -100
+                pad_id = getattr(tokenizer, 'pad_token_id', None)
+                if pad_id is not None:
+                    labels[input_ids == pad_id] = -100
+                labels = labels.long()
+                
+                # Compute server's h_cut
+                h_cut_live, pkg = _server_forward_to_cut_payload(
+                    server_model,
+                    input_ids, attention_mask, labels,
+                    send_fp16=True
+                )
+                
+                # Send eval request to client
+                trainer.send_data({
+                    "type": "eval_request", 
+                    "data": pkg,
+                    "meta": {"eval": True}
+                })
+                
+                # Receive evaluation loss from client
+                resp = trainer.receive_data()
+                eval_loss = resp.get("eval_loss", 0.0)
+                
+                total_loss += eval_loss
+                num_batches += 1
+                
+                # Print progress for first few batches
+                if batch_idx < 3:
+                    print(f"\n  Eval Batch {batch_idx}: Loss={eval_loss:.4f}")
+                
+            except Exception as e:
+                print(f"\n⚠️ Error in evaluation batch {batch_idx}: {e}")
+                continue
+    
+    # Calculate averages
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    print(f"\n  SQUAD Evaluation Complete (via client):")
+    print(f"   Average Loss: {avg_loss:.4f}")
+    print(f"   Note: This reflects the actual trained model with both server and client prefixes")
+    
+    # For now, just return loss. Can extend to other metrics if needed.
+    return avg_loss, 0.0, 0.0, 0.0
+
+    
 def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader,
                              optimizer, scheduler, trainer, device, tokenizer, args):
     """Train using split learning with Zeroth-Order Optimization (server-side ZOO)."""
@@ -814,26 +1164,21 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
 
                     optimizer.zero_grad(set_to_none=True)
 
-                    # ---- objective uses *current* (possibly perturbed) KV: compute loss on CLIENT ----
-                    def objective_fn(_x=None, _y=None):
-                        payload = {
-                            'input_ids': input_ids,
-                            'attention_mask': attention_mask,
-                            'labels': labels,
-                            'server_kv_state': server_model.state_dict_kv(),  # <- reads current KV (incl. perturbations)
-                            'cut_layer': args.cut_layer,
-                            'zoo_eval': True,
-                        }
-                        # Ask client to run forward and return loss
-                        trainer.send_data({'type': 'forward', 'data': payload})
-                        client_resp = trainer.receive_data()
+                    def objective_fn():
+                        h_cut_live, pkg = _server_forward_to_cut_payload(
+                            server_model,
+                            input_ids, attention_mask, labels,
+                            send_fp16=True
+                        )
+                        # Server is ZOO; the client should skip g_cut and return loss only
+                        trainer.send_data({"type": "forward_cut", "data": pkg, "meta": {"zoo_eval": True}})
+                        resp = trainer.receive_data()  # {'loss': float}
+                        return torch.as_tensor(resp["loss"], device=h_cut_live.device, dtype=h_cut_live.dtype)
+                    
+                    def objective_fn_c(*_args,**_kwargs):
+                        return objective_fn()
 
-                        if 'error' in client_resp:
-                            raise RuntimeError(f"Client error during ZOO objective: {client_resp['error']}")
-
-                        # loss is a CPU tensor or float; convert to device tensor
-                        return torch.as_tensor(float(client_resp['loss']), device=device)
-
+                    
                     # Estimate gradients for server KV via ZOO
                     pbar.set_postfix_str("Computing ZOO gradients...")
                     try:
@@ -841,12 +1186,12 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         grad_estimator.model_params = server_params
                         grad_estimator.estimate_gradients(
                             random_seed=global_step * 1000 + args.seed,
-                            objective_fn=objective_fn
+                            objective_fn=objective_fn_c
                         )
                     except TypeError:
                         # Legacy API (positional)
                         grad_estimator.estimate_gradients(
-                            input_ids, labels, objective_fn,
+                            input_ids, labels, objective_fn_c,
                             random_seed=global_step * 1000 + args.seed
                         )
 
@@ -939,17 +1284,6 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     # labels = batch['labels'].to(device)
                     
                     optimizer.zero_grad()
-                    
-                    # Server forward pass
-                    # server_output = server_model(input_ids, attention_mask)
-                    # payload = {
-                    #     'input_ids': input_ids,                # shape [B, S]
-                    #     'attention_mask': attention_mask,      # shape [B, S]
-                    #     'labels': labels,                      # include for training; omit for pure inference
-                    #     'server_kv_state': server_model.state_dict_kv(),  # {'k': ..., 'v': ...} on CPU
-                    #     'cut_layer': args.cut_layer            # e.g., 6
-                    # }
-                    
                     labels = input_ids.clone()
                     labels[attention_mask == 0] = -100
                     pad_id = getattr(tokenizer, 'pad_token_id', None)
@@ -957,38 +1291,28 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         labels[input_ids == pad_id] = -100
                     labels = labels.long()
 
-                    payload = {
-                        'input_ids': input_ids,                    # [B, S] (Long)
-                        'attention_mask': attention_mask,          # [B, S]
-                        'labels': labels,                          # [B, S] with -100 masked
-                        'server_kv_state': server_model.state_dict_kv(),  # {'k': tensor, 'v': tensor} on CPU
-                        'cut_layer': args.cut_layer,               # e.g., 6
-                    }
-                    trainer.send_data({'type': 'forward', 'data': payload})
+                    # === True-split: compute and send h_cut ===
+                    h_cut_live, pkg = _server_forward_to_cut_payload(
+                        server_model,                 # ServerKVOnly instance
+                        input_ids, attention_mask, labels,
+                        send_fp16=True
+                    )
+                    trainer.send_data({"type": "forward_cut", "data": pkg, "meta": {"zoo_eval": False}})
 
-                    # Receive gradients from client
-                    client_response = trainer.receive_data()
+                    # === Receive loss + g_cut; backprop on server ===
+                    resp = trainer.receive_data()  # {'loss': float, 'g_cut': tensor}
+                    loss_val = float(resp["loss"])
+                    print(f"Loss: {loss_val:.4f}")
 
-                    if 'error' in client_response:
-                        print(f"Client error: {client_response['error']}")
-                        pbar.set_postfix_str("Client Error")
-                        continue
+                    g_cut = torch.as_tensor(resp["g_cut"])
+                    if g_cut.shape != h_cut_live.shape:
+                        raise RuntimeError(f"g_cut shape {tuple(g_cut.shape)} != h_cut {tuple(h_cut_live.shape)}")
+                    g_cut = g_cut.to(device=h_cut_live.device, dtype=h_cut_live.dtype)
 
-                    # Loss for logging
-                    loss_val = float(client_response['loss'])
-                    losses.append(loss_val)
-
-                    # KV-only: client returns structured grads for server prefixes
-                    server_grad_state = client_response.get('server_grad_state', None)
-                    if server_grad_state is None:
-                        raise RuntimeError("Client did not return 'server_grad_state' (KV mode).")
-
-                    # Apply server grads and step
-                    optimizer.zero_grad(set_to_none=True)  # ensure clean .grad
-                    load_grad_state_into(server_model.kv, server_grad_state, device=device)  # fills .grad of kv.k / kv.v
+                    optimizer.zero_grad(set_to_none=True)
+                    h_cut_live.backward(g_cut)
                     optimizer.step()
 
-                    
                     # Calculate accuracy for monitoring using full model
                     with torch.no_grad():
                         outputs = full_model(input_ids, attention_mask, labels)
@@ -1032,8 +1356,8 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         print(f"\nStep {global_step}/{args.max_steps} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.6f}")
                     
                 except Exception as e:
-                    print(f"\nâŒ Error in batch {i}: {e}")
-                    pbar.set_postfix_str(f"Batch {i} Error")
+                    traceback.print_exc()
+                    print(f"Batch {global_step} Error: {e}")
                     continue
         
         scheduler.step()
@@ -1092,7 +1416,6 @@ def parse_args():
     
     return parser.parse_args()
 
-
 if __name__ == "__main__":
     try:
         print("STARTING ENHANCED SPLIT LEARNING SERVER")
@@ -1125,8 +1448,12 @@ if __name__ == "__main__":
         # Create models
         print("  Creating models...")
         server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
-        full_model = FullLLMModel(args.model_name, args.num_prefix).to(device)
         
+        # full_model = FullLLMModel(args.model_name, args.num_prefix).to(device)
+        full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
+        # give it a live pointer to server prefixes (no copy)
+        full_model.attach_live_server_kv(server_model.kv)
+
         # Synchronize models
         print("  Models created and synchronized")
         
@@ -1214,7 +1541,14 @@ if __name__ == "__main__":
         # Final evaluation
         print("\nFinal model evaluation...")
         # final_loss, final_acc, final_f1 = evaluate_model(full_model, test_loader, device, tokenizer, args)
-        final_loss, final_acc, final_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
+        # final_loss, final_acc, final_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
+        # --- server.py (main) ---
+        # Final evaluation — do this first so client is alive to send its KV
+        final_loss, final_acc, final_f1, final_em = evaluate_model(
+            full_model, eval_loader, device, tokenizer, args, server_model=server_model, trainer=trainer
+        )
+# now signal completion
+trainer.send_data({'type': 'training_complete'})
 
         
         print(f"\nFINAL RESULTS:")
