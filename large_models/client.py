@@ -14,6 +14,12 @@ from SGDGradientEst import StochasticGradientApproximator
 # Global KV model holder (set in main)
 kv_model = None
 
+from lora import apply_lora_to_opt, iter_lora_parameters
+
+class _NoPrefixStub:
+    def get_local_past(self, bsz): return {}
+    def set_requires_grad(self, flag: bool): pass
+
 try:
     from transformers.cache_utils import DynamicCache, StaticCache
 except Exception:
@@ -21,6 +27,65 @@ except Exception:
     StaticCache = None
 
 import torch.nn.functional as F
+
+class LoRAClientModel(nn.Module):
+    """
+    Client-side when tuning=LoRA. Keeps full base_model, injects LoRA only into layers [cut..L-1].
+    Presents server_kv_mirror/client_kv stubs so the rest of your code (forward, masks) stays unified.
+    """
+    def __init__(self, model_name: str, total_layers: int, cut_layer: int,
+                 r: int = 8, alpha: int = 16, dropout: float = 0.0,
+                 targets=("q_proj","v_proj")):
+        super().__init__()
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        for p in self.base_model.parameters():
+            p.requires_grad = False
+        self.total_layers = total_layers
+        self.cut_layer = cut_layer
+
+        apply_lora_to_opt(self.base_model,
+                          targets=tuple(targets),
+                          layer_range=(cut_layer, total_layers-1),
+                          r=r, lora_alpha=alpha, lora_dropout=dropout)
+
+        # keep interface used elsewhere
+        self.server_kv_mirror = _NoPrefixStub()
+        self.client_kv       = _NoPrefixStub()
+
+    def trainable_parameters(self):
+        return iter_lora_parameters(self.base_model, layer_range=(self.cut_layer, self.total_layers-1))
+
+def create_labels(input_ids, attention_mask, tokenizer):
+    labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
+    if tokenizer.pad_token_id is not None:
+        labels[input_ids == tokenizer.pad_token_id] = -100
+    return labels.long()
+
+@torch.no_grad()
+def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8):
+    # h_cut on the right device/dtype already
+    h0 = h_cut
+    g_hat = torch.zeros_like(h0, dtype=torch.float32)
+
+    for _ in range(num_pert):
+        u = torch.randn_like(h0, dtype=torch.float32)
+        with torch.no_grad():
+            lp = _client_forward_from_cut(
+                kv_model, h_cut=h0 + mu*u,
+                attention_mask=attention_mask, labels=labels, cut=cut,
+                compute_g_cut=False, return_loss_tensor=False
+            )["loss"]
+            ln = _client_forward_from_cut(
+                kv_model, h_cut=h0 - mu*u,
+                attention_mask=attention_mask, labels=labels, cut=cut,
+                compute_g_cut=False, return_loss_tensor=False
+            )["loss"]
+
+        g_hat.add_(((lp - ln) / (2.0*mu)) * u)
+
+    g_hat.div_(float(num_pert))
+    return g_hat
 
 class _PrefixConcatCache:
     """
@@ -101,8 +166,7 @@ def _client_forward_from_cut(
     labels: torch.Tensor,
     cut: int,
     compute_g_cut: bool = True,
-    return_loss_tensor: bool = False,  # NEW: option to return loss as tensor
-):
+    return_loss_tensor: bool = False,):
     base_model = kv_model.base_model
     decoder    = base_model.model.decoder
     device     = next(base_model.parameters()).device
@@ -133,7 +197,11 @@ def _client_forward_from_cut(
 
     # Build client past for layers >= cut
     bsz = h.size(0)
-    client_past = kv_model.client_kv.get_local_past(bsz)  # {layer_idx: (k,v)}
+    # Build client past only if client_kv exists (prefix mode)
+    client_past = {}
+    if hasattr(kv_model, "client_kv") and hasattr(kv_model.client_kv, "get_local_past"):
+        client_past = kv_model.client_kv.get_local_past(bsz)
+
 
     # Run layers cut..end with per-layer client prefixes
     for li in range(cut, len(decoder.layers)):
@@ -157,27 +225,22 @@ def _client_forward_from_cut(
         h = decoder.final_layer_norm(h)
     logits = base_model.lm_head(h)
 
-    # Causal LM loss (safe)
-    if labels is not None and logits.size(1) >= 2:
+    if labels is not None and attention_mask is not None:
+        labels = torch.where(attention_mask == 0, torch.tensor(-100, device=labels.device), labels)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
-        if (shift_labels != -100).any():
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-                reduction="mean",
-            )
-        else:
-            loss = torch.zeros((), device=device, dtype=dtype)
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction="mean",)
     else:
         loss = torch.zeros((), device=device, dtype=dtype)
 
     out = {"loss": float(loss.item())}
     if compute_g_cut:
-        # Use retain_graph=True if we also need the loss tensor for local update
         g_cut, = torch.autograd.grad(loss, h, retain_graph=return_loss_tensor)
-        out["g_cut"] = g_cut.detach().to(torch.float16).cpu()
+        out["g_cut"] = g_cut.detach().to(torch.float32).cpu()
     
     if return_loss_tensor:
         out["loss_tensor"] = loss  # Return the torch tensor for local update
@@ -193,12 +256,7 @@ def _normalize_batch_from_server(payload, device, tokenizer):
         labels = payload['labels'].to(device).long()
     else:
         # Build labels from input_ids; ignore pads with -100 (HF causal LM shifts internally)
-        labels = ids.clone()
-        labels[am == 0] = -100
-        pad_id = getattr(tokenizer, 'pad_token_id', None)
-        if pad_id is not None:
-            labels[ids == pad_id] = -100
-        labels = labels.long()
+        labels = create_labels(ids, am, tokenizer)
 
     kv_state = payload.get('server_kv_state', None)
     return ids, am, labels, kv_state
@@ -391,258 +449,145 @@ def calculate_accuracy(outputs, labels, batch=None, tokenizer=None):
         print(f"⌠Client SQUAD accuracy calculation failed: {e}")
         return 0.0
 
+import torch
+import numpy as np
 
-def handle_training_requests_zoo(client_model, optimizer, grad_estimator, client, device, args):
-    """Handle training with ZOO - FIXED with client prefix training"""
-    current_labels = None
-    current_batch = None
-    batch_count = 0
-    recent_losses = []
-    recent_accuracies = []
+def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args, device,
+                               pkt: dict, meta: dict, batch_idx: int):
+    """
+    Unified handler for 'forward_cut' covering all 4 combos:
+      (server_opt, client_opt) in {(SGD,SGD), (SGD,ZOO), (ZOO,SGD), (ZOO,ZOO)}.
+
+    Protocol:
+      - Server sends (h_cut, attention_mask, labels, cut) and meta.need_g_cut.
+      - Client ALWAYS computes the loss on its half.
+      - If client_opt == sgd: loss.backward(); optimizer.step().
+      - If client_opt == zoo: do a ZOO step using a loss-only objective.
+      - If meta.need_g_cut: return ∂L/∂h_cut (never client param grads).
+
+    True split guarantees:
+      - No parameter gradients cross the boundary.
+      - Only activations go down; only loss (and optional g_cut) go up.
+
+    Args:
+      client: your network wrapper (has send_data/receive_data)
+      kv_model: client model wrapper that owns the trainable client prefixes
+      optimizer: torch optimizer for client prefixes
+      grad_estimator: your ZOO estimator (has estimate_gradients(objective_function=...))
+      args: parsed args (must have args.client_opt in {"sgd","zoo"})
+      device: torch.device
+      pkt: payload from server with keys ['h_cut','attention_mask','labels','cut']
+      meta: meta dict, expects meta.get('need_g_cut', bool)
+    """
+    need_g_cut = bool(meta.get("need_g_cut", False)) 
+    client_sgd = (not args.use_zeroth_order_client)  # True => SGD, False => ZOO
+
+    model_ref = getattr(kv_model, "base_model", kv_model)
+    param0 = next(model_ref.parameters())
+    target_device = param0.device
+    target_dtype  = param0.dtype
+
+    # ---- Unpack incoming tensors ----
+    # Expect tensors already on CPU -> move to device (or adapt to your transport)
+    h_cut = pkt["h_cut"].to(device=target_device, dtype=target_dtype)
+    attn_mask = pkt.get("attention_mask", None)
+    if attn_mask is not None:
+        attn_mask = attn_mask.to(device=target_device)
+    labels = pkt.get("labels", None)
+    if labels is not None:
+        labels = labels if torch.is_tensor(labels) else torch.as_tensor(labels)
+        labels = labels.to(device=target_device)
+    cut = pkt.get("cut", None)
+    if cut is None:
+        raise KeyError("Could not determine cut layer: expected pkt['cut'] or pkt['meta']['cut_layer'] or args.cut_layer")
+    cut = int(cut)
     
-    print("Starting ZOO training request handler...")
-    print(f"  ZOO Configuration:")
-    print(f"    Perturbation scale (mu): {args.mu}")
-    print(f"    Number of perturbations: {args.num_pert}")
-    
-    # Get tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except:
-        tokenizer = None
-        print("⚠️ Could not load tokenizer")
-    
-    while True:
-        try:
-            server_data = client.receive_data()
-            # inside the while True loop, after receiving `server_data`
-            if server_data.get('type') == 'get_client_kv_state':
-                state = {
-                    "k": client_model.client_kv.k.detach().cpu(),
-                    "v": client_model.client_kv.v.detach().cpu(),
-                }
-                client.send_data({"type": "client_kv_state", "state": state})
-                continue
+    if client_sgd:
+        h_cut = h_cut.detach().requires_grad_(True)
+        # allow autograd (for client prefixes + optional boundary grad)
+        out = _client_forward_from_cut(
+            kv_model, h_cut=h_cut, attention_mask=attn_mask, labels=labels,
+            cut=cut, compute_g_cut=False, return_loss_tensor=True
+        )
+    else:
+        # STRICT ZOO: no graph, no boundary-grad inside this forward
+        with torch.no_grad():
+            h_cut = h_cut.detach()
+            out = _client_forward_from_cut(
+                kv_model, h_cut=h_cut, attention_mask=attn_mask, labels=labels,
+                cut=cut, compute_g_cut=False, return_loss_tensor=True
+            )
 
-            
-            if server_data.get('type') == 'training_complete':
-                print("TRAINING COMPLETED - CLIENT SHUTTING DOWN")
-                break
-            
-            elif server_data.get('type') == 'forward_cut':
-                payload = server_data['data']
-                meta    = server_data.get('meta', {})
-                zoo_eval = bool(meta.get('zoo_eval', False))
+    loss_tensor = out["loss_tensor"]                 # scalar tensor
+    loss_value = float(out["loss"])                  # python float for wire
 
-                # tensors come CPU fp16; don't normalize tokenization here
-                h_cut = torch.as_tensor(payload['h_cut'])
-                attention_mask = torch.as_tensor(payload['attention_mask'])
-                labels = None if payload['labels'] is None else torch.as_tensor(payload['labels'])
-                cut = int(payload['meta']['cut_layer'])
+    # Prepare optional g_cut to send
+    g_cut_to_send = None
 
-                # Run from cut onward with return_loss_tensor=True for local update
-                res = _client_forward_from_cut(
+    # ---- Local client update ----
+    if client_sgd:
+        # True first-order update of client prefixes
+        optimizer.zero_grad(set_to_none=True)
+        loss_tensor.backward()  # grads flow into client prefixes (and h_cut.grad if required)
+        if need_g_cut:
+            if h_cut.grad is None:
+                raise RuntimeError("need_g_cut=True but h_cut.grad is None. Ensure h_cut.requires_grad_(True).")
+            g = h_cut.grad.detach()
+            g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
+        optimizer.step()
+
+        # clean leaf grad
+        if h_cut.grad is not None:
+            h_cut.grad = None
+
+    else:
+        # Zeroth order update of client prefixes (loss-only objective)
+        # If server needs g_cut, compute it via autograd.grad wrt h_cut (no client param grads cross boundary)
+        if need_g_cut:
+            g = _estimate_g_cut_fd(
+                kv_model, h_cut, attention_mask, labels, cut,
+                mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-3)),
+                num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 8)),
+            )
+            g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
+
+        # Define a pure loss-only objective for ZOO (no gradients, just returns float loss)
+        def client_objective(_x, _y):
+            with torch.no_grad():
+                o = _client_forward_from_cut(
                     kv_model,
-                    h_cut=h_cut,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    cut=cut,
-                    compute_g_cut=(not zoo_eval),
-                    return_loss_tensor=True  # NEW: get loss tensor for local update
-                )
-
-                # Send response to server first (server might be blocking)
-                if zoo_eval:
-                    client.send_data({"loss": res["loss"]})
-                else:
-                    client.send_data({"loss": res["loss"], "g_cut": res["g_cut"]})
-
-                # NOW do local ZOO update on client prefixes using the SAME batch
-                if not zoo_eval and labels is not None:  # Only update when we have labels
-                    print(f"\rBatch {batch_count}: ZOO client update...", end='', flush=True)
-                    
-                    # Define objective function for client ZOO
-                    def client_objective():
-                        out = _client_forward_from_cut(
-                            kv_model,
-                            h_cut=h_cut,  # reuse the received activation
-                            attention_mask=attention_mask,
-                            labels=labels,
-                            cut=cut,
-                            compute_g_cut=False,  # no need for g_cut locally
-                            return_loss_tensor=True,
-                        )
-                        return out["loss_tensor"]
-                    
-                    # Make sure estimator targets only client prefixes
-                    grad_estimator.model_params = list(kv_model.client_kv.parameters())
-                    
-                    # Estimate gradients and update
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    # Compatible with both old and new SGDGradientEst API
-                    try:
-                        grad_estimator.estimate_gradients(
-                            objective_fn=client_objective,
-                            random_seed=batch_count * 1000 + args.seed,
-                        )
-                    except TypeError:
-                        # Legacy API
-                        dummy_input = torch.zeros(1)
-                        dummy_labels = torch.zeros(1)
-                        grad_estimator.estimate_gradients(
-                            dummy_input, dummy_labels, client_objective,
-                            random_seed=batch_count * 1000 + args.seed
-                        )
-                    
-                    optimizer.step()
-                    
-                    # Clear grads
-                    for p in kv_model.client_kv.parameters():
-                        if p.grad is not None:
-                            p.grad = None
-                    
-                batch_count += 1
-                
-            elif server_data.get('type') == 'eval_request':
-                # Handle evaluation request from server
-                payload = server_data['data']
-                h_cut = torch.as_tensor(payload['h_cut'])
-                attention_mask = torch.as_tensor(payload['attention_mask'])
-                labels = None if payload['labels'] is None else torch.as_tensor(payload['labels'])
-                cut = int(payload['meta']['cut_layer'])
-                
-                # Run evaluation forward pass
-                res = _client_forward_from_cut(
-                    kv_model,
-                    h_cut=h_cut,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    cut=cut,
-                    compute_g_cut=False,  # No gradients needed for eval
+                    h_cut=pkt["h_cut"].to(device).detach(),
+                    attention_mask=attn_mask,
+                    labels=labels, cut=cut,
+                    compute_g_cut=False,
                     return_loss_tensor=False
                 )
-                
-                # Send back evaluation loss
-                client.send_data({"eval_loss": res["loss"]})
-                
-        except Exception as e:
-            print(f"⌠ERROR IN CLIENT ZOO TRAINING: {e}")
-            import traceback
-            traceback.print_exc()
-            break
+                return torch.tensor(float(o["loss"]), device="cpu")
 
+        _dummy_x = torch.zeros(1)
+        _dummy_y = torch.zeros(1)
+        # Run your estimator (MeZO-style), then step
+        optimizer.zero_grad(set_to_none=True)
+        # grad_estimator.model_params = list(kv_model.client_kv.parameters())  # ensure current params
+        grad_estimator.model_params = list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())())
 
-def handle_training_requests_sgd(client_model, optimizer, client, device, args):
-    """Handle training with standard SGD (backpropagation) - FIXED with client prefix training"""
-    current_labels = None
-    current_batch = None
-    batch_count = 0
-    recent_losses = []
-    recent_accuracies = []
-    
-    print("Starting SGD training request handler...")
-    
-    # Get tokenizer for accuracy calculation
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except:
-        tokenizer = None
-        print("⚠️ Could not load tokenizer for client-side accuracy calculation")
-    
-    while True:
         try:
-            server_data = client.receive_data()
+            grad_estimator.estimate_gradients(_dummy_x, _dummy_y, client_objective,
+                                              random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+        except TypeError:
+            # Fallback if your class has the old signature
+            grad_estimator.estimate_gradients(torch.zeros(1), torch.zeros(1), client_objective,
+                                              random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+        # torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
+        optimizer.step()
 
-            # inside the while True loop, after receiving `server_data`
-            if server_data.get('type') == 'get_client_kv_state':
-                state = {
-                    "k": client_model.client_kv.k.detach().cpu(),
-                    "v": client_model.client_kv.v.detach().cpu(),
-                }
-                client.send_data({"type": "client_kv_state", "state": state})
-                continue
-
-            
-            if server_data.get('type') == 'training_complete':
-                print("TRAINING COMPLETED - CLIENT SHUTTING DOWN")
-                break
-                
-            elif server_data.get('type') == 'forward_cut':
-                payload = server_data['data']
-                meta    = server_data.get('meta', {})
-                zoo_eval = bool(meta.get('zoo_eval', False))
-
-                # tensors come CPU fp16; don't normalize tokenization here
-                h_cut = torch.as_tensor(payload['h_cut'])
-                attention_mask = torch.as_tensor(payload['attention_mask'])
-                labels = None if payload['labels'] is None else torch.as_tensor(payload['labels'])
-                cut = int(payload['meta']['cut_layer'])
-
-                # Run from cut onward with return_loss_tensor=True for local update
-                res = _client_forward_from_cut(
-                    kv_model,
-                    h_cut=h_cut,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    cut=cut,
-                    compute_g_cut=(not zoo_eval),
-                    return_loss_tensor=True  # NEW: get loss tensor for local update
-                )
-
-                # Send response to server first
-                if zoo_eval:
-                    client.send_data({"loss": res["loss"]})
-                else:
-                    client.send_data({"loss": res["loss"], "g_cut": res["g_cut"]})
-
-                # NOW do local SGD update on client prefixes using the SAME batch
-                if not zoo_eval and labels is not None and "loss_tensor" in res:
-                    print(f"\rBatch {batch_count}: SGD client update, loss={res['loss']:.4f}", end='', flush=True)
-                    
-                    # Local client-prefix update using SGD
-                    optimizer.zero_grad(set_to_none=True)
-                    res["loss_tensor"].backward()  # This populates grads on kv_model.client_kv only
-                    optimizer.step()
-                    
-                    # Clear grads
-                    for p in kv_model.client_kv.parameters():
-                        if p.grad is not None:
-                            p.grad = None
-                    
-                batch_count += 1
-                
-            elif server_data.get('type') == 'eval_request':
-                # Handle evaluation request from server
-                payload = server_data['data']
-                h_cut = torch.as_tensor(payload['h_cut'])
-                attention_mask = torch.as_tensor(payload['attention_mask'])
-                labels = None if payload['labels'] is None else torch.as_tensor(payload['labels'])
-                cut = int(payload['meta']['cut_layer'])
-                
-                # Run evaluation forward pass
-                res = _client_forward_from_cut(
-                    kv_model,
-                    h_cut=h_cut,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    cut=cut,
-                    compute_g_cut=False,  # No gradients needed for eval
-                    return_loss_tensor=False
-                )
-                
-                # Send back evaluation loss
-                client.send_data({"eval_loss": res["loss"]})
-                
-        except Exception as e:
-            print(f"⌠ERROR IN CLIENT SGD TRAINING: {e}")
-            traceback.print_exc()
-            break
-
+    # ---- Reply to server ----
+    reply = {"loss": loss_value}
+    if g_cut_to_send is not None:
+        # sanity: shape must match h_cut
+        # (can't use tensors in dict over pickle reliably -> send numpy)
+        reply["g_cut"] = g_cut_to_send
+    client.send_data(reply)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Split Learning LLM Client')
@@ -662,6 +607,16 @@ def parse_args():
     parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
     parser.add_argument('--num_pert', type=int, default=5, help='Number of ZOO perturbations')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
+    parser.add_argument('--task', choices=["squad", "xsum", "drop", "sst2"], default="squad", help='Use ZOO for client')
+    parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
+    parser.add_argument('--lora_r', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    parser.add_argument('--lora_targets', type=str, default='q_proj,v_proj')
+
+    # argparse setup
+    parser.add_argument("--gcut-dtype", choices=["fp16", "fp32"], default="fp32", help="Wire precision for g_cut payloads.")
+
     return parser.parse_args()
 
 
@@ -682,14 +637,29 @@ if __name__ == "__main__":
     tokenizer = safe_get_hf_tokenizer(args.model_name)
     print("Tokenizer loaded successfully")
     
-    print("Creating client KV-prefix model...")
+    print("Creating client model...")
     # KV prefix model (new): always create so handlers can access
     from transformers import AutoConfig
     tmp_cfg = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map=None).config
     total_layers = tmp_cfg.num_hidden_layers
-    from prefix_kv import PrefixKV
-    kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix).to(device)
-    trainable_params = list(kv_model.client_kv.parameters())
+    if args.tuning == 'lora':
+        kv_model = LoRAClientModel(
+            args.model_name, total_layers, args.cut_layer,
+            r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
+            targets=tuple(args.lora_targets.split(','))
+        ).to(device)
+        trainable_params = list(kv_model.trainable_parameters())
+        print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+    else:
+        from prefix_kv import PrefixKV
+        kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix).to(device)
+        for p in getattr(kv_model, "base_model", kv_model).parameters():
+            p.requires_grad = False
+        for p in kv_model.client_kv.parameters():
+            p.requires_grad = True
+
+        trainable_params = list(kv_model.client_kv.parameters())
+        print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with {args.num_prefix} prefix tokens each")
 
     
     print(f"Model loaded: {args.model_name}")
@@ -697,10 +667,14 @@ if __name__ == "__main__":
     
     # Setup optimizer for client's prefix embeddings
     if args.use_zeroth_order_client:
-        optimizer = optim.SGD(kv_model.client_kv.parameters(), lr=args.zoo_lr, momentum=0.0)
+        # optimizer = optim.SGD(kv_model.client_kv.parameters(), lr=args.zoo_lr, momentum=0.0)
+        optimizer = optim.SGD(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()),
+                      lr=args.zoo_lr, momentum=0.0)
         print(f"Client using ZOO optimizer with lr={args.zoo_lr}")
     else:
-        optimizer = optim.SGD(kv_model.client_kv.parameters(), lr=args.lr, momentum=args.momentum)
+        # optimizer = optim.SGD(kv_model.client_kv.parameters(), lr=args.lr, momentum=args.momentum)
+        optimizer = optim.SGD(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()),
+                      lr=args.lr, momentum=args.momentum)
         print(f"Client using SGD optimizer with lr={args.lr}, momentum={args.momentum}")
     
     # Setup ZOO gradient estimator if needed
@@ -732,7 +706,17 @@ if __name__ == "__main__":
             'model_name': args.model_name,
             'num_prefix': args.num_prefix,
             'lr': args.lr,
-            'use_zeroth_order_client': args.use_zeroth_order_client
+            'client_sgd': args.use_zeroth_order_client,               # tell server which mode we’re in
+            'zoo_lr': getattr(args, "zoo_lr", None),
+            'mu': getattr(args, "mu", None),
+            'num_pert': getattr(args, "num_pert", None),
+            'client_tuning': args.tuning,
+            'lora': {
+                'r': args.lora_r,
+                'alpha': args.lora_alpha,
+                'dropout': args.lora_dropout,
+                'targets': args.lora_targets,
+            }
         }
         client.send_data(client_config)
         print(f"Sent client configuration")
@@ -745,17 +729,59 @@ if __name__ == "__main__":
             print("STARTING SGD TRAINING REQUEST HANDLER...")
             print(f"  Client prefixes WILL be trained using SGD")
         print("=" * 60)
-        
-        # Choose handler based on optimization method
-        if args.use_zeroth_order_client:
-            handle_training_requests_zoo(
-                kv_model, optimizer, grad_estimator, 
-                client, device, args
-            )
-        else:
-            handle_training_requests_sgd(
-                kv_model, optimizer, client, device, args
-            )
+
+        batch_idx = 0
+        while True:
+            msg = client.receive_data()
+            if msg is None:
+                print("No message received (server closed?). Exiting loop.")
+                break
+
+            mtype = msg.get("type", "")
+            if mtype == "get_client_kv_state":
+                # send a lightweight CPU snapshot of client prefixes for eval
+                state = {
+                    "k": kv_model.client_kv.k.detach().cpu(),
+                    "v": kv_model.client_kv.v.detach().cpu(),
+                }
+                client.send_data({"type": "client_kv_state", "state": state})
+                continue
+
+            elif mtype == "get_client_prefix_snapshot":
+                with torch.no_grad():
+                    if hasattr(kv_model, "client_kv") and getattr(kv_model.client_kv, "k", None) is not None:
+                        kc = kv_model.client_kv.k.detach().cpu()
+                        vc = kv_model.client_kv.v.detach().cpu()
+                        client.send_data({"type": "client_prefix_snapshot", "ok": True, "k": kc, "v": vc})
+                    else:
+                        client.send_data({"type": "client_prefix_snapshot", "ok": True, "k": None, "v": None})
+                continue
+
+            elif mtype == "training_complete":
+                print("TRAINING COMPLETED - CLIENT SHUTTING DOWN")
+                break
+
+            if mtype == "forward_cut":
+                handle_forward_cut_unified(
+                    client=client,
+                    kv_model=kv_model,
+                    optimizer=optimizer,
+                    grad_estimator=grad_estimator,
+                    args=args,
+                    device=device,
+                    pkt=msg["data"],
+                    meta=msg.get("meta", {}),
+                    batch_idx=batch_idx
+                )
+                batch_idx += 1
+
+            elif mtype in ("training_complete", "shutdown"):
+                print(f"Received '{mtype}' from server. Exiting.")
+                break
+
+            else:
+                # You can log/ignore other control messages here
+                print(f"Unknown message type: {mtype}")
         
     except ConnectionRefusedError:
         print("=" * 60)

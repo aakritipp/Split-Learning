@@ -1,7 +1,6 @@
 """
-SQUAD Metrics Calculation Module
-Handles all metric calculations for SQUAD question answering task
-Based on official SQUAD evaluation script and MeZO implementation
+FIXED: Multi-task metrics calculation module
+Handles SQUAD, SST2, DROP, XSum, and other tasks with proper ground truth extraction
 """
 
 import torch
@@ -30,17 +29,95 @@ def normalize_answer(s):
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
+def get_ground_truth_answers(batch, index):
+    """
+    FIXED: Multi-task ground truth extraction
+    Handles SQUAD, SST2, DROP, XSum with robust fallback strategies
+    """
+    try:
+        # Strategy 1: Check processed 'answers' field (your dataset creates this)
+        if 'answers' in batch and index < len(batch['answers']):
+            answers = batch['answers'][index]
+            if isinstance(answers, list) and len(answers) > 0:
+                valid_answers = [str(ans).strip() for ans in answers if str(ans).strip()]
+                if valid_answers:
+                    return valid_answers
+        
+        # Strategy 2: Check processed 'answer' field (single answer)
+        if 'answer' in batch and index < len(batch['answer']):
+            single_answer = batch['answer'][index]
+            if isinstance(single_answer, str) and single_answer.strip():
+                return [single_answer.strip()]
+        
+        # Strategy 3: Handle different original_example formats
+        if 'original_example' in batch and index < len(batch['original_example']):
+            original_ex = batch['original_example'][index]
+            
+            if isinstance(original_ex, dict):
+                # SQUAD format: answers.text
+                if ('answers' in original_ex and 
+                    isinstance(original_ex['answers'], dict) and
+                    'text' in original_ex['answers']):
+                    squad_answers = original_ex['answers']['text']
+                    if isinstance(squad_answers, list) and len(squad_answers) > 0:
+                        return [str(ans) for ans in squad_answers if str(ans).strip()]
+                
+                # SST2 format: reconstruct from label
+                if 'label' in original_ex:
+                    try:
+                        label = int(original_ex['label'])
+                        if label in [0, 1]:
+                            # CRITICAL: Must match your dataset.py verbalizer exactly
+                            verbalizer = {0: "terrible", 1: "great"}  
+                            return [verbalizer[label]]
+                    except (ValueError, TypeError):
+                        pass
+                
+                # DROP format: try various answer fields
+                if 'answers_spans' in original_ex:
+                    spans_data = original_ex['answers_spans']
+                    if isinstance(spans_data, dict) and 'spans' in spans_data:
+                        spans = spans_data['spans']
+                        if isinstance(spans, list) and len(spans) > 0:
+                            valid_spans = [str(span).strip() for span in spans if str(span).strip()]
+                            if valid_spans:
+                                return valid_spans
+                
+                # Direct answer field (some datasets)
+                if 'answer' in original_ex:
+                    direct_answer = str(original_ex['answer']).strip()
+                    if direct_answer and direct_answer.lower() != 'none':
+                        return [direct_answer]
+        
+        # Strategy 4: Extract from formatted_text as last resort
+        if 'formatted_text' in batch and index < len(batch['formatted_text']):
+            formatted_text = batch['formatted_text'][index]
+            if "Answer:" in formatted_text:
+                answer_part = formatted_text.split("Answer:")[-1].strip()
+                if answer_part:
+                    # Clean up the answer (remove newlines, periods)
+                    answer_clean = answer_part.split('\n')[0].split('.')[0].strip()
+                    if answer_clean:
+                        return [answer_clean]
+        
+        return []  # No ground truth found
+        
+    except Exception as e:
+        print(f"Error extracting ground truth for example {index}: {e}")
+        return []
+
+
 def squad_f1_score(prediction, ground_truth_list):
     """
-    Calculate F1 score for SQUAD - handles multiple ground truth answers
-    Args:
-        prediction: str - the predicted answer
-        ground_truth_list: list of str - list of possible correct answers
+    Calculate F1 score - handles multiple ground truth answers
     """
     try:
         # Handle the case where ground_truth_list is a single string
         if isinstance(ground_truth_list, str):
             ground_truth_list = [ground_truth_list]
+        
+        if not ground_truth_list or not prediction:
+            return 0.0
         
         # Handle special cases like "CANNOTANSWER" or "no answer"
         if (len(ground_truth_list) > 0 and 
@@ -77,21 +154,21 @@ def squad_f1_score(prediction, ground_truth_list):
         return float(max(all_f1s)) if all_f1s else 0.0
         
     except Exception as e:
-        print(f"❌ F1 calculation error: {e}")
+        print(f"F1 calculation error: {e}")
         return 0.0
 
 
 def squad_exact_match(prediction, ground_truth_list):
     """
-    Calculate exact match for SQUAD - handles multiple ground truth answers
-    Args:
-        prediction: str - the predicted answer  
-        ground_truth_list: list of str - list of possible correct answers
+    Calculate exact match - handles multiple ground truth answers
     """
     try:
         # Handle the case where ground_truth_list is a single string
         if isinstance(ground_truth_list, str):
             ground_truth_list = [ground_truth_list]
+        
+        if not ground_truth_list or not prediction:
+            return 0.0
         
         # Check exact match against any of the ground truth answers
         normalized_prediction = normalize_answer(prediction)
@@ -104,7 +181,7 @@ def squad_exact_match(prediction, ground_truth_list):
         return 0.0
         
     except Exception as e:
-        print(f"❌ EM calculation error: {e}")
+        print(f"EM calculation error: {e}")
         return 0.0
 
 
@@ -155,7 +232,7 @@ def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
         return sum(accuracies) / len(accuracies) if accuracies else 0.0
         
     except Exception as e:
-        print(f"❌ Answer token accuracy failed: {e}")
+        print(f"Answer token accuracy failed: {e}")
         return 0.0
 
 
@@ -233,12 +310,15 @@ def calculate_client_answer_accuracy(predictions, labels, batch, tokenizer):
         return sum(accuracies) / len(accuracies) if accuracies else 0.0
         
     except Exception as e:
-        print(f"❌ Client answer accuracy calculation failed: {e}")
+        print(f"Client answer accuracy calculation failed: {e}")
         return 0.0
 
 
-def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=30):
-    """Generate answers and calculate F1/EM - UPDATED TO MATCH REFERENCE"""
+
+def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5):
+    """
+    FIXED: Generation with constrained decoding for classification tasks
+    """
     try:
         model.eval()
         f1_scores = []
@@ -249,23 +329,19 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=3
         with torch.no_grad():
             for i in range(len(batch.get('formatted_text', []))):
                 try:
-                    # Get the full formatted text
                     full_text = batch['formatted_text'][i]
                     
-                    # Find the LAST occurrence of "Answer:"
+                    # Find "Answer:" to create generation prompt
                     answer_splits = full_text.split("Answer:")
                     if len(answer_splits) < 2:
-                        print(f"⚠️ No 'Answer:' found in text {i}")
+                        print(f"No 'Answer:' found in text {i}")
                         continue
                     
-                    # Reconstruct context + question + "Answer:"
                     context_question = "Answer:".join(answer_splits[:-1]) + "Answer:"
                     
-                    # Debug output
                     if i < 2:
-                        print(f"🔍 Example {i} - Generating from (last 100 chars): ...{context_question[-100:]}")
+                        print(f"Example {i} - Generating from: ...{context_question[-100:]}")
                     
-                    # Tokenize and generate
                     inputs = tokenizer(
                         context_question,
                         return_tensors='pt',
@@ -274,19 +350,14 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=3
                         padding=False
                     ).to(device)
                     
-                    if inputs['input_ids'].shape[1] == 0:
-                        print(f"⚠️ Empty input for example {i}")
-                        continue
-                    
-                    # Generate answer
+                    # FIXED: More constrained generation for classification
                     outputs = model.generate(
                         inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],
-                        max_new_tokens=max_new_tokens,
+                        max_new_tokens=max_new_tokens,  # Reduced from 30 to 5
                         min_new_tokens=1,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
+                        do_sample=False,  # FIXED: Use greedy decoding
+                        num_beams=1,      # FIXED: No beam search
                         pad_token_id=tokenizer.eos_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         use_cache=True
@@ -299,82 +370,214 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=3
                     if len(full_generated) > len(input_text):
                         generated_answer = full_generated[len(input_text):].strip()
                     else:
-                        generated_answer = full_generated.strip()
+                        generated_answer = ""
                     
-                    # Clean up the generated answer
+                    # FIXED: Better answer cleaning for classification
                     if generated_answer:
-                        generated_answer = generated_answer.split('\n')[0].split('.')[0]
-                        # Remove common artifacts
-                        generated_answer = generated_answer.replace('<|endoftext|>', '').strip()
+                        # Take only the first word (should be sentiment)
+                        generated_answer = generated_answer.split()[0] if generated_answer.split() else ""
+                        # Remove punctuation
+                        generated_answer = generated_answer.strip('.,!?"\'').lower()
+                        # Map common variations to expected labels
+                        answer_mapping = {
+                            'positive': 'great',
+                            'negative': 'terrible', 
+                            'good': 'great',
+                            'bad': 'terrible',
+                            'pos': 'great',
+                            'neg': 'terrible'
+                        }
+                        generated_answer = answer_mapping.get(generated_answer, generated_answer)
                     
-                    # Get ground truth answers as list (SQUAD can have multiple correct answers)
-                    ground_truth_answers = []
-                    if 'original_example' in batch and i < len(batch['original_example']):
-                        original_ex = batch['original_example'][i]
-                        if (isinstance(original_ex, dict) and 
-                            'answers' in original_ex and 
-                            isinstance(original_ex['answers'], dict) and
-                            'text' in original_ex['answers']):
-                            # SQUAD answers is a list - use all of them
-                            ground_truth_answers = original_ex['answers']['text']
+                    # Get ground truth
+                    ground_truth_answers = get_ground_truth_answers(batch, i)
                     
                     if not ground_truth_answers:
-                        print(f"⚠️ No ground truth answers for example {i}")
+                        print(f"No ground truth for example {i}")
                         continue
                     
-                    # Calculate F1 and EM with multiple ground truth answers
+                    # Calculate metrics
                     f1 = squad_f1_score(generated_answer, ground_truth_answers)
                     em = squad_exact_match(generated_answer, ground_truth_answers)
-                    
-                    # Validate scores
-                    if not (0 <= f1 <= 1) or not (0 <= em <= 1):
-                        print(f"⚠️ Invalid scores for example {i}: F1={f1}, EM={em}")
-                        continue
                     
                     f1_scores.append(f1)
                     em_scores.append(em)
                     
-                    # Debug output for first few examples
                     if i < 3:
-                        print(f"🔍 Example {i}:")
+                        print(f"Example {i}:")
                         print(f"   Generated: '{generated_answer}'")
                         print(f"   Ground truth: {ground_truth_answers}")
                         print(f"   F1: {f1:.4f}, EM: {em:.4f}")
-                    
-                except Exception as example_error:
-                    print(f"⚠️ Processing failed for example {i}: {example_error}")
+                
+                except Exception as e:
+                    print(f"Example {i} failed: {e}")
                     continue
         
-        # Calculate averages
         avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
         avg_em = sum(em_scores) / len(em_scores) if em_scores else 0.0
         
-        print(f"Generation complete: {len(f1_scores)} valid examples out of {len(batch.get('formatted_text', []))}")
-        print(f"Average F1: {avg_f1:.6f}, Average EM: {avg_em:.6f}")
-        
+        print(f"Generation complete: {len(f1_scores)} valid examples")
         return avg_f1, avg_em
         
     except Exception as e:
-        print(f"❌ Generation F1/EM calculation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Generation failed: {e}")
         return 0.0, 0.0
 
-
-def calculate_squad_metrics(outputs, labels, batch, tokenizer, model, device):
-    """Calculate SQUAD-specific metrics - MAIN FUNCTION"""
+def constrained_sentiment_generation(model, tokenizer, prompt, device):
+    """
+    Alternative: Constrained generation that forces valid sentiment tokens
+    """
     try:
-        # 1. Calculate standard next-token loss
+        # Define valid sentiment tokens
+        sentiment_tokens = {
+            'great': tokenizer.encode('great', add_special_tokens=False)[0],
+            'terrible': tokenizer.encode('terrible', add_special_tokens=False)[0],
+            'positive': tokenizer.encode('positive', add_special_tokens=False)[0],  
+            'negative': tokenizer.encode('negative', add_special_tokens=False)[0]
+        }
+        
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+        
+        with torch.no_grad():
+            # Get logits for next token
+            outputs = model(**inputs)
+            next_token_logits = outputs.logits[0, -1, :]  # Last token logits
+            
+            # Zero out all tokens except sentiment tokens
+            constrained_logits = torch.full_like(next_token_logits, -float('inf'))
+            for token_id in sentiment_tokens.values():
+                constrained_logits[token_id] = next_token_logits[token_id]
+            
+            # Sample from constrained distribution
+            probs = torch.softmax(constrained_logits, dim=-1)
+            next_token = torch.multinomial(probs, 1)
+            
+            # Decode the chosen token
+            return tokenizer.decode(next_token, skip_special_tokens=True).strip()
+    
+    except Exception as e:
+        print(f"Constrained generation failed: {e}")
+        return ""
+
+
+def debug_model_output(model, tokenizer, device):
+    """
+    Debug function to understand what the model is actually learning
+    """
+    model.eval()
+    
+    test_prompts = [
+        "Context: This movie is amazing\nQuestion: What is the overall sentiment?\nAnswer:",
+        "Context: This movie is awful\nQuestion: What is the overall sentiment?\nAnswer:",
+        "Review: Great film\nSentiment:",
+        "Sentiment of 'I love this': "
+    ]
+    
+    print("=== MODEL DEBUG ===")
+    
+    for i, prompt in enumerate(test_prompts):
+        print(f"\nTest {i+1}: {prompt}")
+        
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+        
+        # Try different generation strategies
+        strategies = [
+            {"do_sample": False, "max_new_tokens": 3},  # Greedy
+            {"do_sample": True, "temperature": 0.1, "max_new_tokens": 3},  # Low temp
+            {"do_sample": True, "temperature": 1.0, "max_new_tokens": 3},  # High temp
+        ]
+        
+        for j, params in enumerate(strategies):
+            try:
+                outputs = model.generate(inputs['input_ids'], **params)
+                generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                answer = generated[len(prompt):].strip()
+                print(f"  Strategy {j+1}: '{answer}'")
+            except Exception as e:
+                print(f"  Strategy {j+1}: FAILED - {e}")
+    
+    print("\n=== TOKEN ANALYSIS ===")
+    # Check if sentiment tokens are in vocabulary
+    sentiment_words = ['great', 'terrible', 'positive', 'negative', 'good', 'bad']
+    for word in sentiment_words:
+        tokens = tokenizer.encode(word, add_special_tokens=False)
+        print(f"'{word}' -> tokens: {tokens}")
+
+
+def evaluate_without_generation(outputs, labels, batch, tokenizer):
+    """
+    Alternative evaluation that doesn't rely on generation
+    Focus on next-token prediction accuracy for the answer tokens
+    """
+    try:
+        logits = outputs.logits
+        
+        # Create target tokens for sentiment words
+        great_tokens = tokenizer.encode(' great', add_special_tokens=False)
+        terrible_tokens = tokenizer.encode(' terrible', add_special_tokens=False)
+        
+        prediction_accuracies = []
+        
+        for i in range(len(batch['formatted_text'])):
+            text = batch['formatted_text'][i]
+            
+            # Find answer position
+            if 'Answer:' not in text:
+                continue
+                
+            # Get ground truth
+            ground_truth = get_ground_truth_answers(batch, i)
+            if not ground_truth:
+                continue
+                
+            expected_answer = ground_truth[0].lower()
+            
+            # Get expected token sequence
+            if expected_answer == 'great':
+                expected_tokens = great_tokens
+            elif expected_answer == 'terrible':
+                expected_tokens = terrible_tokens
+            else:
+                continue
+            
+            # Find answer token positions in the sequence
+            answer_start = text.find('Answer:') + len('Answer:')
+            context_part = text[:answer_start]
+            context_tokens = tokenizer.encode(context_part, add_special_tokens=False)
+            
+            # Check if model predicts correct next tokens
+            start_pos = len(context_tokens) - 1  # Position before answer
+            
+            if start_pos < logits.shape[1] - 1:
+                # Get prediction for first answer token
+                predicted_token_id = torch.argmax(logits[i, start_pos, :]).item()
+                expected_token_id = expected_tokens[0]
+                
+                accuracy = 1.0 if predicted_token_id == expected_token_id else 0.0
+                prediction_accuracies.append(accuracy)
+        
+        return sum(prediction_accuracies) / len(prediction_accuracies) if prediction_accuracies else 0.0
+        
+    except Exception as e:
+        print(f"Next-token evaluation failed: {e}")
+        return 0.0
+
+
+# Updated main metrics function
+def calculate_squad_metrics(outputs, labels, batch, tokenizer, model, device):
+    """
+    Enhanced metrics with fallback for classification tasks
+    """
+    try:
         loss = outputs.loss.item() if outputs.loss is not None else 0.0
         
-        # 2. Calculate token-level accuracy (for monitoring)
+        # Standard token accuracy
         logits = outputs.logits
         if logits.shape[1] != labels.shape[1]:
             min_len = min(logits.shape[1], labels.shape[1])
             logits = logits[:, :min_len, :]
             labels = labels[:, :min_len]
         
-        # For next token prediction
         if logits.shape[1] > 1:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
@@ -383,51 +586,53 @@ def calculate_squad_metrics(outputs, labels, batch, tokenizer, model, device):
             shift_labels = labels
         
         predictions = torch.argmax(shift_logits, dim=-1)
+        answer_accuracy = calculate_answer_token_accuracy(predictions, shift_labels, batch, tokenizer)
         
-        # Calculate answer token accuracy
-        answer_accuracy = calculate_answer_token_accuracy(
-            predictions, shift_labels, batch, tokenizer
-        )
-        
-        # 3. Calculate F1/EM by generating answers (with error handling)
-        f1_score = 0.0
-        em_score = 0.0
-        
-        # Only try generation if we have the required data
-        if ('original_example' in batch and 'formatted_text' in batch and 
-            len(batch.get('original_example', [])) > 0 and 
-            len(batch.get('formatted_text', [])) > 0):
+        # Try generation-based evaluation
+        f1_score, em_score = 0.0, 0.0
+        try:
+            f1_score, em_score = calculate_generation_f1_em(model, batch, tokenizer, device)
+        except Exception as gen_error:
+            print(f"Generation evaluation failed: {gen_error}")
             
-            try:
-                f1_score, em_score = calculate_generation_f1_em(
-                    model, batch, tokenizer, device
-                )
-            except Exception as gen_error:
-                print(f"⚠️ Generation metrics failed: {gen_error}")
-                f1_score, em_score = 0.0, 0.0
+            # Fallback: next-token prediction accuracy
+            print("Using next-token prediction evaluation as fallback...")
+            next_token_acc = evaluate_without_generation(outputs, labels, batch, tokenizer)
+            print(f"Next-token accuracy: {next_token_acc:.4f}")
         
         return loss, answer_accuracy, f1_score, em_score
         
     except Exception as e:
-        print(f"❌ SQUAD metrics calculation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"All metrics failed: {e}")
         return 0.0, 0.0, 0.0, 0.0
 
 
-def test_generation_simple(model, tokenizer, device):
-    """Simple generation test to verify model works"""
+def test_generation_simple(model, tokenizer, device, max_new_tokens=16):
+    """
+    FIXED: Simple generation test with proper input handling
+    """
     try:
+        model.eval()
         test_input = "Question: What is the capital of France? Answer:"
         
         inputs = tokenizer(test_input, return_tensors='pt').to(device)
         
-        outputs = model.generate(
-            inputs['input_ids'],
-            max_new_tokens=10,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
+        # Handle different model wrappers
+        if hasattr(model, 'generate'):
+            outputs = model.generate(
+                inputs['input_ids'],
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        elif hasattr(model, 'base_model') and hasattr(model.base_model, 'generate'):
+            outputs = model.base_model.generate(
+                inputs['input_ids'],
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        else:
+            print("No generate method found")
+            return False
         
         generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
         answer = generated[len(test_input):].strip()
@@ -439,7 +644,7 @@ def test_generation_simple(model, tokenizer, device):
         return len(answer) > 0
         
     except Exception as e:
-        print(f"❌ Generation test failed: {e}")
+        print(f"Generation test failed: {e}")
         return False
 
 

@@ -100,15 +100,15 @@ class MultiTaskDataset(Dataset):
             # Fix XSum dataset loading to follow reference pattern
             try:
                 # Try the standard XSum dataset first
-                dataset = load_dataset('EdinburghNLP/xsum', split='train' if split == 'train' else 'test')
+                dataset = load_dataset('EdinburghNLP/xsum', split=split)
             except:
                 try:
                     # Try alternative XSum loading
-                    dataset = load_dataset('xsum', split='train' if split == 'train' else 'test', revision='main')
+                    dataset = load_dataset('xsum', split=split)
                 except:
                     # Last resort: try CNN/DailyMail
-                    print(f"Warning: XSum loading failed, using CNN/DailyMail as fallback")
-                    dataset = load_dataset('cnn_dailymail', '3.0.0', split='train' if split == 'train' else 'test')
+                    alt_split = 'validation' if split == 'validation' else ('train' if split == 'train' else 'test')
+                    dataset = load_dataset('cnn_dailymail', '3.0.0', split=alt_split)
         elif task == 'sst2':
             dataset = load_dataset('glue', 'sst2', split='train' if split == 'train' else 'validation')
         else:
@@ -172,6 +172,9 @@ class MultiTaskDataset(Dataset):
                 # Some DROP examples might have direct answer field
                 answer = example['answer']
             
+            if not answer and 'number' in example:
+                answer = str(example['number'])
+            
             formatted_text = f"Context: {passage}\nQuestion: {question}\nAnswer: {answer}"
             
             return {
@@ -216,27 +219,42 @@ class MultiTaskDataset(Dataset):
                 'original_example': example
             }
             
-        elif task == 'sst2':
-            sentence = example['sentence']
-            label = example['label']  # 0 = negative, 1 = positive
-            
-            # Use completion format inspired by reference templates
-            # This is much more natural for language models than classification format
-            verbalizer = {0: "terrible", 1: "great"}  # Maps labels to completion words
+        elif task == "sst2":
+            # Robustly read fields
+            sentence = example.get("sentence", "")
+            raw_label = example.get("label", 0)
+            try:
+                label = int(raw_label)
+            except Exception:
+                # Some loaders yield strings like "1"
+                label = 1 if str(raw_label).strip() in {"1", "true", "pos", "positive"} else 0
+
+            # Verbalizer must stay consistent across train/eval to keep EM/F1 meaningful
+            verbalizer = {0: "terrible", 1: "great"}
             completion_word = verbalizer[label]
-            
-            # Format: "Sentence It was word" instead of "Sentence: X\nSentiment: label"
-            formatted_text = f"{sentence} It was {completion_word}"
-            
+
+            # Use the same universal prompt shape your SQuAD path uses
+            question = "What is the overall sentiment of the sentence?"
+            formatted_text = (
+                f"Context: {sentence}\n"
+                f"Question: {question}\n"
+                f"Answer: {completion_word}"
+            )
+
+            # Return keys that your collate/eval already understand
             return {
-                'text': formatted_text,
-                'context': sentence,
-                'question': '',
-                'answer': completion_word,  # Use completion word as answer
-                'id': example.get('idx', ''),
-                'formatted_text': formatted_text,
-                'original_example': example  # Keep original for ground truth mapping
+                "text": formatted_text,                # legacy key (if used elsewhere)
+                "context": sentence,
+                "question": question,
+                "answer": completion_word,             # keep if some code expects 'answer'
+                "answer_text": completion_word,        # common in your QA path
+                "answers": [completion_word],          # safe default for EM/F1 helpers
+                "id": example.get("idx", example.get("guid", "")),
+                "formatted_text": formatted_text,      # the string the model actually sees
+                "original_example": example,
+                "label": label,                        # keep raw label for debugging
             }
+
     
     def __len__(self):
         return len(self.examples)
