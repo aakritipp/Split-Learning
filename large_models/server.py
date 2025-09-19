@@ -256,7 +256,7 @@ def _server_forward_to_cut_payload(
         "labels": labels.cpu() if labels is not None else None,
         "cut_layer": cut,
     }
-    return h_cut_send, payload
+    return h_cut_live, payload
 
 class _PrefixConcatCache:
     """
@@ -561,10 +561,8 @@ class SQuADDataset(Dataset):
             
             result = {
                 'input_ids': input_ids,
-                        'server_kv_state': server_model.state_dict_kv(),
-                        'cut_layer': args.cut_layer,
-                        'server_kv_state': server_model.state_dict_kv(),
-                        'cut_layer': args.cut_layer,
+                'server_kv_state': server_model.state_dict_kv(),
+                'cut_layer': args.cut_layer,
                 'attention_mask': attention_mask,
                 'labels': labels
             }
@@ -868,7 +866,6 @@ class Trainer:
             return pickle.loads(payload)
         except (EOFError, ConnectionResetError, BrokenPipeError, socket.timeout, OSError):
             return None
-
 
 def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
     """Calculate SQUAD-specific metrics - ROBUST VERSION"""
@@ -1792,21 +1789,20 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     loss_val = float(resp["loss"])
                     print(f"Loss: {loss_val:.4f}")
 
-                    g_cut = torch.as_tensor(resp["g_cut"])
+                    if "g_cut" not in resp:
+                        raise RuntimeError("SGD training requires g_cut from client")
+
+                    # Convert numpy array back to tensor and move to correct device
+                    g_cut_np = resp["g_cut"]
+                    g_cut = torch.from_numpy(g_cut_np).to(device=h_cut_live.device, dtype=h_cut_live.dtype)
+
+                    # Verify shapes match
                     if g_cut.shape != h_cut_live.shape:
                         raise RuntimeError(f"g_cut shape {tuple(g_cut.shape)} != h_cut {tuple(h_cut_live.shape)}")
-                    g_cut = g_cut.to(device=h_cut_live.device, dtype=h_cut_live.dtype)
 
-                    g_cut = torch.as_tensor(resp.get("g_cut")) if resp.get("g_cut", None) is not None else None
-                    if meta_server_needs_g_cut:  # whatever flag you use in this scope
-                        if g_cut is None:
-                            raise RuntimeError("Server expected g_cut but client returned none.")
-                        # enforce exact shape match
-                        if g_cut.shape != h_cut_live.shape:
-                            raise RuntimeError(f"g_cut shape {tuple(g_cut.shape)} != h_cut {tuple(h_cut_live.shape)}")
-                        h_cut_live.backward(g_cut)
-                        optimizer.step()
-
+                    # Verify gradient requirements
+                    if not h_cut_live.requires_grad:
+                        raise RuntimeError("h_cut_live doesn't require grad - server prefixes may not be trainable")
 
                     optimizer.zero_grad(set_to_none=True)
                     h_cut_live.backward(g_cut)

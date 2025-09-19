@@ -370,6 +370,177 @@ class ClientKVModel(nn.Module):
         )
         return outputs
 
+    def forward_from_cut(self, h_cut, attention_mask, labels=None, return_logits=False):
+        """
+        Forward pass starting from intermediate activations h_cut.
+        Used for evaluation and loss computation.
+        
+        Args:
+            h_cut: [batch_size, seq_len, hidden_size] - intermediate activations from server
+            attention_mask: [batch_size, seq_len] - attention mask
+            labels: optional labels for loss computation
+            return_logits: if True, return logits instead of loss dict
+        
+        Returns:
+            dict with 'loss' key, or logits tensor if return_logits=True
+        """
+        device = h_cut.device
+        dtype = h_cut.dtype
+        
+        # Move tensors to correct device
+        h = h_cut.to(device=device, dtype=dtype)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=device)
+        if labels is not None:
+            labels = labels.to(device=device)
+
+        # Get client prefix length
+        try:
+            prefix_len = int(self.client_kv.k.shape[-2])  # [L, H, P, D]
+        except:
+            prefix_len = 0
+
+        tgt_len = h.shape[1]
+        attn_mask_4d = _build_self_attn_mask(
+            attention_mask=attention_mask,
+            tgt_len=tgt_len,
+            prefix_len=prefix_len,
+            dtype=h.dtype,
+            device=h.device,
+        )
+
+        # Build client past for layers >= cut_layer
+        bsz = h.size(0)
+        client_past = {}
+        if hasattr(self, "client_kv") and hasattr(self.client_kv, "get_local_past"):
+            client_past = self.client_kv.get_local_past(bsz)
+
+        # Run layers cut_layer..end with per-layer client prefixes
+        decoder = self.base_model.model.decoder
+        for li in range(self.cut_layer, len(decoder.layers)):
+            layer = decoder.layers[li]
+            pkv = client_past.get(li, None)
+            if pkv is not None:
+                pkv = _PrefixConcatCache(pkv[0], pkv[1])
+
+            layer_out = layer(
+                h,
+                attention_mask=attn_mask_4d,
+                layer_head_mask=None,
+                past_key_value=pkv,
+                output_attentions=False,
+                use_cache=False,
+            )
+            h = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
+
+        # Final norm + LM head
+        if decoder.final_layer_norm is not None:
+            h = decoder.final_layer_norm(h)
+        logits = self.base_model.lm_head(h)
+
+        # Return logits if requested
+        if return_logits:
+            return logits
+
+        # Compute loss if labels provided
+        if labels is not None and attention_mask is not None:
+            labels = torch.where(attention_mask == 0, torch.tensor(-100, device=labels.device), labels)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="mean",
+            )
+        else:
+            loss = torch.zeros((), device=device, dtype=dtype)
+
+        return {"loss": float(loss.item())}
+
+    
+    def generate_from_cut(self, h_cut, attention_mask, max_new_tokens=20):
+        """
+        Generate token IDs starting from intermediate activations h_cut.
+        
+        Args:
+            h_cut: [batch_size, seq_len, hidden_size] - intermediate activations from server
+            attention_mask: [batch_size, seq_len] - attention mask
+            max_new_tokens: int - number of new tokens to generate
+        
+        Returns:
+            torch.Tensor: [batch_size, max_new_tokens] - generated token IDs
+        """
+        device = h_cut.device
+        batch_size = h_cut.shape[0]
+        generated_tokens = []
+        
+        # Start with the last hidden state from h_cut
+        current_hidden = h_cut[:, -1:, :]  # [batch_size, 1, hidden_size]
+        
+        for step in range(max_new_tokens):
+            # Forward through client layers starting from cut_layer
+            h = current_hidden
+            
+            # Build attention mask for current step
+            step_attention_mask = torch.ones(batch_size, 1, device=device)
+            
+            # Get prefix length for attention masking
+            try:
+                prefix_len = int(self.client_kv.k.shape[-2])
+            except:
+                prefix_len = 0
+                
+            # Build 4D attention mask
+            attn_mask_4d = _build_self_attn_mask(
+                attention_mask=step_attention_mask,
+                tgt_len=1,
+                prefix_len=prefix_len,
+                dtype=h.dtype,
+                device=h.device,
+            )
+            
+            # Get client KV cache
+            client_past = self.client_kv.get_local_past(batch_size)
+            
+            # Forward through decoder layers [cut_layer..total_layers-1]
+            decoder = self.base_model.model.decoder
+            for li in range(self.cut_layer, len(decoder.layers)):
+                layer = decoder.layers[li]
+                pkv = client_past.get(li, None)
+                if pkv is not None:
+                    pkv = _PrefixConcatCache(pkv[0], pkv[1])
+
+                layer_out = layer(
+                    h,
+                    attention_mask=attn_mask_4d,
+                    layer_head_mask=None,
+                    past_key_value=pkv,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+                h = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
+
+            # Final layer norm and LM head
+            if decoder.final_layer_norm is not None:
+                h = decoder.final_layer_norm(h)
+            logits = self.base_model.lm_head(h)  # [batch_size, 1, vocab_size]
+            
+            # Sample next token (greedy decoding)
+            next_token_id = torch.argmax(logits[:, -1, :], dim=-1)  # [batch_size]
+            generated_tokens.append(next_token_id.unsqueeze(1))  # [batch_size, 1]
+            
+            # Prepare next input (embed the generated token)
+            next_token_embed = decoder.embed_tokens(next_token_id.unsqueeze(1))
+            scale = getattr(decoder, "embed_scale", 1.0)
+            if scale != 1.0:
+                next_token_embed = next_token_embed * scale
+            current_hidden = next_token_embed
+        
+        # Concatenate all generated tokens
+        generated_ids = torch.cat(generated_tokens, dim=1)  # [batch_size, max_new_tokens]
+        return generated_ids
+
     def zero_prefix_grads(self):
         for mod in [self.server_kv_mirror, self.client_kv]:
             if hasattr(mod.k, "grad") and mod.k.grad is not None:
@@ -394,7 +565,7 @@ class Client:
 
         _ = self.receive_data()
         
-    def _recvall(self, n: int):
+    def _recvall(self, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
             try:
@@ -405,7 +576,7 @@ class Client:
                 return None
             buf.extend(chunk)
         return bytes(buf)
-
+        
     def send_data(self, obj):
         try:
             payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -417,7 +588,7 @@ class Client:
 
     def receive_data(self):
         try:
-            header = self._recvall(4)           # ← use the method, not a global
+            header = self._recvall(4)            # <-- use the method, not a global
             if header is None or len(header) != 4:
                 return None
             n = int.from_bytes(header, 'big')
@@ -428,6 +599,7 @@ class Client:
         except Exception as e:
             print(f"⌠receive_data failed: {e}")
             return None
+
 
     def close(self):
         try:
@@ -696,8 +868,12 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         # (can't use tensors in dict over pickle reliably -> send numpy)
         # reply["g_cut"] = g_cut_to_send
         # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
-        reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
-    print(reply)
+        # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
+        if isinstance(g_cut_to_send, torch.Tensor):
+            gc = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
+        else:
+            gc=np.asarray(g_cut_to_send, dtype=np.float32)
+        reply["g_cut"] = gc
     client.send_data(reply)
 
 def parse_args():
@@ -840,7 +1016,7 @@ if __name__ == "__main__":
         
         # client = Client('localhost', 12345)
         client = Client(args.host, args.port)  # establishes TCP immediately
-        client.send_data({"type": "client_hello", "version": 1})
+        # client.send_data({"type": "client_hello", "version": 1})
         
         print("=" * 60)
         print("CLIENT SUCCESSFULLY CONNECTED TO SERVER!")
