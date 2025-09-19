@@ -385,25 +385,27 @@ class Client:
             self.socket.settimeout(300.0)
         except Exception:
             pass
-        # Optional: read and ignore a server hello if sent
+
         try:
-            peek_hdr = self.socket.recv(4, socket.MSG_PEEK)
-            if len(peek_hdr) == 4:
-                # there is a framed message waiting; consume and ignore if it's just 'server_hello'
-                _ = self.receive_data()
-        except Exception:
-            # If nothing is there yet, that's fine; we wait for the first real command.
-            pass
+            self.send_data({"type": "client_hello", "version": 1})
+        except Exception as e:
+            print(f"⌠failed to send client_hello: {e}")
+            raise
+
+        _ = self.receive_data()
         
-    def _recvall(self, n: int) -> bytes:
+    def _recvall(self, n: int):
         buf = bytearray()
         while len(buf) < n:
-            chunk = self.socket.recv(n - len(buf))
+            try:
+                chunk = self.socket.recv(n - len(buf))
+            except (BlockingIOError, InterruptedError):
+                continue
             if not chunk:
-                raise EOFError(f"socket closed during recv (wanted {n}, got {len(buf)})")
+                return None
             buf.extend(chunk)
         return bytes(buf)
-        
+
     def send_data(self, obj):
         try:
             payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -415,13 +417,18 @@ class Client:
 
     def receive_data(self):
         try:
-            header = _recvall(self.socket, 4)
+            header = self._recvall(4)
+            if header is None or len(header) != 4:
+                return None
             n = int.from_bytes(header, 'big')
-            payload = _recvall(self.socket, n)
+            payload = self._recvall(n)
+            if payload is None or len(payload) != n:
+                return None
             return pickle.loads(payload)
         except Exception as e:
             print(f"⌠receive_data failed: {e}")
-            raise
+            return None
+
     
     def close(self):
         try:
@@ -798,7 +805,6 @@ if __name__ == "__main__":
         trainable_params = list(kv_model.client_kv.parameters())
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with {args.num_prefix} prefix tokens each")
 
-    
     print(f"Model loaded: {args.model_name}")
     print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with {args.num_prefix} prefix tokens each")
     
@@ -833,7 +839,9 @@ if __name__ == "__main__":
         print("=" * 60)
         print("Trying to connect to server at localhost:12345...")
         
-        client = Client('localhost', 12345)
+        # client = Client('localhost', 12345)
+        client = Client(args.host, args.port)  # establishes TCP immediately
+        client.send_data({"type": "client_hello", "version": 1})
         
         print("=" * 60)
         print("CLIENT SUCCESSFULLY CONNECTED TO SERVER!")
@@ -855,8 +863,29 @@ if __name__ == "__main__":
                 'targets': args.lora_targets,
             }
         }
-        client.send_data(client_config)
-        print(f"Sent client configuration")
+        try:
+            first = client.receive_data()
+            if isinstance(first, dict) and first.get("type") == "server_hello":
+                # wait for an explicit request or fall back after a short grace period
+                try:
+                    maybe_req = client.receive_data()
+                    if isinstance(maybe_req, dict) and maybe_req.get("type") == "request_client_config":
+                        client.send_data(client_config)
+                    else:
+                        # Server didn’t ask explicitly; send proactively
+                        client.send_data(client_config)
+                except Exception:
+                    client.send_data(client_config)
+            else:
+                # Old server — just send it
+                client.send_data(client_config)
+        except Exception:
+            # If the read failed, still try to send config (server may be waiting)
+            client.send_data(client_config)
+
+        print("Sent client configuration")
+        # client.send_data(client_config)
+        # print(f"Sent client configuration")
 
         print("=" * 60)
         if args.use_zeroth_order_client:
@@ -899,6 +928,11 @@ if __name__ == "__main__":
                 break
 
             if mtype == "forward_cut":
+                data = msg.get("data")
+                if data is None or not isinstance(data, dict):
+                    print("⌠CLIENT: malformed forward_cut (missing 'data'); ignoring this packet.")
+                    # Optionally: client.send_data({"type":"error","reason":"missing_data_in_forward_cut"})
+                    continue
                 handle_forward_cut_unified(
                     client=client,
                     kv_model=kv_model,
@@ -906,7 +940,7 @@ if __name__ == "__main__":
                     grad_estimator=grad_estimator,
                     args=args,
                     device=device,
-                    pkt=msg["data"],
+                    pkt=msg,
                     meta=msg.get("meta", {}),
                     batch_idx=batch_idx
                 )

@@ -834,26 +834,40 @@ class Trainer:
         except Exception:
             pass
 
-    def _recvall(self, n: int) -> bytes:
+    def _recvall(self, n: int):
         buf = bytearray()
         while len(buf) < n:
-            chunk = self.conn.recv(n - len(buf))
+            try:
+                chunk = self.conn.recv(n - len(buf))
+            except (BlockingIOError, InterruptedError):
+                continue
             if not chunk:
-                raise EOFError(f"socket closed during recv (wanted {n}, got {len(buf)})")
+                return None  # peer closed
             buf.extend(chunk)
         return bytes(buf)
 
-    def send_data(self, data):
-        serialized = pickle.dumps(data, protocol=4)
-        self.conn.sendall(len(serialized).to_bytes(4, 'big'))
-        self.conn.sendall(serialized)
+    def send_data(self, data) -> bool:
+        try:
+            serialized = pickle.dumps(data, protocol=4)
+            self.conn.sendall(len(serialized).to_bytes(4, 'big'))
+            self.conn.sendall(serialized)
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError, socket.timeout) as e:
+            print(f"⚠️ send_data failed: {e}")
+            return False
 
     def receive_data(self):
-        header = self._recvall(4)
-        length = int.from_bytes(header, 'big')
-        payload = self._recvall(length)
-        return pickle.loads(payload)
-
+        try:
+            header = self._recvall(4)
+            if header is None or len(header) != 4:
+                return None
+            length = int.from_bytes(header, 'big')
+            payload = self._recvall(length)
+            if payload is None or len(payload) != length:
+                return None
+            return pickle.loads(payload)
+        except (EOFError, ConnectionResetError, BrokenPipeError, socket.timeout, OSError):
+            return None
 
 def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
     """Calculate SQUAD-specific metrics - ROBUST VERSION"""
@@ -1968,7 +1982,7 @@ if __name__ == "__main__":
         print("Setting up network...")
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('localhost', 12345))
+        server_socket.bind((args.host, args.port))
         server_socket.listen(1)
         
         # Debug: Print model dimensions
@@ -1980,13 +1994,53 @@ if __name__ == "__main__":
         print("Server listening on localhost:12345")
         print("Start client with same parameters")
         print("=" * 60)
-        
+
+        # Accept client connection(s) until we get a valid hello/config
+        client_config = None
         # Accept client connection
         conn, addr = server_socket.accept()
         print(f"✅ Client connected from {addr}")
-        
         trainer = Trainer(conn)
-        client_config = trainer.receive_data()
+
+        def _is_valid_client_config(msg: dict) -> bool:
+            if not isinstance(msg, dict):
+                return False
+            # minimally expect keys you actually use later
+            required = {"model_name", "num_prefix"}
+            return required.issubset(msg.keys())
+
+        # Read first message; don’t assume it’s config
+        msg = trainer.receive_data()
+        if msg is None:
+            print("⚠️ Client disconnected before sending any message; closing.")
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            conn.close()
+            sys.exit(0)
+
+        client_config = None
+        if _is_valid_client_config(msg):
+            client_config = msg
+            print(f"Received client config: {client_config}")
+        else:
+            # Optional: if you later add client_hello/request flow, you can branch here.
+            # For now, insist on a real config.
+            print(f"⚠️ Expected client config, got: {msg}. Closing.")
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            conn.close()
+            sys.exit(1)
+
+        print("Starting training...")
+
+
+        if client_config is None:
+            raise RuntimeError("Client disconnected before hello/config")
+
         print(f"Received client config: {client_config}")
         
         print("Starting training...")
