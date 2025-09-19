@@ -28,6 +28,95 @@ try:
 except Exception:
     merge_past_key_values = None
 
+def right_trim(input_ids, attention_mask, labels=None):
+    """Remove right padding for efficiency"""
+    L = attention_mask.sum(dim=1).max().item()
+    input_ids = input_ids[:, :int(L)]
+    attention_mask = attention_mask[:, :int(L)]
+    if labels is not None: 
+        labels = labels[:, :int(L)]
+    return input_ids, attention_mask, labels
+
+@torch.no_grad()
+def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, k=4):
+    """Print generation examples during evaluation"""
+    print("\n=== GENERATION SAMPLES ===")
+    
+    if "prompt_only" not in batch:
+        print("No prompt_only field available for generation testing")
+        return
+    
+    model.eval()
+    prompts = batch["prompt_only"][:k]
+    refs = batch["refs"][:k]
+    
+    # Tokenize prompts
+    enc = tokenizer(
+        prompts, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=350
+    ).to(device)
+
+    input_ids, attention_mask = right_trim(enc["input_ids"], enc["attention_mask"])
+    enc = {"input_ids": input_ids, "attention_mask": attention_mask}
+    
+    
+    # Generate
+    try:
+        outputs = model.generate(
+            enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
+        )
+    except Exception as e:
+        print(f"Generation failed: {e}")
+        return
+    
+    # Process outputs
+    for i in range(min(k, outputs.size(0))):
+        try:
+            # Decode full generated sequence
+            full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+            
+            # Remove prompt to get just the answer
+            prompt_text = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=True)
+            if len(full_text) > len(prompt_text):
+                pred_answer = full_text[len(prompt_text):].strip()
+            else:
+                pred_answer = ""
+            
+            # Clean up prediction
+            pred_answer = pred_answer.split('\n')[0].strip('.,!?"\'')
+            
+            # Get ground truth
+            gold_answers = refs[i] if i < len(refs) else [""]
+            gold_answer = gold_answers[0] if gold_answers else ""
+            
+            # Extract question for display
+            question_part = prompts[i].split('Question:', 1)[-1].split('Answer:', 1)[0].strip()
+            
+            # Calculate metrics
+            from metrics import squad_f1_score, squad_exact_match
+            f1 = squad_f1_score(pred_answer, gold_answers)
+            em = squad_exact_match(pred_answer, gold_answers)
+            
+            print(f"\nExample {i+1}:")
+            print(f"Q: {question_part}")
+            print(f"Pred: '{pred_answer}'")
+            print(f"Gold: '{gold_answer}'")
+            print(f"EM={em:.3f} F1={f1:.3f}")
+            
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+    
+    print("=== END SAMPLES ===\n")
+
 def adapt_batch(batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -1116,7 +1205,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
         try:
             # --- Uniform batch adapter THEN right-trim ---
             input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
-            input_ids, attention_mask, labels = right_trim_batch(input_ids, attention_mask, labels)
+            input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
 
             # ======== TRUE-SPLIT EVAL PATH ========
             if server_model is not None and trainer is not None:
@@ -1720,6 +1809,43 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
         traceback.print_exc()
         return 0.0, 0.0
 
+def create_squad_labels(input_ids, attention_mask, formatted_texts, tokenizer):
+    """
+    Create proper labels for SQuAD training - only supervise on answer tokens
+    """
+    batch_size = input_ids.shape[0]
+    labels = torch.full_like(input_ids, -100)  # Start with all ignored
+    
+    for i in range(batch_size):
+        text = formatted_texts[i]
+        
+        # Find the answer start position
+        answer_start_text = text.find("Answer:")
+        if answer_start_text == -1:
+            continue
+            
+        # Get context + question + "Answer:" part
+        context_question = text[:answer_start_text + len("Answer:")]
+        answer_text = text[answer_start_text + len("Answer:"):].strip()
+        
+        if not answer_text:
+            continue
+            
+        # Tokenize to find answer token positions
+        context_tokens = tokenizer.encode(context_question, add_special_tokens=False)
+        answer_tokens = tokenizer.encode(answer_text, add_special_tokens=False)
+        
+        if len(answer_tokens) == 0:
+            continue
+            
+        # Set labels for answer tokens only
+        start_idx = len(context_tokens)
+        end_idx = min(start_idx + len(answer_tokens), input_ids.shape[1])
+        
+        if start_idx < input_ids.shape[1] and start_idx < end_idx:
+            labels[i, start_idx:end_idx] = input_ids[i, start_idx:end_idx]
+    
+    return labels
 
 def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader, optimizer, 
                            scheduler, trainer, device, tokenizer, args):
@@ -1752,15 +1878,21 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                 try:
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
+                    formatted_texts = batch.get('formatted_text', [])
                     # labels = batch['labels'].to(device)
+
+                    labels = create_squad_labels(input_ids, attention_mask, formatted_texts, tokenizer)
+                    labels = labels.to(device)
+
+                    input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
                     
                     optimizer.zero_grad()
-                    labels = input_ids.clone()
-                    labels[attention_mask == 0] = -100
-                    pad_id = getattr(tokenizer, 'pad_token_id', None)
-                    if pad_id is not None:
-                        labels[input_ids == pad_id] = -100
-                    labels = labels.long()
+                    # labels = input_ids.clone()
+                    # labels[attention_mask == 0] = -100
+                    # pad_id = getattr(tokenizer, 'pad_token_id', None)
+                    # if pad_id is not None:
+                    #     labels[input_ids == pad_id] = -100
+                    # labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
                     h_cut_live, pkg = _server_forward_to_cut_payload(
@@ -1818,19 +1950,16 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     # Update progress bar with current loss, accuracy, and F1
                     global_step += 1
                     current_loss = sum(losses[-10:]) / min(len(losses), 10)  # Moving average of last 10
-                    current_acc = sum(accs[-10:]) / min(len(accs), 10)
                     
-                    pbar.set_postfix_str(f"{current_loss:.4f}, Acc: {current_acc:.3f}")
+                    pbar.set_postfix_str(f"{current_loss:.4f}")
                     pbar.update(1)
                     
-                    # Print detailed stats every 20 batches
-                    if (i + 1) % 20 == 0:
-                        avg_loss = sum(losses) / len(losses)
-                        avg_acc = sum(accs) / len(accs)
-                        print(f"\nStep {i+1}/{len(train_loader)} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.3f}")
-
                     if global_step % args.eval_steps == 0:
                         print(f"\nStep {global_step}: Running evaluation...")
+
+                        test_batch = next(iter(eval_loader))
+                        print_squad_generations(full_model, tokenizer, test_batch, device)
+                        
                         eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
                             full_model, eval_loader, device, tokenizer, args
                         )
@@ -1844,12 +1973,6 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         # Return to training mode
                         server_model.train()
 
-                    # Print progress every 100 steps
-                    if global_step % 100 == 0:
-                        avg_loss = sum(losses[-100:]) / min(len(losses), 100)
-                        avg_acc = sum(accs[-100:]) / min(len(accs), 100)
-                        print(f"\nStep {global_step}/{args.max_steps} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.6f}")
-                    
                 except Exception as e:
                     traceback.print_exc()
                     print(f"Batch {global_step} Error: {e}")
@@ -1858,10 +1981,9 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
         scheduler.step()
         
         avg_loss = sum(losses) / len(losses) if losses else 0.0
-        avg_acc = sum(accs) / len(accs) if accs else 0.0
         
-        print(f"\nSGD Training Complete - Final Loss: {avg_loss:.4f}, Final Acc: {avg_acc:.3f}")
-        return avg_loss, avg_acc
+        print(f"\nSGD Training Complete - Final Loss: {avg_loss:.4f}")
+        return avg_loss, 0.0
         
     except Exception as e:
         print(f"âŒ Training failed: {e}")

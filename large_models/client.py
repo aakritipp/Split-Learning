@@ -87,6 +87,15 @@ def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, nu
     g_hat.div_(float(num_pert))
     return g_hat
 
+def right_trim(input_ids, attention_mask, labels=None):
+    """Remove right padding for efficiency"""
+    L = attention_mask.sum(dim=1).max().item()
+    input_ids = input_ids[:, :int(L)]
+    attention_mask = attention_mask[:, :int(L)]
+    if labels is not None: 
+        labels = labels[:, :int(L)]
+    return input_ids, attention_mask, labels
+
 class _PrefixConcatCache:
     """
     Minimal cache adapter for HF SelfAttention that expects an object with .update(...)
@@ -167,6 +176,7 @@ def _client_forward_from_cut(
     cut: int,
     compute_g_cut: bool = True,
     return_loss_tensor: bool = False,):
+
     base_model = kv_model.base_model
     decoder    = base_model.model.decoder
     device     = next(base_model.parameters()).device
@@ -226,25 +236,44 @@ def _client_forward_from_cut(
     logits = base_model.lm_head(h)
 
     if labels is not None and attention_mask is not None:
-        labels = torch.where(attention_mask == 0, torch.tensor(-100, device=labels.device), labels)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        # labels = torch.where(attention_mask == 0, torch.tensor(-100, device=labels.device), labels)
         loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
             ignore_index=-100,
-            reduction="mean",)
+            reduction="mean",
+        )
+        # else:
+        #     # No valid tokens to supervise on - return small loss
+        #     loss = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
+            
+        # loss = F.cross_entropy(
+        #     shift_logits.view(-1, shift_logits.size(-1)),
+        #     shift_labels.view(-1),
+        #     ignore_index=-100,
+        #     reduction="mean",)
     else:
         loss = torch.zeros((), device=device, dtype=dtype)
 
     out = {"loss": float(loss.item())}
+    # if compute_g_cut:
+    #     g_cut, = torch.autograd.grad(loss, h, retain_graph=return_loss_tensor)
+    #     out["g_cut"] = g_cut.detach().to(torch.float32).cpu()
+    
+    # if return_loss_tensor:
+    #     out["loss_tensor"] = loss  # Return the torch tensor for local update
+    
     if compute_g_cut:
-        g_cut, = torch.autograd.grad(loss, h, retain_graph=return_loss_tensor)
-        out["g_cut"] = g_cut.detach().to(torch.float32).cpu()
+        if loss.requires_grad:
+            g_cut, = torch.autograd.grad(loss, h, retain_graph=return_loss_tensor)
+            out["g_cut"] = g_cut.detach().to(torch.float32).cpu()
+        # else:
+        #     # Fallback if no gradients
+        #     out["g_cut"] = torch.zeros_like(h).detach().to(torch.float32).cpu()
     
     if return_loss_tensor:
-        out["loss_tensor"] = loss  # Return the torch tensor for local update
-    
+        out["loss_tensor"] = loss
+
     return out
 
 
@@ -726,6 +755,10 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         labels = labels if torch.is_tensor(labels) else torch.as_tensor(labels)
         labels = labels.to(device=target_device)
     
+    if attn_mask is not None and labels is not None:
+        # Note: h_cut should match the trimmed length from server
+        _, attn_mask, labels = right_trim(torch.zeros_like(attn_mask), attn_mask, labels)
+    
     if labels is not None and labels.dim() == 2 and labels.shape[1] != T:
         if labels.shape[1] > T:
             labels = labels[:, :T]
@@ -763,22 +796,32 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
                     max_new_tokens=max_new
                 )
                 # decode here to keep server simple
-                generations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                # generations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
                 # Optionally strip prompt echoes inside client if your generator includes them
-                generations = [g.strip() for g in generations]
+                # generations = [g.strip() for g in generations]
                 # Compute LM loss if labels are available (monitor only)
+
+                # For SQuAD, decode outputs properly
+                try:
+                    generations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                    generations = [g.strip() for g in generations]
+                except:
+                    generations = [""] * h_cut.shape[0]
+
                 loss = 0.0
                 if labels is not None:
                     # Your kv_model can return logits for CE; do a single forward
                     logits = kv_model.forward_from_cut(h_cut=h_cut, attention_mask=attn_mask, labels=None, return_logits=True)
                     shift_logits = logits[:, :-1, :].contiguous()
                     shift_labels = labels[:, 1:].contiguous()
-                    loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                        ignore_index=-100,
-                        reduction="mean",
-                    ).item()
+                    valid_mask = (shift_labels != -100)
+                    if valid_mask.sum() > 0:
+                        loss = torch.nn.functional.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                            reduction="mean",
+                        ).item()
                 client.send_data({"loss": float(loss), "generations": generations})
                 return
     

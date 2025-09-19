@@ -370,6 +370,10 @@ class SQuADDataset(Dataset):
     def __init__(self, split='train', tokenizer=None, max_length=512, num_examples=None):
         self.tokenizer = tokenizer
         self.max_length = max_length
+
+        # Ensure proper padding token
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Load SQuAD dataset from HuggingFace
         print(f"Loading SQuAD {split} dataset...")
@@ -388,12 +392,14 @@ class SQuADDataset(Dataset):
             # Handle multiple answers (take the first one)
             if isinstance(example['answers']['text'], list) and len(example['answers']['text']) > 0:
                 answer = example['answers']['text'][0]
+                all_answers = example['answers']['text']
             else:
                 answer = ""
+                all_answers = [""]
             
             # Format as natural language prompt (MeZO style)
             # This follows the pattern mentioned in MeZO paper
-            formatted_text = f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
+            # formatted_text = f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
             
             self.examples.append({
                 'text': formatted_text,
@@ -412,24 +418,45 @@ class SQuADDataset(Dataset):
     
     def __getitem__(self, idx):
         example = self.examples[idx]
+        prompt_only = f"Context: {example['context']}\nQuestion: {example['question']}\nAnswer:"
+        
+        # Build full string with answer
+        with_answer = prompt_only + " " + example['answer']
         text = example['text']
         
         # Tokenize the full text
         encoding = self.tokenizer(
-            text,
+            prompt_only,
             truncation=True,
-            padding='max_length',
             max_length=self.max_length,
             return_tensors='pt'
         )
+
+        # Tokenize full sequence
+        enc_full = self.tokenizer(
+            with_answer,
+            truncation=True,
+            max_length=self.max_length,
+            padding='max_length',
+            return_tensors="pt"
+        )
+        
+        input_ids = enc_full["input_ids"].squeeze(0)
+        attention_mask = enc_full["attention_mask"].squeeze(0)
+        
+        # Create labels: mask prompt tokens with -100, supervise only on answer
+        labels = input_ids.clone()
+        prompt_length = enc_prompt["input_ids"].shape[1]
+        labels[:prompt_length] = -100  # Mask prompt tokens
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': encoding['input_ids'].squeeze(),  # For language modeling
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,  # Already properly masked!
+            'prompt_only': prompt_only,  # For generation during eval
+            'refs': example['all_answers'],  # For evaluation metrics
             'example_id': example['id'],
-            'answer': example['answer'],
-            'formatted_text': example['formatted_text'],
+            'formatted_text': with_answer,  # Keep for compatibility
             'original_example': example['original_example']
         }
 
@@ -637,7 +664,40 @@ class MultiTaskDataset(Dataset):
             'original_example': example['original_example']
         }
 
-
+def debug_label_construction(dataset, tokenizer, num_examples=3):
+    """Verify that labels are constructed correctly"""
+    print("\n=== DEBUGGING LABEL CONSTRUCTION ===")
+    
+    for i in range(min(num_examples, len(dataset))):
+        example = dataset[i]
+        input_ids = example['input_ids']
+        labels = example['labels']
+        prompt_only = example['prompt_only']
+        
+        print(f"\nExample {i+1}:")
+        print(f"Prompt: {prompt_only}")
+        
+        # Find supervised tokens (labels != -100)
+        supervised_mask = (labels != -100)
+        if supervised_mask.sum() > 0:
+            supervised_tokens = input_ids[supervised_mask]
+            supervised_text = tokenizer.decode(supervised_tokens, skip_special_tokens=True)
+            print(f"Supervised text: '{supervised_text}'")
+            print(f"Expected answer: '{example['refs'][0]}'")
+            
+            # Check if they match
+            match = supervised_text.strip().lower() == example['refs'][0].strip().lower()
+            print(f"Match: {'✓' if match else '✗'}")
+        else:
+            print("❌ No supervised tokens found!")
+        
+        # Show label distribution
+        num_ignored = (labels == -100).sum().item()
+        num_supervised = (labels != -100).sum().item()
+        print(f"Tokens: {num_ignored} ignored, {num_supervised} supervised")
+    
+    print("=== END DEBUGGING ===\n")
+    
 # KEEP your existing functions exactly as they are
 def normalize_answer(s):
     """Normalize answer for F1 computation (from SQuAD evaluation script)"""
@@ -698,28 +758,21 @@ def get_enhanced_dataloaders(task='squad', tokenizer=None, train_batch_size=2, t
         train_dataset = MultiTaskDataset(task, 'train', tokenizer, max_length, num_train_examples)
         test_dataset = MultiTaskDataset(task, 'validation', tokenizer, max_length, num_eval_examples)
     
-    # Use your existing collate function
-    def squad_collate_fn(batch):
-        input_ids = []
-        attention_masks = []
-        labels = []
-        formatted_texts = []
-        original_examples = []
-        
-        for item in batch:
-            input_ids.append(item['input_ids'])
-            attention_masks.append(item['attention_mask'])
-            labels.append(item['labels'])
-            formatted_texts.append(item['formatted_text'])
-            original_examples.append(item['original_example'])
-        
-        return {
-            'input_ids': torch.stack(input_ids),
-            'attention_mask': torch.stack(attention_masks),
-            'labels': torch.stack(labels),
-            'formatted_text': formatted_texts,
-            'original_example': original_examples
-        }
+# Use your existing collate function
+def squad_collate_fn(batch):
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_masks = torch.stack([item['attention_mask'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_masks,
+        'labels': labels,
+        'prompt_only': [item['prompt_only'] for item in batch],
+        'refs': [item['refs'] for item in batch],
+        'formatted_text': [item['formatted_text'] for item in batch],
+        'original_example': [item['original_example'] for item in batch]
+    }
     
     train_loader = DataLoader(
         train_dataset, 
