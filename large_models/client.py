@@ -417,7 +417,7 @@ class Client:
 
     def receive_data(self):
         try:
-            header = self._recvall(4)
+            header = self._recvall(4)           # ← use the method, not a global
             if header is None or len(header) != 4:
                 return None
             n = int.from_bytes(header, 'big')
@@ -429,7 +429,6 @@ class Client:
             print(f"⌠receive_data failed: {e}")
             return None
 
-    
     def close(self):
         try:
             self.socket.shutdown(socket.SHUT_RDWR)

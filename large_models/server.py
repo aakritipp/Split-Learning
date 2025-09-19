@@ -842,13 +842,13 @@ class Trainer:
             except (BlockingIOError, InterruptedError):
                 continue
             if not chunk:
-                return None  # peer closed
+                return None  # peer closed / half-open
             buf.extend(chunk)
         return bytes(buf)
 
     def send_data(self, data) -> bool:
         try:
-            serialized = pickle.dumps(data, protocol=4)
+            serialized = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
             self.conn.sendall(len(serialized).to_bytes(4, 'big'))
             self.conn.sendall(serialized)
             return True
@@ -868,6 +868,7 @@ class Trainer:
             return pickle.loads(payload)
         except (EOFError, ConnectionResetError, BrokenPipeError, socket.timeout, OSError):
             return None
+
 
 def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
     """Calculate SQUAD-specific metrics - ROBUST VERSION"""
@@ -1998,53 +1999,68 @@ if __name__ == "__main__":
         # Accept client connection(s) until we get a valid hello/config
         client_config = None
         # Accept client connection
-        conn, addr = server_socket.accept()
-        print(f"✅ Client connected from {addr}")
-        trainer = Trainer(conn)
-
         def _is_valid_client_config(msg: dict) -> bool:
             if not isinstance(msg, dict):
                 return False
-            # minimally expect keys you actually use later
+            # include the keys you actually use later during setup
             required = {"model_name", "num_prefix"}
             return required.issubset(msg.keys())
 
-        # Read first message; don’t assume it’s config
-        msg = trainer.receive_data()
-        if msg is None:
-            print("⚠️ Client disconnected before sending any message; closing.")
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            conn.close()
-            sys.exit(0)
-
         client_config = None
-        if _is_valid_client_config(msg):
-            client_config = msg
+
+        while True:
+            conn, addr = server_socket.accept()
+            print(f"✅ Client connected from {addr}")
+            trainer = Trainer(conn)
+
+            # Expect the client to speak first (hello or config)
+            msg = trainer.receive_data()
+            if msg is None:
+                print("⚠️ Client disconnected before sending any message; closing and waiting for next client.")
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                conn.close()
+                continue  # back to accept()
+
+            if isinstance(msg, dict) and msg.get("type") == "fatal":
+                print(f"⚠️ Client reported fatal error during init: {msg.get('error')}")
+                conn.close()
+                continue  # wait for next client
+
+            if isinstance(msg, dict) and msg.get("type") == "client_hello":
+                # safe to send now
+                if not trainer.send_data({"type": "server_hello", "version": 1}):
+                    print("⚠️ Failed to send server_hello; closing.")
+                    conn.close()
+                    continue
+                if not trainer.send_data({"type": "request_client_config"}):
+                    print("⚠️ Failed to request client config; closing.")
+                    conn.close()
+                    continue
+                cfg = trainer.receive_data()
+                if _is_valid_client_config(cfg):
+                    client_config = cfg
+                else:
+                    print(f"⚠️ Expected client config, got: {cfg}. Closing.")
+                    conn.close()
+                    continue
+
+            elif _is_valid_client_config(msg):
+                # Legacy client that sends config first
+                client_config = msg
+
+            else:
+                print(f"⚠️ Unexpected message before config: {msg}. Closing.")
+                conn.close()
+                continue
+
             print(f"Received client config: {client_config}")
-        else:
-            # Optional: if you later add client_hello/request flow, you can branch here.
-            # For now, insist on a real config.
-            print(f"⚠️ Expected client config, got: {msg}. Closing.")
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            conn.close()
-            sys.exit(1)
-
-        print("Starting training...")
-
-
-        if client_config is None:
-            raise RuntimeError("Client disconnected before hello/config")
-
-        print(f"Received client config: {client_config}")
-        
-        print("Starting training...")
-        
+            # ----- proceed into your training setup using client_config -----
+            print("Starting training...")
+            break
+            
         # Training loop
         for epoch in range(args.epochs):
             print(f"\nEpoch {epoch+1}/{args.epochs}")
