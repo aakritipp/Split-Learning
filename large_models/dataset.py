@@ -1,12 +1,366 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 import json
 import re
 from collections import Counter
 import string
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
 
+_all__ = [
+    "build_task_datasets",  # main entry
+    "TaskSpec",
+]
+
+@dataclass(frozen=True)
+class TaskSpec:
+    name: str
+    hf_path: str
+    config: Optional[str]
+    split_train: str
+    split_eval: str
+    task_type: str  # "qa" | "cls" | "gen"
+    formatter: Callable[[dict], Tuple[str, str, dict]]
+
+def _format_squad(ex):
+    # HF 'squad' and 'squad_v2' compatible
+    ctx = ex["context"].strip()
+    q = ex["question"].strip()
+    # answers is dict: {"text": [...], "answer_start": [...]}
+    refs = [t.strip() for t in ex.get("answers", {}).get("text", []) if t and t.strip()]
+    tgt = refs[0] if refs else ""     # single target for LM loss; refs kept for metrics
+    prompt = f"Context: {ctx}\nQuestion: {q}\nAnswer:"
+    return prompt, tgt, {"refs": refs}
+
+def _format_sst2(ex):
+    sent = ex["sentence"].strip()
+    label = int(ex["label"])  # 1=positive, 0=negative
+    tgt = "positive" if label == 1 else "negative"
+    prompt = f"Sentence: {sent}\nLabel (positive/negative):"
+    return prompt, tgt, {"label_id": label}
+
+def _format_drop(ex):
+    # DROP (ucinlp/drop) has textual and numeric answers; normalize to list[str]
+    passage = ex["passage"].strip()
+    question = ex["question"].strip()
+    # Prefer spans if present; fall back to 'answers' text if available
+    spans = ex.get("answers_spans", {})
+    text_spans = []
+    for k in ("spans", "answer_spans", "texts"):
+        v = spans.get(k, [])
+        if isinstance(v, list):
+            text_spans.extend([s.strip() for s in v if isinstance(s, str)])
+    # numeric answers (e.g., counts)
+    num = ex.get("number", None)
+    if isinstance(num, (int, float)) and str(num) not in text_spans:
+        text_spans.append(str(num))
+    refs = [t for t in text_spans if t]
+    tgt = refs[0] if refs else ""  # use a single canonical target for LM loss
+    prompt = f"Context: {passage}\nQuestion: {question}\nAnswer:"
+    return prompt, tgt, {"refs": refs}
+
+def _format_xsum(ex):
+    doc = ex["document"].strip()
+    summ = ex["summary"].strip()
+    prompt = f"Document:\n{doc}\n\nSummary:"
+    return prompt, summ, {}
+
+TASKS: Dict[str, TaskSpec] = {
+    # SQuAD v1/v2: choose your path; v1 shown here
+    "squad": TaskSpec("squad", "squad", None, "train", "validation", "qa", _format_squad),
+    # GLUE/SST-2 (via nyu-mll/glue with config='sst2')
+    "sst2": TaskSpec("sst2", "glue", "sst2", "train", "validation", "cls", _format_sst2),
+    # DROP
+    "drop": TaskSpec("drop", "ucinlp/drop", None, "train", "validation", "qa", _format_drop),
+    # XSum
+    "xsum": TaskSpec("xsum", "GEM/xsum", None, "train", "validation", "gen", _format_xsum),
+}
+
+def _tokenize_example(tokenizer: PreTrainedTokenizerBase, prompt: str, target: str, max_length: int):
+    # Teacher-forced target appended after prompt for CausalLM; labels mask the prompt tokens.
+    text = prompt + " " + target
+    enc = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_tensors="pt",
+    )
+    ids = enc["input_ids"][0]
+    attn = enc["attention_mask"][0]
+    # Build labels: ignore prompt tokens
+    with tokenizer.as_target_tokenizer():
+        tgt_ids = tokenizer(target, truncation=True, max_length=max_length, padding=False, return_tensors="pt")["input_ids"][0]
+    labels = torch.full_like(ids, -100)
+    labels[-len(tgt_ids):] = tgt_ids  # only supervise the target suffix
+    return ids, attn, labels
+
+def _collate_lm(tokenizer: PreTrainedTokenizerBase):
+    pad = tokenizer.pad_token_id
+    def pad_stack(tensors, pad_value):
+        max_len = max(t.size(0) for t in tensors)
+        out = []
+        for t in tensors:
+            if t.size(0) < max_len:
+                pad_t = torch.full((max_len - t.size(0),), pad_value, dtype=t.dtype)
+                t = torch.cat([t, pad_t], dim=0)
+            out.append(t)
+        return torch.stack(out, dim=0)
+
+    def fn(batch):
+        input_ids = pad_stack([b["input_ids"] for b in batch], pad)
+        attention_mask = pad_stack([b["attention_mask"] for b in batch], 0)
+        labels = pad_stack([b["labels"] for b in batch], -100)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            # Keep human-readable for debugging & metrics:
+            "prompt_text": [b["prompt_text"] for b in batch],
+            "text_target": [b["text_target"] for b in batch],
+            "meta": [b.get("meta", {}) for b in batch],
+        }
+    return fn
+
+def _collate_cls():
+    def fn(batch):
+        return {
+            "input_ids": torch.nn.utils.rnn.pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=0),
+            "attention_mask": torch.nn.utils.rnn.pad_sequence([b["attention_mask"] for b in batch], batch_first=True, padding_value=0),
+            "labels": torch.tensor([b["meta"]["label_id"] for b in batch], dtype=torch.long),
+            "prompt_text": [b["prompt_text"] for b in batch],
+            "text_target": [b["text_target"] for b in batch],
+            "meta": [b.get("meta", {}) for b in batch],
+        }
+    return fn
+
+def _tokenize_pair(tokenizer: PreTrainedTokenizerBase, prompt: str, target: Optional[str], max_len: int):
+    # For encoder-decoder use labels; for causal LM we create labels by masking the prompt part.
+    enc = tokenizer(prompt, truncation=True, max_length=max_len, padding=False)
+    if target is None:
+        return enc["input_ids"], enc["attention_mask"], None
+
+    # For causal LM training-on-target: append target and mask prompt tokens with -100
+    with_target = tokenizer(prompt + " " + target, truncation=True, max_length=max_len, padding=False)
+    n_prompt = len(enc["input_ids"])
+    labels = [-100]*n_prompt + with_target["input_ids"][n_prompt:]
+    return with_target["input_ids"], with_target["attention_mask"], labels
+
+class _HFDataset(Dataset):
+    def __init__(self, hf_ds, tokenizer, fmt_fn, max_len: int, task_type: str):
+        self.hf_ds = hf_ds
+        self.tok = tokenizer
+        self.fmt = fmt_fn
+        self.max_len = max_len
+        self.task_type = task_type
+
+    def __len__(self): return len(self.hf_ds)
+
+    def __getitem__(self, idx):
+        ex = self.hf_ds[idx]
+        prompt, target, meta = self.fmt(ex)
+
+        # Classification uses label_id supervised targets rather than text loss
+        if self.task_type == "cls":
+            input_ids, attn, _ = _tokenize_pair(self.tok, prompt, None, self.max_len)
+            label_id = meta["label_id"]
+            return {
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(attn, dtype=torch.long),
+                "label_id": torch.tensor(label_id, dtype=torch.long),
+                "text_target": target,  # for pretty prints
+            }
+
+        # Generative (qa/sum) uses text targets (prompt+answer) with prompt masked by -100
+        input_ids, attn, labels = _tokenize_pair(self.tok, prompt, target, self.max_len)
+        item = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attn, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long) if labels is not None else None,
+            "refs": meta.get("refs", []),
+            "target_text": target,
+            "prompt_text": prompt,
+        }
+        return item
+    
+def _pad_seq(batch, pad_id: int):
+    max_len = max(len(b["input_ids"]) for b in batch)
+    for b in batch:
+        pad = max_len - len(b["input_ids"])
+        if pad > 0:
+            b["attention_mask"] = torch.tensor(
+                list(b["attention_mask"]) + [0]*pad, dtype=torch.long
+            )
+            b["input_ids"] = torch.tensor(
+                list(b["input_ids"]) + [pad_id]*pad, dtype=torch.long
+            )
+            if "labels" in b and b["labels"] is not None:
+                b["labels"] = torch.tensor(
+                    list(b["labels"]) + [-100]*pad, dtype=torch.long
+                )
+    return batch
+
+def _collate_gen(tokenizer):
+    pad_id = tokenizer.pad_token_id
+    def fn(batch):
+        batch = _pad_seq(batch, pad_id)
+        out = {
+            "input_ids": torch.stack([b["input_ids"] for b in batch]),
+            "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        }
+        if "labels" in batch[0] and batch[0]["labels"] is not None:
+            out["labels"] = torch.stack([b["labels"] for b in batch])
+        # carry strings for metrics
+        out["refs"] = [b.get("refs", []) for b in batch]
+        out["target_text"] = [b.get("target_text", "") for b in batch]
+        out["prompt_text"] = [b.get("prompt_text", "") for b in batch]
+        return out
+    return fn
+
+# def _collate_cls(tokenizer):
+#     pad_id = tokenizer.pad_token_id
+#     def fn(batch):
+#         batch = _pad_seq(batch, pad_id)
+#         return {
+#             "input_ids": torch.stack([b["input_ids"] for b in batch]),
+#             "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+#             "labels": torch.stack([b["label_id"] for b in batch]),
+#             "target_text": [b.get("text_target","") for b in batch],
+#         }
+#     return fn
+
+def _spec_squad():
+    return TaskSpec(
+        name="squad",
+        task_type="qa",
+        hf_path="squad",
+        hf_config=None,
+        splits={"train":"train", "validation":"validation", "test":"validation"},
+        format_fn=_format_squad,
+        collate_fn=None,  # filled later (needs tokenizer)
+    )
+
+def _spec_sst2():
+    return TaskSpec(
+        name="sst2",
+        task_type="cls",
+        hf_path="glue",
+        hf_config="sst2",
+        splits={"train":"train", "validation":"validation", "test":"validation"},
+        format_fn=_format_sst2,
+        collate_fn=None,
+    )
+
+def _spec_drop():
+    return TaskSpec(
+        name="drop",
+        task_type="qa",
+        hf_path="drop",
+        hf_config=None,
+        splits={"train":"train", "validation":"validation", "test":"validation"},
+        format_fn=_format_drop,
+        collate_fn=None,
+    )
+
+def _spec_xsum():
+    return TaskSpec(
+        name="xsum",
+        task_type="sum",
+        hf_path="xsum",
+        hf_config=None,
+        splits={"train":"train", "validation":"validation", "test":"validation"},
+        format_fn=_format_xsum,
+        collate_fn=None,
+    )
+
+_REGISTRY: Dict[str, Callable[[], TaskSpec]] = {
+    "squad": _spec_squad,
+    "sst2": _spec_sst2,
+    "drop":  _spec_drop,
+    "xsum":  _spec_xsum,
+}
+
+# def build_task_datasets(
+#     task: str,
+#     tokenizer: PreTrainedTokenizerBase,
+#     max_length: int = 512,
+#     streaming: bool = False,):
+#     """
+#     Returns: (spec, train_ds, val_ds, test_ds, collate_fn)
+#     """
+#     t = task.lower()
+#     if t not in _REGISTRY:
+#         raise ValueError(f"Unsupported task '{task}'. Choose from {list(_REGISTRY)}")
+
+#     spec = _REGISTRY[t]()
+
+
+#     # choose collator
+#     # spec.collate_fn = _collate_cls(tokenizer) if spec.task_type == "cls" else _collate_gen(tokenizer)
+
+#     # Load splits
+#     def _ld(split):
+#         return load_dataset(spec.hf_path, spec.hf_config, split=split, streaming=streaming)
+
+#     raw_train = _ld(spec.splits["train"])
+#     raw_val   = _ld(spec.splits["validation"])
+#     raw_test  = _ld(spec.splits["test"])
+
+#     train_ds = _HFDataset(raw_train, tokenizer, spec.format_fn, max_length, spec.task_type)
+#     val_ds   = _HFDataset(raw_val,   tokenizer, spec.format_fn, max_length, spec.task_type)
+#     test_ds  = _HFDataset(raw_test,  tokenizer, spec.format_fn, max_length, spec.task_type)
+
+#     return spec, train_ds, val_ds, test_ds, spec.collate_fn
+
+
+def build_task_datasets(task: str, tokenizer: PreTrainedTokenizerBase, max_length: int = 512,
+                        num_train_examples: Optional[int] = None,
+                        num_eval_examples: Optional[int] = None):
+    task = task.lower()
+    if task not in TASKS:
+        raise ValueError(f"Unknown task '{task}'. Supported: {list(TASKS.keys())}")
+    spec = TASKS[task]
+
+    # Load HF dataset
+    if spec.config:
+        ds = load_dataset(spec.hf_path, spec.config)
+    else:
+        ds = load_dataset(spec.hf_path)
+
+    train_raw = ds[spec.split_train]
+    eval_raw = ds[spec.split_eval]
+
+    def _prep(example):
+        prompt, tgt, meta = spec.formatter(example)
+        ids, attn, labels = _tokenize_example(tokenizer, prompt, tgt, max_length)
+        return {
+            "input_ids": ids,
+            "attention_mask": attn,
+            "labels": labels if spec.task_type != "cls" else torch.zeros_like(ids),  # placeholder for uniformity
+            "prompt_text": prompt,
+            "text_target": tgt,
+            "meta": meta,
+        }
+
+    train = [ _prep(ex) for ex in (train_raw if num_train_examples is None else train_raw.select(range(num_train_examples))) ]
+    evald = [ _prep(ex) for ex in (eval_raw if num_eval_examples is None else eval_raw.select(range(num_eval_examples))) ]
+
+    collate = _collate_cls() if spec.task_type == "cls" else _collate_lm(tokenizer)
+
+    return train, evald, collate, spec.task_type
+
+from torch.utils.data import DataLoader
+
+def get_dataloaders(task, tokenizer, train_bs=8, eval_bs=8, max_length=512,
+                    num_train_examples=None, num_eval_examples=None, shuffle=True):
+    train, evald, collate, task_type = build_task_datasets(
+        task, tokenizer, max_length, num_train_examples, num_eval_examples
+    )
+    train_loader = DataLoader(train, batch_size=train_bs, shuffle=shuffle, collate_fn=collate)
+    eval_loader  = DataLoader(evald, batch_size=eval_bs,  shuffle=False,   collate_fn=collate)
+    return train_loader, eval_loader, task_type
 
 class SQuADDataset(Dataset):
     """

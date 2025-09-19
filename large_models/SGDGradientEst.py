@@ -16,6 +16,7 @@ class StochasticGradientApproximator:
         for param in self.trainable_params:
             self.original_params.append(param.data.clone())
 
+    @torch.no_grad()
     def estimate_gradients(self, input_batch, target_labels, objective_fn, random_seed):
         """
         Fixed gradient estimation based on MeZO approach

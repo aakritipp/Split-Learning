@@ -9,7 +9,13 @@ import re
 import string
 from collections import Counter
 from tqdm import tqdm
+from typing import Dict, List, Optional, Tuple
 
+try:
+    import evaluate  # pip install evaluate
+    _has_evaluate = True
+except Exception:
+    _has_evaluate = False
 
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
@@ -28,7 +34,165 @@ def normalize_answer(s):
     
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
+def _qa_em_f1(pred: str, golds: list):
+    pred_n = normalize_answer(pred)
+    gold_ns = [normalize_answer(g) for g in golds if g is not None]
+    if not gold_ns:
+        return 0.0, 0.0
+    em = float(any(pred_n == g for g in gold_ns))
+    def f1(p, g):
+        ps, gs = p.split(), g.split()
+        common = Counter(ps) & Counter(gs)
+        num_same = sum(common.values())
+        if num_same == 0: return 0.0
+        prec = num_same / max(len(ps), 1)
+        rec  = num_same / max(len(gs), 1)
+        return 2 * prec * rec / (prec + rec)
+    f1s = [f1(pred_n, g) for g in gold_ns]
+    return em, float(max(f1s))
 
+def _cls_map_prediction_to_label(text_pred: str):
+    s = (text_pred or "").lower()
+    if "positive" in s: return 1
+    if "negative" in s: return 0
+    # numeric fallback
+    if s.strip() in {"1", "pos", "+1"}: return 1
+    if s.strip() in {"0", "neg", "-1"}: return 0
+    # default: treat anything else as negative (conservative)
+    return 0
+
+def _rouge_scores(preds: list, refs: list):
+    if _has_evaluate:
+        rouge = evaluate.load("rouge")  # ROUGE-1/2/Lsum
+        sc = rouge.compute(predictions=preds, references=refs, use_stemmer=True)
+        return {"rouge1": float(sc.get("rouge1", 0.0)),
+                "rouge2": float(sc.get("rouge2", 0.0)),
+                "rougeL": float(sc.get("rougeL", 0.0))}
+    # Fallback: ROUGE-1 proxy
+    def r1(p, r):
+        p_set, r_set = set((p or "").split()), set((r or "").split())
+        return len(p_set & r_set) / max(len(r_set), 1)
+    return {"rouge1": float(np.mean([r1(p, r) for p, r in zip(preds, refs)])),
+            "rouge2": 0.0, "rougeL": 0.0}
+
+def compute_metrics_for_batch(task_type: str,
+                              pred_texts: list,
+                              batch_meta: list,
+                              gold_texts: list):
+    """
+    task_type: "qa" | "cls" | "gen"
+    pred_texts: decoded model outputs (len = batch)
+    batch_meta: per-example dicts from dataset (contains 'refs' for QA, 'label_id' for CLS)
+    gold_texts: the single canonical 'text_target' we trained against (len = batch)
+    """
+    if task_type == "qa":
+        ems, f1s = [], []
+        for pred, meta in zip(pred_texts, batch_meta):
+            refs = meta.get("refs", [])
+            em, f1 = _qa_em_f1(pred, refs if isinstance(refs, list) else [])
+            ems.append(em); f1s.append(f1)
+        return {"exact_match": float(np.mean(ems)), "f1": float(np.mean(f1s))}
+
+    if task_type == "cls":
+        gold = [m.get("label_id") for m in batch_meta]
+        pred_ids = [_cls_map_prediction_to_label(p) for p in pred_texts]
+        acc = float(np.mean([int(p == g) for p, g in zip(pred_ids, gold)]))
+        return {"accuracy": acc}
+
+    if task_type == "gen":
+        # Use gold single-reference texts for ROUGE
+        return _rouge_scores(pred_texts, gold_texts)
+
+    return {}
+    
+def _f1_em(pred: str, refs: List[str]) -> Tuple[float,float]:
+    # Token overlap F1 and exact match across any reference
+    pred_norm = _normalize_text(pred)
+    best_f1 = 0.0
+    best_em = 0.0
+    for r in refs or [""]:
+        r_norm = _normalize_text(r)
+        em = 1.0 if pred_norm == r_norm else 0.0
+        pred_toks = pred_norm.split()
+        ref_toks  = r_norm.split()
+        common = {}
+        for t in pred_toks:
+            common[t] = min(pred_toks.count(t), ref_toks.count(t))
+        num_same = sum(common.values())
+        if len(pred_toks) == 0 and len(ref_toks) == 0:
+            f1 = 1.0
+        elif len(pred_toks) == 0 or len(ref_toks) == 0:
+            f1 = 0.0
+        else:
+            precision = num_same / max(len(pred_toks), 1)
+            recall    = num_same / max(len(ref_toks), 1)
+            if precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = 2 * precision * recall / (precision + recall)
+        best_f1 = max(best_f1, f1)
+        best_em = max(best_em, em)
+    return best_f1, best_em
+
+def _accuracy(pred_ids: List[int], label_ids: List[int]) -> float:
+    pred_ids = np.asarray(pred_ids)
+    label_ids = np.asarray(label_ids)
+    return float((pred_ids == label_ids).mean())
+
+def _rouge(preds: List[str], refs: List[str]) -> Dict[str,float]:
+    if _has_evaluate:
+        rouge = evaluate.load("rouge")
+        sc = rouge.compute(predictions=preds, references=refs, use_stemmer=True)
+        # Ensure consistent keys
+        return {
+            "rouge1": float(sc.get("rouge1", 0.0)),
+            "rouge2": float(sc.get("rouge2", 0.0)),
+            "rougeL": float(sc.get("rougeL", 0.0)),
+        }
+    # Fallback: simplistic unigram overlap as ROUGE-1 proxy
+    def _r1(p, r):
+        p_set, r_set = set(p.split()), set(r.split())
+        inter = len(p_set & r_set)
+        return inter / max(len(r_set), 1)
+    r1 = np.mean([_r1(p, r) for p, r in zip(preds, refs)])
+    return {"rouge1": float(r1), "rouge2": 0.0, "rougeL": 0.0}
+
+def compute_metrics_for_task(
+    task_type: str,
+    *,
+    # For CLS:
+    pred_label_ids: Optional[List[int]] = None,
+    true_label_ids: Optional[List[int]] = None,
+    # For QA/SUM:
+    pred_texts: Optional[List[str]] = None,
+    ref_texts_list: Optional[List[List[str]]] = None,  # list of refs per example
+) -> Dict[str, float]:
+    """
+    Unifies metric calculation across tasks.
+    task_type in {"cls", "qa", "sum"}.
+    """
+    if task_type == "cls":
+        if pred_label_ids is None or true_label_ids is None:
+            raise ValueError("Classification metrics need predicted and true label ids.")
+        acc = _accuracy(pred_label_ids, true_label_ids)
+        return {"accuracy": acc}
+
+    if task_type == "qa":
+        assert pred_texts is not None and ref_texts_list is not None
+        f1s, ems = [], []
+        for pred, refs in zip(pred_texts, ref_texts_list):
+            f1, em = _f1_em(pred or "", refs or [])
+            f1s.append(f1); ems.append(em)
+        return {"f1": float(np.mean(f1s)), "em": float(np.mean(ems))}
+
+    if task_type == "sum":
+        assert pred_texts is not None and ref_texts_list is not None
+        refs = [ (refs[0] if refs else "") for refs in ref_texts_list ]
+        return _rouge(pred_texts, refs)
+
+    raise ValueError(f"Unknown task_type: {task_type}")
+    
+       
 def get_ground_truth_answers(batch, index):
     """
     FIXED: Multi-task ground truth extraction
