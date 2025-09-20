@@ -28,6 +28,15 @@ except Exception:
 
 import torch.nn.functional as F
 
+def right_trim(input_ids, attention_mask, labels=None):
+    """Remove right padding for efficiency"""
+    L = attention_mask.sum(dim=1).max().item()
+    input_ids = input_ids[:, :int(L)]
+    attention_mask = attention_mask[:, :int(L)]
+    if labels is not None: 
+        labels = labels[:, :int(L)]
+    return input_ids, attention_mask, labels
+
 class LoRAClientModel(nn.Module):
     """
     Client-side when tuning=LoRA. Keeps full base_model, injects LoRA only into layers [cut..L-1].
@@ -55,12 +64,6 @@ class LoRAClientModel(nn.Module):
     def trainable_parameters(self):
         return iter_lora_parameters(self.base_model, layer_range=(self.cut_layer, self.total_layers-1))
 
-def create_labels(input_ids, attention_mask, tokenizer):
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
-    if tokenizer.pad_token_id is not None:
-        labels[input_ids == tokenizer.pad_token_id] = -100
-    return labels.long()
 
 @torch.no_grad()
 def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8):
@@ -141,23 +144,6 @@ def _build_self_attn_mask(attention_mask: torch.Tensor,
         src_pad = pad
     attn = attn + src_pad.view(bsz, 1, 1, prefix_len + tgt_len) * _neg_inf(dtype)
     return attn
-
-def _resolve_base_lm(model_like):
-    def _looks_like_hf_lm(x):
-        return hasattr(x, "model") and hasattr(x.model, "decoder") and hasattr(x, "lm_head")
-    obj = model_like
-    for _ in range(6):
-        if _looks_like_hf_lm(obj):
-            return obj
-        for name in ("base_model","hf_model","model","module","net","inner","wrapped","lm"):
-            if hasattr(obj, name):
-                obj = getattr(obj, name)
-                break
-        else:
-            break
-    if _looks_like_hf_lm(model_like):
-        return model_like
-    raise AttributeError(f"Could not resolve HF LM from {type(model_like).__name__}")
 
 def _client_forward_from_cut(
     kv_model,                       # your ClientKVModel instance
@@ -247,21 +233,6 @@ def _client_forward_from_cut(
     
     return out
 
-
-def _normalize_batch_from_server(payload, device, tokenizer):
-    ids = payload['input_ids'].to(device)
-    am  = payload['attention_mask'].to(device)
-
-    if 'labels' in payload and torch.is_tensor(payload['labels']):
-        labels = payload['labels'].to(device).long()
-    else:
-        # Build labels from input_ids; ignore pads with -100 (HF causal LM shifts internally)
-        labels = create_labels(ids, am, tokenizer)
-
-    kv_state = payload.get('server_kv_state', None)
-    return ids, am, labels, kv_state
-
-
 def safe_get_hf_tokenizer(model_name):
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -297,6 +268,12 @@ class ClientKVModel(nn.Module):
         # server prefixes live on layers [0..cut-1]; client prefixes live on [cut..L-1]
         self.server_kv_mirror = PrefixKV(self.base_model.config, list(range(0, cut_layer)), num_prefix=num_prefix, device=self.base_model.device)
         self.client_kv = PrefixKV(self.base_model.config, list(range(cut_layer, total_layers)), num_prefix=num_prefix, device=self.base_model.device)
+        # Only client prefixes are trainable by default
+        for p in self.server_kv_mirror.parameters():
+            p.requires_grad = False
+        for p in self.client_kv.parameters():
+            p.requires_grad = True
+
 
     def load_server_state(self, state_dict: dict):
         # state_dict expected to contain keys "k" and "v" tensors matching server_kv_mirror
@@ -396,62 +373,6 @@ class Client:
     def close(self):
         self.socket.close()
 
-
-def calculate_accuracy(outputs, labels, batch=None, tokenizer=None):
-    """Calculate SQUAD-specific accuracy from model outputs"""
-    try:
-        if outputs.loss is None:
-            return 0.0
-            
-        logits = outputs.logits
-        
-        # Debug for first few calls
-        global client_debug_count
-        if 'client_debug_count' not in globals():
-            client_debug_count = 0
-            
-        if client_debug_count < 3:
-            print(f"\n  Client SQUAD Debug call {client_debug_count}:")
-            print(f"   Logits shape: {logits.shape}")
-            print(f"   Labels shape: {labels.shape}")
-            if batch is not None and 'formatted_text' in batch:
-                print(f"   Sample text: {batch['formatted_text'][0][:100]}...")
-        
-        # Ensure logits and labels have compatible shapes
-        if logits.shape[1] != labels.shape[1]:
-            min_len = min(logits.shape[1], labels.shape[1])
-            logits = logits[:, :min_len, :]
-            labels = labels[:, :min_len]
-        
-        # For language modeling: predict next token
-        if logits.shape[1] > 1:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-        else:
-            shift_logits = logits
-            shift_labels = labels
-        
-        # Get predictions
-        predictions = torch.argmax(shift_logits, dim=-1)
-        
-        # Use the imported function for SQUAD-specific accuracy calculation
-        answer_accuracy = calculate_client_answer_accuracy(
-            predictions, shift_labels, batch, tokenizer
-        )
-        
-        if client_debug_count < 3:
-            print(f"   Answer accuracy: {answer_accuracy:.6f}")
-        
-        client_debug_count += 1
-        return answer_accuracy
-        
-    except Exception as e:
-        print(f"⌠Client SQUAD accuracy calculation failed: {e}")
-        return 0.0
-
-import torch
-import numpy as np
-
 def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args, device,
                                pkt: dict, meta: dict, batch_idx: int):
     """
@@ -479,7 +400,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
       pkt: payload from server with keys ['h_cut','attention_mask','labels','cut']
       meta: meta dict, expects meta.get('need_g_cut', bool)
     """
-    need_g_cut = bool(meta.get("need_g_cut", False)) 
+    need_g_cut = not bool(meta.get("zoo_eval", False)) 
     client_sgd = (not args.use_zeroth_order_client)  # True => SGD, False => ZOO
 
     model_ref = getattr(kv_model, "base_model", kv_model)
@@ -487,17 +408,43 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
     target_device = param0.device
     target_dtype  = param0.dtype
 
+    server_data = pkt["data"]
+    mode        = pkt.get("mode", "train")   # <-- new, default 'train'
+    task_type   = pkt.get("meta", {}).get("task_type", "qa")
+    max_new     = pkt.get("meta", {}).get("max_new_tokens", 20)
+    tgt_len    = int(server_data.get("tgt_len", 0))
+
     # ---- Unpack incoming tensors ----
     # Expect tensors already on CPU -> move to device (or adapt to your transport)
-    h_cut = pkt["h_cut"].to(device=target_device, dtype=target_dtype)
-    attn_mask = pkt.get("attention_mask", None)
+    h_cut = server_data["h_cut"].to(device=target_device, dtype=target_dtype)
+    B, T, H = h_cut.shape
+    attn_mask = server_data.get("attention_mask", None)
+    labels = server_data.get("labels", None)
+
+    T = h_cut.shape[1]
+    if tgt_len and tgt_len != T:
+        # Sanity check: trust the server's view if present
+        print(f"⚠️ client: adjusting local T={T} -> server T={tgt_len} (will pad gradients if needed)")
+        T = tgt_len
+
     if attn_mask is not None:
         attn_mask = attn_mask.to(device=target_device)
-    labels = pkt.get("labels", None)
+    # labels = pkt.get("labels", None)
     if labels is not None:
         labels = labels if torch.is_tensor(labels) else torch.as_tensor(labels)
         labels = labels.to(device=target_device)
-    cut = pkt.get("cut", None)
+    if attn_mask is not None and labels is not None:
+        # Note: h_cut should match the trimmed length from server
+        _, attn_mask, labels = right_trim(torch.zeros_like(attn_mask), attn_mask, labels)
+    
+    if labels is not None and labels.dim() == 2 and labels.shape[1] != T:
+        if labels.shape[1] > T:
+            labels = labels[:, :T]
+        else:
+            pad = torch.full((labels.shape[0], T - labels.shape[1]), -100,
+                            dtype=labels.dtype, device=labels.device)
+            labels = torch.cat([labels, pad], dim=1)
+    cut = server_data.get("cut_layer", None)
     if cut is None:
         raise KeyError("Could not determine cut layer: expected pkt['cut'] or pkt['meta']['cut_layer'] or args.cut_layer")
     cut = int(cut)
@@ -545,7 +492,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         # If server needs g_cut, compute it via autograd.grad wrt h_cut (no client param grads cross boundary)
         if need_g_cut:
             g = _estimate_g_cut_fd(
-                kv_model, h_cut, attention_mask, labels, cut,
+                kv_model, h_cut, attn_mask, labels, cut,
                 mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-3)),
                 num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 8)),
             )
@@ -556,7 +503,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
             with torch.no_grad():
                 o = _client_forward_from_cut(
                     kv_model,
-                    h_cut=pkt["h_cut"].to(device).detach(),
+                    h_cut=server_data["h_cut"].to(device).detach(),
                     attention_mask=attn_mask,
                     labels=labels, cut=cut,
                     compute_g_cut=False,
@@ -582,11 +529,18 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         optimizer.step()
 
     # ---- Reply to server ----
-    reply = {"loss": loss_value}
+    reply = {"loss": float(loss_tensor.item())}
     if g_cut_to_send is not None:
         # sanity: shape must match h_cut
         # (can't use tensors in dict over pickle reliably -> send numpy)
-        reply["g_cut"] = g_cut_to_send
+        # reply["g_cut"] = g_cut_to_send
+        # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
+        # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
+        if isinstance(g_cut_to_send, torch.Tensor):
+            gc = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
+        else:
+            gc=np.asarray(g_cut_to_send, dtype=np.float32)
+        reply["g_cut"] = gc
     client.send_data(reply)
 
 def parse_args():
@@ -620,6 +574,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=None):
+    for n,p in module.named_parameters():
+        if mode == "prefix":
+            ok = ("lora_" not in n) and (("prefix" in n) == p.requires_grad)
+        elif mode == "lora":
+            ok = (("lora_" in n) == p.requires_grad) and (("prefix" not in n))
+        else:  # none
+            ok = (p.requires_grad is False)
+        assert ok, f"Unexpected trainable param in {mode} mode: {n} requires_grad={p.requires_grad}"
+
+
 if __name__ == "__main__":
     args = parse_args()
     
@@ -649,6 +614,8 @@ if __name__ == "__main__":
             targets=tuple(args.lora_targets.split(','))
         ).to(device)
         trainable_params = list(kv_model.trainable_parameters())
+        _assert_only_expected_trainables(kv_model, args.tuning, side="client")
+
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
     else:
         from prefix_kv import PrefixKV
@@ -657,8 +624,12 @@ if __name__ == "__main__":
             p.requires_grad = False
         for p in kv_model.client_kv.parameters():
             p.requires_grad = True
+        for p in kv_model.server_kv_mirror.parameters():
+            p.requires_grad = False
 
         trainable_params = list(kv_model.client_kv.parameters())
+        _assert_only_expected_trainables(kv_model, args.tuning, side="client")
+
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with {args.num_prefix} prefix tokens each")
 
     
@@ -762,6 +733,11 @@ if __name__ == "__main__":
                 break
 
             if mtype == "forward_cut":
+                data = msg.get("data")
+                if data is None or not isinstance(data, dict):
+                    print("⌠CLIENT: malformed forward_cut (missing 'data'); ignoring this packet.")
+                    # Optionally: client.send_data({"type":"error","reason":"missing_data_in_forward_cut"})
+                    continue
                 handle_forward_cut_unified(
                     client=client,
                     kv_model=kv_model,
@@ -769,7 +745,7 @@ if __name__ == "__main__":
                     grad_estimator=grad_estimator,
                     args=args,
                     device=device,
-                    pkt=msg["data"],
+                    pkt=msg,
                     meta=msg.get("meta", {}),
                     batch_idx=batch_idx
                 )

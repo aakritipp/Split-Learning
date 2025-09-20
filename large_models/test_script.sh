@@ -99,7 +99,7 @@ python3 server.py \
     --max_length $MAX_LENGTH \
     --lr $LR \
     --zoo_lr $ZOO_LR \
-    --seed 42 \
+    --seed $SEED \
     --train_examples $TRAIN \
     --dev_examples $DEV \
     --eval_examples $EVAL \
@@ -150,7 +150,7 @@ python3 client.py \
     --max_length $MAX_LENGTH \
     --lr $LR \
     --zoo_lr $ZOO_LR \
-    --seed 0 \
+    --seed $SEED \
     --mu $EPS \
     --use_zeroth_order_client \
     --train_batch_size $BATCH_SIZE \
