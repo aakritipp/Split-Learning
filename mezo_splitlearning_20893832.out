@@ -1,0 +1,44 @@
+Starting Split Learning Job
+================================
+Job ID: 20893832
+Node: skl-a-48
+Time: Tue Sep 23 06:26:44 PM EDT 2025
+Working Directory: /home/al1745/Split-Learning/large_models
+================================
+All required files present
+Configuration:
+   Model: facebook/opt-125m
+   Epochs: 1
+   Batch Size: 8
+   Max Length: 512
+   Learning Rate: 1e-4
+
+Starting server...
+Server PID: 2552227
+Waiting 45 seconds for server initialization...
+Server is running
+Starting client...
+Waiting for server to finish...
+============================================================
+SPLIT LEARNING CLIENT WITH PREFIX TUNING
+============================================================
+Using device: cuda
+Loading tokenizer: facebook/opt-125m
+Tokenizer loaded successfully
+Creating client model...
+Client owns layers [6, 11] with LoRA r=4, alpha=16
+Model loaded: facebook/opt-125m
+Client owns layers [6, 11] with 5 prefix tokens each
+Client using SGD optimizer with lr=0.0001, momentum=0.9
+============================================================
+CLIENT STARTING - ATTEMPTING TO CONNECT TO SERVER
+============================================================
+Trying to connect to server at localhost:12345...
+============================================================
+⌠CONNECTION FAILED!
+============================================================
+Could not connect to server at localhost:12345
+Make sure the server is running first:
+   python server.py --model_name facebook/opt-125m
+============================================================
+CLIENT SHUTDOWN COMPLETE
