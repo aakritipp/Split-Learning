@@ -19,14 +19,104 @@ import traceback
 from SGDGradientEst import StochasticGradientApproximator
 import torch.nn.functional as F
 from prefix_kv import PrefixKV, load_grad_state_into
-from dataset import build_task_datasets
-from metrics import compute_metrics_for_task
+from lora import apply_lora_to_opt, iter_lora_parameters, get_lora_state_dict, load_lora_state_dict
+from dataset import get_enhanced_dataloaders as get_task_dataloaders
+
 
 # Ensure merge_past_key_values is available for prefix-aware eval
 try:
     from prefix_kv import merge_past_key_values
 except Exception:
     merge_past_key_values = None
+
+def right_trim(input_ids, attention_mask, labels=None):
+    """Remove right padding for efficiency"""
+    L = attention_mask.sum(dim=1).max().item()
+    input_ids = input_ids[:, :int(L)]
+    attention_mask = attention_mask[:, :int(L)]
+    if labels is not None: 
+        labels = labels[:, :int(L)]
+    return input_ids, attention_mask, labels
+
+@torch.no_grad()
+def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, k=4):
+    """Print generation examples during evaluation"""
+    print("\n=== GENERATION SAMPLES ===")
+    
+    if "prompt_only" not in batch:
+        print("No prompt_only field available for generation testing")
+        return
+    
+    model.eval()
+    prompts = batch["prompt_only"][:k]
+    refs = batch["refs"][:k]
+    
+    # Tokenize prompts
+    enc = tokenizer(
+        prompts, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=350
+    ).to(device)
+
+    input_ids, attention_mask = right_trim(enc["input_ids"], enc["attention_mask"])
+    enc = {"input_ids": input_ids, "attention_mask": attention_mask}
+    
+    
+    # Generate
+    try:
+        outputs = model.generate(
+            enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
+        )
+    except Exception as e:
+        print(f"Generation failed: {e}")
+        return
+    
+    # Process outputs
+    for i in range(min(k, outputs.size(0))):
+        try:
+            # Decode full generated sequence
+            full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+            
+            # Remove prompt to get just the answer
+            prompt_text = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=True)
+            if len(full_text) > len(prompt_text):
+                pred_answer = full_text[len(prompt_text):].strip()
+            else:
+                pred_answer = ""
+            
+            # Clean up prediction
+            pred_answer = pred_answer.split('\n')[0].strip('.,!?"\'')
+            
+            # Get ground truth
+            gold_answers = refs[i] if i < len(refs) else [""]
+            gold_answer = gold_answers[0] if gold_answers else ""
+            
+            # Extract question for display
+            question_part = prompts[i].split('Question:', 1)[-1].split('Answer:', 1)[0].strip()
+            
+            # Calculate metrics
+            from metrics import squad_f1_score, squad_exact_match
+            f1 = squad_f1_score(pred_answer, gold_answers)
+            em = squad_exact_match(pred_answer, gold_answers)
+            
+            print(f"\nExample {i+1}:")
+            print(f"Q: {question_part}")
+            print(f"Pred: '{pred_answer}'")
+            print(f"Gold: '{gold_answer}'")
+            print(f"EM={em:.3f} F1={f1:.3f}")
+            
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+    
+    print("=== END SAMPLES ===\n")
 
 def adapt_batch(batch, device):
     input_ids = batch["input_ids"].to(device)
@@ -39,23 +129,60 @@ def adapt_batch(batch, device):
     meta = batch.get("meta", None) or [{} for _ in range(input_ids.size(0))]
     return input_ids, attention_mask, labels, prompt_text, text_target, meta
 
+def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=None, side: str = None):
+    for n, p in module.named_parameters():
+        if mode == "prefix":
+            if side == "server":
+                # Only server KV prefixes should be trainable
+                is_allowed = n.startswith("kv.")
+            elif side == "client":
+                # Only client prefixes should be trainable
+                is_allowed = n.startswith("client_kv.")
+            else:
+                # Generic fallback: any KV/prefix-like params are allowed
+                is_allowed = (n.startswith("kv.") or n.startswith("client_kv.") or ("prefix" in n))
+
+            ok = ("lora_A" not in n and "lora_B" not in n) and ((is_allowed) == p.requires_grad)
+
+        elif mode == "lora":
+            # Only LoRA adapters should be trainable
+            is_lora = ("lora_A" in n) or ("lora_B" in n)
+            ok = (is_lora == p.requires_grad) and ("kv." not in n) and ("client_kv." not in n)
+
+        else:  # none
+            ok = (p.requires_grad is False)
+
+        assert ok, f"Unexpected trainable param in {mode} mode{f' ({side})' if side else ''}: {n} requires_grad={p.requires_grad}"
+
+
 def _neg_inf(dtype: torch.dtype) -> float:
     # Use the representable minimum as the additive mask value
     return torch.finfo(dtype).min
-def _refresh_eval_prefixes(full_model, server_model, trainer):
+
+def _refresh_eval_prefixes(full_model, server_model, trainer, args):
     """
     Pull the latest client prefix snapshot for eval,
     attach live server prefixes, and enable prefix-aware eval.
     Safe fallback to legacy eval if anything fails.
     """
+    # LoRA mode: do not use prefix-aware eval or request client KV
+    if args.tuning == "lora":
+        # In LoRA mode, skip split eval handshake entirely; use local frozen eval only
+        full_model.enable_prefix_eval(False)
+        return False
+    
     full_model.attach_live_server_kv(server_model.kv)
     try:
         trainer.send_data({"type": "get_client_kv_state"})
         resp = trainer.receive_data()
         if isinstance(resp, dict) and resp.get("type") == "client_kv_state":
-            full_model.load_client_kv_state(resp["state"])
-            full_model.enable_prefix_eval(True)
-            return True
+            state = resp["state"]
+            # Guard against LoRA/empty state
+            if state and state.get("k") is not None and state.get("v") is not None:
+                full_model.load_client_kv_state(state)
+                full_model.enable_prefix_eval(True)
+                return True
+        
     except Exception as e:
         print(f"⚠️ Eval prefixes not refreshed: {e}")
     full_model.enable_prefix_eval(False)   # fallback to legacy eval
@@ -99,20 +226,6 @@ def _build_self_attn_mask(attention_mask: torch.Tensor,
     attn = attn + src_pad.view(bsz, 1, 1, prefix_len + tgt_len) * _neg_inf(dtype)
     return attn
 
-
-def _resolve_base_lm(model_like):
-    def _looks_like_hf_lm(x):
-        return hasattr(x, "model") and hasattr(x.model, "decoder") and hasattr(x, "lm_head")
-    obj = model_like
-    for _ in range(6):
-        if _looks_like_hf_lm(obj): return obj
-        for name in ("base_model","hf_model","model","module","net","inner","wrapped","lm"):
-            if hasattr(obj, name):
-                obj = getattr(obj, name); break
-        else: break
-    if _looks_like_hf_lm(model_like): return model_like
-    raise AttributeError(f"Could not resolve HF LM from {type(model_like).__name__}")
-
 import torch
 import torch.nn.functional as F
 
@@ -126,12 +239,6 @@ def _right_trim(input_ids, attention_mask, labels):
         labels[:, :max_len] if labels is not None else None,
     )
 
-def _right_trim_inputs(input_ids, attention_mask):
-    # Keep only non-pad prefix per row (helps generation behave)
-    lengths = attention_mask.sum(dim=1)
-    max_len = int(lengths.max().item())
-    return input_ids[:, :max_len], attention_mask[:, :max_len]
-    
 def _server_forward_to_cut_payload(
     server_wrap,                    # ServerKVOnly instance
     input_ids: torch.Tensor,
@@ -195,12 +302,6 @@ def _server_forward_to_cut_payload(
             )
         # else: no-op if p == 0.0
 
-
-    # 4D attn mask
-    # attn_mask_4d = decoder._prepare_decoder_attention_mask(
-    #     attention_mask, (x.shape[0], x.shape[1]), x, 0
-    # )
-    # Determine prefix length P from your server PrefixKV
     try:
         prefix_len = int(server_wrap.kv.k.shape[-2])  # [L, H, P, D] -> P
     except Exception:
@@ -285,6 +386,65 @@ class _PrefixConcatCache:
         v_cat = torch.cat([vp, value_states], dim=2)
         return (k_cat, v_cat)
 
+class LoRAServerModel(nn.Module):
+    """
+    Server-side when tuning=LoRA. Keeps full base_model, injects LoRA only into layers [0..cut-1].
+    Presents no-prefix stubs so forward/masks pipeline stays unified.
+    """
+    def __init__(self, model_name: str, cut_layer: int,
+                 r: int = 8, alpha: int = 16, dropout: float = 0.0,
+                 targets=("q_proj","v_proj")):
+        super().__init__()
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float32, device_map=None
+        )
+        for p in self.base_model.parameters():
+            p.requires_grad = False
+        self.total_layers = self.base_model.config.num_hidden_layers
+        self.cut_layer = cut_layer
+
+        apply_lora_to_opt(
+            self.base_model,
+            targets=tuple(targets),
+            layer_range=(0, cut_layer - 1),
+            r=r, lora_alpha=alpha, lora_dropout=dropout
+        )
+
+        # keep interface consistent with prefix path
+        class _NoPrefixStub:
+            def get_local_past(self, bsz): return {}
+            def set_requires_grad(self, flag: bool): pass
+        self.server_kv = _NoPrefixStub()
+        self.client_kv_mirror = _NoPrefixStub()
+
+        # Provide a minimal KV stub so shared code paths can reference server_model.kv safely
+        class _EmptyKV:
+            def __init__(self):
+                # tensors with 4 dims so shape[-2] exists; P dimension is 0
+                self.k = torch.zeros((0, 0, 0, 0))
+                self.v = torch.zeros((0, 0, 0, 0))
+            def get_local_past(self, bsz):
+                return {}
+            def parameters(self):
+                return iter(())
+            def set_requires_grad(self, flag: bool):
+                return None
+            def state_dict(self):
+                return {"k": self.k, "v": self.v}
+
+        self.kv = _EmptyKV()
+
+    def state_dict_kv(self):
+        """Return an empty KV state to satisfy interfaces expecting a server KV snapshot."""
+        try:
+            # Prefer the stub tensors so shapes/types are tensors
+            return {"k": self.kv.k.detach().cpu(), "v": self.kv.v.detach().cpu()}
+        except Exception:
+            # Ultimate fallback
+            return {"k": torch.zeros(0), "v": torch.zeros(0)}
+
+    def trainable_parameters(self):
+        return iter_lora_parameters(self.base_model, layer_range=(0, self.cut_layer-1))
 
 class ServerKVOnly(nn.Module):
     """
@@ -298,6 +458,8 @@ class ServerKVOnly(nn.Module):
         self.total_layers = tmp.config.num_hidden_layers
         self.cut_layer = cut_layer
         self.kv = PrefixKV(tmp.config, list(range(0, cut_layer)), num_prefix=num_prefix, device=tmp.device)
+        for p in self.kv.parameters():
+            p.requires_grad = True
         self.attach_partial_model(model_name)
         # we do not keep the full model in memory here to save RAM
         del tmp
@@ -320,6 +482,9 @@ class ServerKVOnly(nn.Module):
         # keep only [0..cut_layer-1]
         dec.layers = nn.ModuleList(list(dec.layers[: self.cut_layer]))
         self.base_model = base.eval()
+        # Freeze all base model params on server in prefix mode; only KV prefixes train
+        for p in self.base_model.parameters():
+            p.requires_grad = False
 
     def state_dict_kv(self):
         # minimal state dict to send to client
@@ -349,17 +514,11 @@ def squad_collate_fn(batch):
             input_ids.append(item['input_ids'])
             attention_masks.append(item['attention_mask'])
             labels.append(item['labels'])
-            
-            # Handle optional fields
-            if 'formatted_text' in item:
-                formatted_texts.append(item['formatted_text'])
-            else:
-                formatted_texts.append("")  # Default empty string
-                
-            if 'original_example' in item:
-                original_examples.append(item['original_example'])
-            else:
-                original_examples.append({})  # Default empty dict
+            # Optional fields (some codepaths expect server_kv_state even in LoRA mode)
+            formatted_texts.append(item.get('formatted_text', ""))
+            original_examples.append(item.get('original_example', {}))
+            if 'server_kv_state' in item:
+                pass
         
         # Stack tensors
         batch_dict = {
@@ -368,12 +527,9 @@ def squad_collate_fn(batch):
             'labels': torch.stack(labels),
         }
         
-        # Add non-tensor data only if we have valid data
-        if any(text for text in formatted_texts):
-            batch_dict['formatted_text'] = formatted_texts
-            
-        if any(ex for ex in original_examples):
-            batch_dict['original_example'] = original_examples
+        # Always include non-tensor metadata lists for downstream logging/metrics
+        batch_dict['formatted_text'] = formatted_texts
+        batch_dict['original_example'] = original_examples
         
         return batch_dict
         
@@ -391,57 +547,10 @@ def safe_get_hf_tokenizer(model_name):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.padding_side = "left"
         return tokenizer
     except Exception as e:
         print(f"Failed to load tokenizer for {model_name}: {e}")
         raise
-
-
-class TextDataset(Dataset):
-    """Simple text dataset for demonstration purposes"""
-    def __init__(self, texts, tokenizer, max_length=512):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        
-        try:
-            encoding = self.tokenizer(
-                text,
-                truncation=True,
-                padding='max_length',
-                max_length=self.max_length,
-                return_tensors='pt'
-            )
-            
-            input_ids = encoding['input_ids'].squeeze()
-            attention_mask = encoding['attention_mask'].squeeze()
-            
-            return {
-                'input_ids': input_ids,
-                        'server_kv_state': server_model.state_dict_kv(),
-                        'cut_layer': args.cut_layer,
-                        'server_kv_state': server_model.state_dict_kv(),
-                        'cut_layer': args.cut_layer,
-                'attention_mask': attention_mask,
-                'labels': input_ids.clone()
-            }
-        except Exception as e:
-            print(f"Error processing text at index {idx}: {e}")
-            # Return a dummy sample
-            dummy_ids = torch.zeros(self.max_length, dtype=torch.long)
-            return {
-                'input_ids': dummy_ids,
-                'attention_mask': torch.ones_like(dummy_ids),
-                'labels': dummy_ids.clone()
-            }
-
 
 def get_squad_dataloaders(args, tokenizer):
     """Create SQUAD dataloaders with custom collate function"""
@@ -486,7 +595,7 @@ def get_squad_dataloaders(args, tokenizer):
         train_squad_dataset = SQuADDataset(train_texts, tokenizer, args.max_length)
         eval_squad_dataset = SQuADDataset(eval_texts, tokenizer, args.max_length, eval_examples)
         
-        # Create dataloaders with custom collate function
+            # Create dataloaders with custom collate function
         train_loader = DataLoader(
             train_squad_dataset, 
             batch_size=args.train_batch_size, 
@@ -539,6 +648,12 @@ class SQuADDataset(Dataset):
         text = self.texts[idx]
         
         try:
+            # Ensure the suffix containing "Answer:" + answer is retained
+            old_side = getattr(self.tokenizer, 'truncation_side', 'right')
+            try:
+                self.tokenizer.truncation_side = 'left'
+            except Exception:
+                pass
             encoding = self.tokenizer(
                 text,
                 truncation=True,
@@ -546,6 +661,10 @@ class SQuADDataset(Dataset):
                 max_length=self.max_length,
                 return_tensors='pt'
             )
+            try:
+                self.tokenizer.truncation_side = old_side
+            except Exception:
+                pass
             
             input_ids = encoding['input_ids'].squeeze()
             attention_mask = encoding['attention_mask'].squeeze()
@@ -556,16 +675,84 @@ class SQuADDataset(Dataset):
             if attention_mask.dim() == 0:
                 attention_mask = attention_mask.unsqueeze(0)
             
-            # For training, labels = input_ids (next token prediction)
+            # Build labels that supervise ONLY the answer tokens (ignore prefix + padding)
             labels = input_ids.clone()
+            valid_len = int(attention_mask.sum().item())
+            ids_list = input_ids.tolist()
+
+            # Helper to find token subsequence
+            def _find_subseq(hay, needle):
+                n = len(needle)
+                if n == 0 or n > len(hay):
+                    return -1
+                for i in range(0, len(hay) - n + 1):
+                    if hay[i:i+n] == needle:
+                        return i
+                return -1
+
+            # Try several encodings of the marker to be robust to whitespace/newlines
+            candidates = []
+            for marker in ["\nAnswer:", " Answer:", "Answer:"]:
+                try:
+                    tok = self.tokenizer.encode(marker, add_special_tokens=False)
+                    if tok:
+                        candidates.append(tok)
+                except Exception:
+                    pass
+
+            pos = -1
+            match_len = 0
+            for cand in candidates:
+                p = _find_subseq(ids_list, cand)
+                if p != -1 and (pos == -1 or p < pos):
+                    pos = p
+                    match_len = len(cand)
+
+            if pos != -1:
+                start_idx = pos + match_len
+            else:
+                # Fallback via character split
+                astart = text.find("Answer:")
+                if astart == -1:
+                    start_idx = 0
+                else:
+                    prefix = text[:astart + len("Answer:")]
+                    old_side2 = getattr(self.tokenizer, 'truncation_side', 'right')
+                    try:
+                        self.tokenizer.truncation_side = 'left'
+                    except Exception:
+                        pass
+                    prefix_tokens = self.tokenizer.encode(prefix, add_special_tokens=False)
+                    try:
+                        self.tokenizer.truncation_side = old_side2
+                    except Exception:
+                        pass
+                    start_idx = len(prefix_tokens)
+
+            # Clamp to valid sequence length
+            start_idx = max(0, min(start_idx, valid_len))
+            # Ignore everything before the answer prefix
+            if start_idx > 0:
+                labels[:start_idx] = -100
+            # Ignore padding
+            labels[attention_mask == 0] = -100
+            pad_id = getattr(self.tokenizer, 'pad_token_id', None)
+            if pad_id is not None:
+                labels[input_ids == pad_id] = -100
+            labels = labels.long()
             
             result = {
                 'input_ids': input_ids,
-                'server_kv_state': server_model.state_dict_kv(),
                 'cut_layer': args.cut_layer,
                 'attention_mask': attention_mask,
                 'labels': labels
             }
+            # Only include server_kv_state in prefix mode
+            try:
+                if args.tuning != 'lora':
+                    result['server_kv_state'] = server_model.state_dict_kv()
+            except Exception:
+                pass
             
             # Add optional fields consistently
             result['formatted_text'] = text  # Always include text
@@ -590,88 +777,6 @@ class SQuADDataset(Dataset):
                 'original_example': {}
             }
 
-
-class PrefixEncoder(nn.Module):
-    """Prefix encoder that creates trainable prefix embeddings"""
-    def __init__(self, config, num_prefix=5):
-        super(PrefixEncoder, self).__init__()
-        self.num_prefix = num_prefix
-        self.hidden_size = config.hidden_size
-        
-        # FIXED: Better initialization - use same as model embeddings
-        self.prefix_embeddings = nn.Parameter(
-            torch.randn(num_prefix, self.hidden_size) * (self.hidden_size ** -0.5)
-        )
-        
-        # Initialize to match existing embedding statistics
-        with torch.no_grad():
-            # Initialize with normal distribution similar to model embeddings
-            nn.init.normal_(self.prefix_embeddings, mean=0.0, std=0.02)
-        
-        print(f"  PrefixEncoder: {num_prefix} tokens x {self.hidden_size} dims = {num_prefix * self.hidden_size} parameters")
-        print(f"  Prefix embedding std: {self.prefix_embeddings.std().item():.6f}")
-    
-    def forward(self, batch_size):
-        """Expand prefix embeddings for the given batch size"""
-        return self.prefix_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-class ServerLLMModel(nn.Module):
-    """Server-side model that only trains prefix embeddings"""
-    def __init__(self, model_name, num_prefix=5):
-        super(ServerLLMModel, self).__init__()
-        print(f"Loading server model: {model_name}")
-        
-        try:
-            self.base_model = AutoModelForCausalLM.from_pretrained(
-                model_name, 
-                torch_dtype=torch.float32,
-                device_map=None
-            )
-            print(f"✅ Base model loaded successfully")
-        except Exception as e:
-            print(f"❌ Failed to load base model: {e}")
-            raise
-        
-        # Freeze base model parameters - server only trains prefix
-        for param in self.base_model.parameters():
-            param.requires_grad = False
-        
-        # Create trainable prefix encoder
-        try:
-            self.num_prefix = num_prefix
-            print(f"Prefix encoder created successfully")
-        except Exception as e:
-            print(f"❌ Failed to create prefix encoder: {e}")
-            raise
-        
-        print(f"Base parameters: {sum(p.numel() for p in self.base_model.parameters()):,}")
-        
-    def forward(self, input_ids, attention_mask):
-        """Forward pass that combines prefix with input embeddings"""
-        try:
-            batch_size, seq_len = input_ids.shape
-            
-            # Get input embeddings from base model
-            inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-            
-            # Get prefix embeddings for this batch
-            
-            # Concatenate prefix embeddings with input embeddings
-            # Shape: [batch_size, num_prefix + seq_len, hidden_size]
-            inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
-            
-            # Extend attention mask to include prefix tokens
-            prefix_mask = torch.ones(batch_size, self.num_prefix, device=attention_mask.device, dtype=attention_mask.dtype)
-            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-            
-            return {
-                'inputs_embeds': inputs_embeds,
-                'attention_mask': attention_mask
-            }
-        except Exception as e:
-            print(f"❌ Server model forward pass failed: {e}")
-            raise
 
 class FullLLMModel(nn.Module):
     """Frozen full model used only for monitoring/evaluation."""
@@ -814,61 +919,65 @@ class FullLLMModel(nn.Module):
         # Fallback: no prefixes known
         return self.base_model.generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
-def _recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise EOFError(f"socket closed during recv (wanted {n}, got {len(buf)})")
-        buf.extend(chunk)
-    return bytes(buf)
 
-# server.py
 class Trainer:
+    """Handles communication with the client"""
     def __init__(self, conn):
         self.conn = conn
-        try:
-            self.conn.settimeout(300.0)  # ok
-        except Exception:
-            pass
-
-    def _recvall(self, n: int):
-        buf = bytearray()
-        while len(buf) < n:
-            try:
-                chunk = self.conn.recv(n - len(buf))
-            except (BlockingIOError, InterruptedError):
-                continue
-            if not chunk:
-                return None  # peer closed / half-open
-            buf.extend(chunk)
-        return bytes(buf)
-
-    def send_data(self, data) -> bool:
+    
+    def send_data(self, data):
         try:
             serialized = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
             self.conn.sendall(len(serialized).to_bytes(4, 'big'))
             self.conn.sendall(serialized)
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError, socket.timeout) as e:
-            print(f"⚠️ send_data failed: {e}")
-            return False
-
+        except Exception as e:
+            print(f"❌ Failed to send data: {e}")
+            raise
+    
     def receive_data(self):
         try:
-            header = self._recvall(4)
-            if header is None or len(header) != 4:
-                return None
-            length = int.from_bytes(header, 'big')
-            payload = self._recvall(length)
-            if payload is None or len(payload) != length:
-                return None
-            return pickle.loads(payload)
-        except (EOFError, ConnectionResetError, BrokenPipeError, socket.timeout, OSError):
-            return None
+            length = int.from_bytes(self.conn.recv(4), 'big')
+            data = b''
+            while len(data) < length:
+                data += self.conn.recv(length - len(data))
+            return pickle.loads(data)
+        except Exception as e:
+            print(f"❌ Failed to receive data: {e}")
+            raise
+
+
+def _classification_metrics(outputs, labels, batch, tokenizer):
+    """Compute simple classification accuracy when 'class_label' is present."""
+    try:
+        # Predict the next token after the marker as a word and map to class
+        logits = outputs.logits
+        # position for first answer token: find via formatted_text
+        preds = []
+        trues = []
+        for i, text in enumerate(batch.get('formatted_text', [])):
+            if 'Answer:' not in text:
+                continue
+            ctx = text[: text.find('Answer:') + len('Answer:')]
+            ctx_tokens = tokenizer.encode(ctx, add_special_tokens=False)
+            pos = max(len(ctx_tokens) - 1, 0)
+            if pos >= logits.shape[1]-1:
+                continue
+            token_id = int(torch.argmax(logits[i, pos, :]).item())
+            token_str = tokenizer.decode([token_id]).strip().lower()
+            mapped = 1 if token_str in {"great", "positive", "good"} else 0
+            preds.append(mapped)
+            if 'class_label' in batch:
+                trues.append(int(batch['class_label'][i].item()))
+        if preds and trues and len(preds) == len(trues):
+            correct = sum(int(p==t) for p,t in zip(preds, trues))
+            return float(correct/len(trues))
+    except Exception:
+        return 0.0
+    return 0.0
+
 
 def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
-    """Calculate SQUAD-specific metrics - ROBUST VERSION"""
+    """Task-aware metrics: classification (SST-2) vs generation (QA/summary)."""
     try:
         # 1. Calculate standard next-token loss
         loss = outputs.loss.item() if outputs.loss is not None else 0.0
@@ -889,11 +998,14 @@ def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
             shift_labels = labels
         
         predictions = torch.argmax(shift_logits, dim=-1)
-        
-        # Calculate answer token accuracy
-        answer_accuracy = calculate_answer_token_accuracy(
-            predictions, shift_labels, batch, tokenizer
-        )
+        # Classification branch: if batch has class labels, compute classification acc
+        if 'class_label' in batch:
+            answer_accuracy = _classification_metrics(outputs, labels, batch, tokenizer)
+        else:
+            # Calculate answer token accuracy for generation tasks
+            answer_accuracy = calculate_answer_token_accuracy(
+                predictions, shift_labels, batch, tokenizer
+            )
         
         # 3. Calculate F1/EM by generating answers (with error handling)
         f1_score = 0.0
@@ -971,611 +1083,163 @@ def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
         print(f"❌ Answer token accuracy failed: {e}")
         return 0.0
 
-
-def squad_f1_score(prediction, ground_truth):
-    """Calculate F1 score for SQUAD with better error handling"""
-    try:
-        from collections import Counter
-        import string
-        import re
-        
-        def normalize_answer(s):
-            """Normalize answer text"""
-            if not isinstance(s, str):
-                s = str(s)
-            
-            def remove_articles(text):
-                return re.sub(r'\b(a|an|the)\b', ' ', text)
-            def white_space_fix(text):
-                return ' '.join(text.split())
-            def remove_punc(text):
-                exclude = set(string.punctuation)
-                return ''.join(ch for ch in text if ch not in exclude)
-            def lower(text):
-                return text.lower()
-            
-            return white_space_fix(remove_articles(remove_punc(lower(s))))
-        
-        # Normalize inputs
-        pred_normalized = normalize_answer(prediction)
-        truth_normalized = normalize_answer(ground_truth)
-        
-        prediction_tokens = pred_normalized.split()
-        ground_truth_tokens = truth_normalized.split()
-        
-        # Handle empty cases
-        if len(prediction_tokens) == 0 and len(ground_truth_tokens) == 0:
-            return 1.0
-        if len(prediction_tokens) == 0 or len(ground_truth_tokens) == 0:
-            return 0.0
-        
-        # Calculate overlap
-        common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
-        num_same = sum(common.values())
-        
-        if num_same == 0:
-            return 0.0
-        
-        precision = num_same / len(prediction_tokens)
-        recall = num_same / len(ground_truth_tokens)
-        f1 = (2 * precision * recall) / (precision + recall)
-        
-        return float(f1)
-        
-    except Exception as e:
-        print(f"❌ F1 calculation error: {e}")
-        return 0.0
-
-import torch
-
-def right_trim_batch(input_ids, attention_mask, labels=None):
-    """
-    Right-trim padding so the model doesn't waste compute on padded tokens.
-    Keeps shape-consistency across input_ids / attention_mask / labels.
-    """
-    # length per row
-    lens = attention_mask.sum(dim=-1)
-    max_len = int(lens.max().item())
-    input_ids = input_ids[:, :max_len]
-    attention_mask = attention_mask[:, :max_len]
-    if labels is not None:
-        labels = labels[:, :max_len]
-        return input_ids, attention_mask, labels
-    return input_ids, attention_mask, None
-
-def decode_generated_suffix(model, tokenizer, input_ids, attention_mask,
-                            max_new_tokens=32, eos_token_id=None):
-    """
-    Greedy generation, then decode ONLY the new suffix after the prompt length.
-    - Works for causal LMs (OPT, etc.)
-    - Strips at first newline to avoid rambling
-    """
-    eos_id = eos_token_id if eos_token_id is not None else tokenizer.eos_token_id
-    gen = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        eos_token_id=eos_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    prompt_lens = attention_mask.sum(dim=1)  # B
-    outs = []
-    for i, g in enumerate(gen):
-        start = int(prompt_lens[i].item())
-        suffix_ids = g[start:]
-        txt = tokenizer.decode(suffix_ids, skip_special_tokens=True).strip()
-        # Be conservative for QA/CLS: take first line/sentence
-        txt = txt.split("\n", 1)[0].strip()
-        outs.append(txt)
-    return outs
-
-
-@torch.no_grad()
 def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
-    """
-    Unified evaluation across tasks using true-split when available.
-
-    Returns (avg_loss, main1, main2, main3) where:
-      - For 'cls' (SST-2): (loss, accuracy, 0.0, 0.0)
-      - For 'qa'  (SQuAD/DROP): (loss, f1, em, 0.0)
-      - For 'sum' (XSum): (loss, rouge1, rouge2, rougeL)
-    """
-    task = getattr(args, "task", "squad").lower()
-    task_type = {"sst2": "cls", "squad": "qa", "drop": "qa", "xsum": "sum"}.get(task, "qa")
-    print(f"  Starting evaluation for task='{task}' (type='{task_type}')")
-
-    # Smoke test (okay to fail for non-generative heads)
-    try:
-        print("  Testing generation capability (local model path)...")
+    """Task-aware evaluation; generation metrics for QA/summary, class acc for SST-2."""
+    print("  Starting SQUAD evaluation...")
+    
+    # Only test generation if not a pure classification task
+    if getattr(args, 'task', 'squad') != 'sst2':
+        print("  Testing generation capability...")
         gen_works = test_generation_simple(model, tokenizer, device)
         print(f"  Generation test result: {'✅ PASS' if gen_works else '❌ FAIL'}")
-    except Exception:
-        print("  (Skipping generation smoke test for non-generative head.)")
-
-    # Prefix refresh if applicable
-    if server_model is not None and trainer is not None:
-        _refreshed = _refresh_eval_prefixes(model, server_model, trainer)
-        if not _refreshed:
-            print("⚠️ Prefix-aware eval unavailable; continuing with current weights.")
-
+    
     model.eval()
-    if server_model is not None:
-        server_model.eval()
-
     total_loss = 0.0
-    n_batches  = 0
+    total_answer_accuracy = 0.0
+    total_f1 = 0.0
+    total_em = 0.0
+    num_batches = 0
 
-    # Accumulators
-    pred_label_ids, true_label_ids = [], []   # CLS
-    pred_texts = []                           # QA/SUM (and CLS fallback)
-    all_meta   = []                           # one dict per example
-    all_targets = []                          # text_target (used for SUM; ignored for QA)
-
-    for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"{task.upper()} Evaluation")):
-        try:
-            # --- Uniform batch adapter THEN right-trim ---
-            input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
-            input_ids, attention_mask, labels = right_trim_batch(input_ids, attention_mask, labels)
-
-            # ======== TRUE-SPLIT EVAL PATH ========
-            if server_model is not None and trainer is not None:
-                # Server forward to cut
-                h_cut_live, _pkg = _server_forward_to_cut_payload(
-                    server_model,
-                    input_ids, attention_mask, labels,
-                    send_fp16=True
-                )
-                trainer.send_data({
-                    "type": "forward_cut",
-                    "mode": "eval",
-                    "data": {"h_cut": h_cut_live, "attention_mask": _pkg["attention_mask"], "labels": _pkg["labels"], "cut_layer": _pkg["cut_layer"]},
-                    "meta": {
-                        "task_type": task_type,
-                        "max_new_tokens": getattr(args, "max_new_tokens", 20),
-                    }
-                })
-
-                resp = trainer.receive_data()
-                batch_loss = float(resp.get("loss", 0.0))
-                total_loss += batch_loss
-                n_batches  += 1
-
-                if task_type == "cls":
-                    # Prefer explicit pred_ids; else derive from logits
-                    if "pred_ids" in resp:
-                        preds = list(resp["pred_ids"])
-                    elif "logits" in resp:
-                        logits = torch.tensor(resp["logits"])
-                        preds = logits.argmax(-1).tolist()
-                    else:
-                        # Fallback: ask client to return generations; map to labels later
-                        preds = None
-
-                    if preds is not None:
-                        pred_label_ids.extend(preds)
-                        true_label_ids.extend(batch["labels"].tolist())
-                    else:
-                        # Fallback to text-based mapping if only generations are available
-                        gens = [g.strip() for g in resp.get("generations", [])]
-                        pred_texts.extend(gens)
-                        all_meta.extend(meta)
-                        all_targets.extend(text_target)
-
-                else:
-                    gens = [g.strip() for g in resp.get("generations", [])]
-                    pred_texts.extend(gens)
-                    all_meta.extend(meta)
-                    all_targets.extend(text_target)
-
-            # ======== LOCAL (MONOLITHIC) EVAL PATH ========
+    with torch.no_grad():
+        # Try to refresh prefix-aware eval when split context is available
+        split_eval = False
+        if server_model is not None and trainer is not None:
+            if getattr(args, 'tuning', 'prefix') == 'lora':
+                # In LoRA mode, use split pipeline (no prefix handshake needed)
+                split_eval = True
             else:
-                if task_type == "cls":
-                    # If a classifier head exists:
-                    try:
-                        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-                        if isinstance(labels, torch.Tensor) and labels.ndim == 1 and labels.dtype in (torch.long, torch.int64):
-                            loss = F.cross_entropy(logits, labels, reduction="mean")
-                            total_loss += float(loss.item())
-                        else:
-                            total_loss += 0.0
-                        n_batches += 1
-                        preds = logits.argmax(-1).tolist()
-                        pred_label_ids.extend(preds)
-                        true_label_ids.extend(batch["labels"].tolist())
-                    except Exception:
-                        # No classifier head → use LM path and text mapping
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels if labels is not None and labels.ndim==2 else None)
-                        if hasattr(outputs, "loss") and outputs.loss is not None:
-                            total_loss += float(outputs.loss.item())
-                        n_batches += 1
-                        gens = decode_generated_suffix(
-                            model, tokenizer, input_ids, attention_mask,
-                            max_new_tokens=getattr(args, "max_new_tokens", 20)
-                        )
-                        pred_texts.extend(gens)
-                        all_meta.extend(meta)
-                        all_targets.extend(text_target)
-
+                _refreshed = _refresh_eval_prefixes(model, server_model, trainer, args)
+                if not _refreshed:
+                    print("⚠️ Prefix-aware eval unavailable; falling back to frozen no-prefix eval.")
                 else:
-                    # Generative path (QA/SUM): compute LM loss if labels are provided
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    if hasattr(outputs, "loss") and outputs.loss is not None:
-                        total_loss += float(outputs.loss.item())
-                    else:
-                        # Manual CE if needed
-                        logits = outputs.logits
-                        shift_logits = logits[:, :-1, :].contiguous()
-                        shift_labels = labels[:, 1:].contiguous() if labels is not None else None
-                        if shift_labels is not None:
-                            ce = F.cross_entropy(
-                                shift_logits.view(-1, shift_logits.size(-1)),
-                                shift_labels.view(-1),
-                                ignore_index=-100,
-                                reduction="mean",
-                            )
-                            total_loss += float(ce.item())
-                    n_batches += 1
+                    split_eval = True
 
-                    # Prompt-aware decoding (no duplicate generation)
-                    gens = decode_generated_suffix(
-                        model, tokenizer, input_ids, attention_mask,
-                        max_new_tokens=getattr(args, "max_new_tokens", 20)
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc="SQUAD Evaluation")):
+            try:
+                input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
+                input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
+
+                # LoRA eval: combine server+client LoRA on a fresh full model and evaluate locally
+                if split_eval and getattr(args, 'tuning', 'prefix') == 'lora':
+                    try:
+                        # 1) Build a fresh full model
+                        full_eval = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map=None).to(device)
+                        for p in full_eval.parameters():
+                            p.requires_grad = False
+
+                        total_layers_local = full_eval.config.num_hidden_layers
+
+                        # 2) Apply LoRA to both halves
+                        apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(0, args.cut_layer-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+                        apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(args.cut_layer, total_layers_local-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+
+                        # 3) Load server LoRA into [0..cut-1]
+                        server_state = get_lora_state_dict(getattr(server_model, 'base_model', server_model), layer_range=(0, args.cut_layer-1))
+                        _ = load_lora_state_dict(full_eval, server_state)
+
+                        # 4) Request client LoRA for [cut..L-1] and load
+                        trainer.send_data({"type": "get_client_lora_state"})
+                        resp = trainer.receive_data()
+                        if isinstance(resp, dict) and resp.get("type") == "client_lora_state" and resp.get("ok", False):
+                            client_state = resp.get("state", {})
+                            _ = load_lora_state_dict(full_eval, client_state)
+                        else:
+                            print("⚠️ Could not fetch client LoRA state; proceeding with server half only")
+
+                        # 5) Compute outputs and metrics locally on combined model
+                        outputs = full_eval(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss, answer_acc, f1, em = calculate_squad_metrics(outputs, labels, batch, tokenizer, full_eval, device)
+
+                        total_loss += loss
+                        total_answer_accuracy += answer_acc
+                        total_f1 += f1
+                        total_em += em
+                        num_batches += 1
+                        if batch_idx < 3:
+                            print(f"\nBatch {batch_idx}: Loss={loss:.4f}, Acc={answer_acc:.6f}, F1={f1:.6f}, EM={em:.6f}")
+                        continue
+                    except Exception as e:
+                        print(f"⚠️ Combined LoRA eval failed, falling back to client eval path: {e}")
+                        # Fall through to legacy path below if needed
+
+                # Default eval: compute local outputs for metrics
+                outputs = model(input_ids, attention_mask, labels)
+
+                # Debug: Check data structure for first batch
+                if batch_idx == 0:
+                    print(f"\n  First batch debug:")
+                    print(f"   Input shape: {input_ids.shape}")
+                    print(f"   Has formatted_text: {'formatted_text' in batch}")
+                    print(f"   Has original_example: {'original_example' in batch}")
+                    if 'formatted_text' in batch:
+                        print(f"   Formatted text count: {len(batch['formatted_text'])}")
+                        print(f"   Sample: {batch['formatted_text'][0][:100]}...")
+
+                # If split eval context exists, ask client to compute loss on its half once
+                if split_eval:
+                    h_cut_live, pkg = _server_forward_to_cut_payload(
+                        server_model,
+                        input_ids, attention_mask, labels,
+                        send_fp16=True
                     )
-                    pred_texts.extend([g.strip() for g in gens])
-                    all_meta.extend(meta)
-                    all_targets.extend(text_target)
 
-            # (Optional) light debug
-            if batch_idx < 2:
-                print(f"  Batch {batch_idx} ok.")
+                    trainer.send_data({
+                        "type": "forward_cut",
+                        "mode": "eval",
+                        "data": {"h_cut": pkg["h_cut"], "attention_mask": pkg["attention_mask"], "labels": pkg["labels"], "cut_layer": pkg["cut_layer"]},
+                        "meta": {
+                            "task_type": getattr(args, "task", None),
+                            "max_new_tokens": getattr(args, "max_new_tokens", 20),
+                        }
+                    })
 
-        except Exception as e:
-            print(f"\n⚠️ Error in evaluation batch {batch_idx}: {e}")
-            continue
+                    resp = trainer.receive_data()  # client returns eval stats
+                    if not (isinstance(resp, dict) and resp.get("type") == "eval_stats"):
+                        raise RuntimeError(f"Bad eval resp: {type(resp)}")
 
-    avg_loss = total_loss / max(n_batches, 1)
+                    # Client responded; we rely on local metrics for aggregation
 
-    # ---- Aggregate metrics in one place ----
-    from metrics import compute_metrics_for_batch, _cls_map_prediction_to_label
+                # Calculate task-aware metrics locally (authoritative)
+                # Choose generation max tokens dynamically per task
+                task = getattr(args, 'task', 'squad')
+                gen_max = 5
+                if task == 'squad':
+                    gen_max = 16
+                elif task == 'drop':
+                    gen_max = 8
+                elif task == 'xsum':
+                    gen_max = 20
+                loss, answer_acc, f1, em = calculate_squad_metrics(
+                    outputs, labels, batch, tokenizer, model, device,
+                    generation_max_new_tokens=gen_max
+                )
 
-    if task_type == "cls":
-        if pred_label_ids and true_label_ids:
-            acc = float((torch.tensor(pred_label_ids) == torch.tensor(true_label_ids)).float().mean().item())
-        else:
-            # text-based mapping fallback
-            mapped = [_cls_map_prediction_to_label(t) for t in pred_texts]
-            acc = float((torch.tensor(mapped) == torch.tensor([m.get("label_id", 0) for m in all_meta])).float().mean().item())
-        print(f"\n  {task.upper()} Evaluation Complete:")
-        print(f"   Average Loss: {avg_loss:.4f}")
-        print(f"   Accuracy:     {acc:.6f}")
-        return avg_loss, acc, 0.0, 0.0
+                total_loss += loss
+                total_answer_accuracy += answer_acc
+                total_f1 += f1
+                total_em += em
+                num_batches += 1
 
-    elif task_type == "qa":
-        # For QA we want meta["refs"] per example. compute_metrics_for_batch will pull from meta.
-        md = compute_metrics_for_batch(
-            "qa",
-            pred_texts=pred_texts,
-            batch_meta=all_meta,
-            gold_texts=all_targets  # ignored for QA, kept for signature unity
-        )
-        f1 = float(md.get("f1", 0.0))
-        em = float(md.get("exact_match", md.get("em", 0.0)))
-        print(f"\n  {task.upper()} Evaluation Complete:")
-        print(f"   Average Loss: {avg_loss:.4f}")
-        print(f"   F1:           {f1:.6f}")
-        print(f"   EM:           {em:.6f}")
-        return avg_loss, f1, em, 0.0
+                if batch_idx < 3:
+                    print(f"\nBatch {batch_idx}: Loss={loss:.4f}, Acc={answer_acc:.6f}, F1={f1:.6f}, EM={em:.6f}")
 
-    else:  # "sum"
-        # For summarization, use text targets as references
-        md = compute_metrics_for_batch(
-            "gen",
-            pred_texts=pred_texts,
-            batch_meta=all_meta,        # not used for GEN
-            gold_texts=all_targets      # single-reference summaries
-        )
-        r1 = float(md.get("rouge1", 0.0))
-        r2 = float(md.get("rouge2", 0.0))
-        rL = float(md.get("rougeL", 0.0))
-        print(f"\n  {task.upper()} Evaluation Complete:")
-        print(f"   Average Loss: {avg_loss:.4f}")
-        print(f"   ROUGE-1:      {r1:.6f}")
-        print(f"   ROUGE-2:      {r2:.6f}")
-        print(f"   ROUGE-L:      {rL:.6f}")
-        return avg_loss, r1, r2, rL
-        
-# @torch.no_grad()
-# def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
-#     """
-#     Unified evaluation across tasks using true-split when available.
-
-#     Returns (avg_loss, main1, main2, main3) where:
-#       - For 'cls' (SST-2): (loss, accuracy, 0.0, 0.0)
-#       - For 'qa'  (SQuAD/DROP): (loss, f1, em, 0.0)
-#       - For 'sum' (XSum): (loss, rouge1, rouge2, rougeL)
-#     """
-#     task = getattr(args, "task", "squad").lower()
-#     task_type = {"sst2": "cls", "squad": "qa", "drop": "qa", "xsum": "sum"}.get(task, "qa")
-
-#     print(f"  Starting evaluation for task='{task}' (type='{task_type}')")
-
-#     # Quick smoke test for generation capability on local model only
-#     try:
-#         print("  Testing generation capability (local model path)...")
-#         gen_works = test_generation_simple(model, tokenizer, device)
-#         print(f"  Generation test result: {'✅ PASS' if gen_works else '❌ FAIL'}")
-#     except Exception as _:
-#         # Some classifier heads won’t pass a text-gen probe; that’s fine.
-#         print("  (Skipping generation smoke test for non-generative head.)")
-
-#     # Prefix refresh if you use that mechanism
-#     if server_model is not None and trainer is not None:
-#         _refreshed = _refresh_eval_prefixes(model, server_model, trainer)
-#         if not _refreshed:
-#             print("⚠️ Prefix-aware eval unavailable; continuing with current weights.")
-
-#     model.eval()
-#     if server_model is not None:
-#         server_model.eval()
-
-#     total_loss = 0.0
-#     n_batches  = 0
-
-#     # Accumulators by task type
-#     pred_label_ids, true_label_ids = [], []                 # cls
-#     pred_texts, ref_texts_list = [], []                     # qa/sum
-
-#     for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"{task.upper()} Evaluation")):
-#         try:
-#             input_ids      = batch["input_ids"].to(device)
-#             attention_mask = batch["attention_mask"].to(device)
-#             labels = batch.get("labels", None)
-#             if isinstance(labels, torch.Tensor):
-#                 labels = labels.to(device)
-
-#             # Right-trim for saner generation
-#             input_ids, attention_mask, labels = right_trim_batch(input_ids, attention_mask, labels)
-#             input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
-
-#             # Classification labels (SST-2) vs generative labels (QA/SUM)
-            
-
-#             # ======== TRUE-SPLIT EVAL PATH ========
-#             if server_model is not None and trainer is not None:
-#                 # Server forward to cut
-#                 h_cut_live, _pkg = _server_forward_to_cut_payload(
-#                     server_model,
-#                     input_ids, attention_mask, labels,
-#                     send_fp16=True
-#                 )
-
-#                 trainer.send_data({
-#                     "type": "forward_cut",
-#                     "mode": "eval",
-#                     "data": {
-#                         "h_cut": h_cut_live,                      # already packed by helper
-#                         "attention_mask": attention_mask.cpu(),
-#                         "labels": labels.cpu() if labels is not None else None,
-#                     },
-#                     "meta": {
-#                         "task_type": task_type,                   # "cls" | "qa" | "sum"
-#                         "max_new_tokens": getattr(args, "max_new_tokens", 20),
-#                     }
-#                 })
-
-#                 resp = trainer.receive_data()
-#                 batch_loss = float(resp.get("loss", 0.0))
-#                 total_loss += batch_loss
-#                 n_batches  += 1
-
-#                 if task_type == "cls":
-#                     if "pred_ids" in resp:
-#                         preds = resp["pred_ids"]
-#                     else:
-#                         logits = torch.tensor(resp["logits"])
-#                         preds = logits.argmax(-1).tolist()
-#                     pred_label_ids.extend(preds)
-#                     true_label_ids.extend(batch["labels"].tolist())
-
-#                 else:
-#                     gens = [g.strip() for g in resp.get("generations", [])]
-#                     pred_texts.extend(gens)
-#                     # refs: list of lists (provided by dataset collator)
-#                     refs = batch.get("refs", [[] for _ in gens])
-#                     ref_texts_list.extend(refs)
-
-#             # ======== LOCAL (MONOLITHIC) EVAL PATH ========
-#             else:
-#                 if task_type == "cls":
-#                     # Classifier head path: logits → CE loss and argmax
-#                     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-#                     if labels is not None:
-#                         loss = F.cross_entropy(logits, labels, reduction="mean")
-#                         total_loss += float(loss.item())
-#                     else:
-#                         total_loss += 0.0
-#                     n_batches += 1
-#                     preds = logits.argmax(-1).tolist()
-#                     pred_label_ids.extend(preds)
-#                     true_label_ids.extend(batch["labels"].tolist())
-
-#                 else:
-#                     # Generative path: compute LM loss if labels given, and generate texts
-#                     # Loss: shift logits vs shifted labels with ignore_index=-100
-#                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-#                     if hasattr(outputs, "loss") and outputs.loss is not None:
-#                         total_loss += float(outputs.loss.item())
-#                     else:
-#                         # Manual CE if needed
-#                         logits = outputs.logits
-#                         shift_logits = logits[:, :-1, :].contiguous()
-#                         shift_labels = labels[:, 1:].contiguous() if labels is not None else None
-#                         if shift_labels is not None:
-#                             ce = F.cross_entropy(
-#                                 shift_logits.view(-1, shift_logits.size(-1)),
-#                                 shift_labels.view(-1),
-#                                 ignore_index=-100,
-#                                 reduction="mean",
-#                             )
-#                             total_loss += float(ce.item())
-#                     n_batches += 1
-
-#                     # Generation
-#                     gen_ids = model.generate(
-#                         input_ids=input_ids,
-#                         attention_mask=attention_mask,
-#                         max_new_tokens=getattr(args, "max_new_tokens", 20),
-#                     )
-
-#                     pred_texts = decode_generated_suffix(model, tokenizer, input_ids, attention_mask,
-#                                      max_new_tokens=getattr(args, "max_new_tokens", 20))
-#                     gens = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-#                     pred_texts.extend([g.strip() for g in gens])
-#                     refs = batch.get("refs", [[] for _ in gens])
-#                     ref_texts_list.extend(refs)
-
-#             from metrics import compute_metrics_for_batch
-#             m = compute_metrics_for_batch(task_type, pred_texts, batch["meta"], batch["text_target"])
-
-#             # Optional: light debugging for first few batches
-#             if batch_idx < 2:
-#                 print(f"  Batch {batch_idx} ok.")
-
-#         except Exception as e:
-#             print(f"\n⚠️ Error in evaluation batch {batch_idx}: {e}")
-#             continue
-
-#     avg_loss = total_loss / max(n_batches, 1)
-
-#     # ---- Aggregate metrics in one place ----
-#     if task_type == "cls":
-#         md = compute_metrics_for_task(
-#             "cls",
-#             pred_label_ids=pred_label_ids,
-#             true_label_ids=true_label_ids,
-#         )
-#         acc = float(md["accuracy"])
-#         print(f"\n  {task.upper()} Evaluation Complete:")
-#         print(f"   Average Loss: {avg_loss:.4f}")
-#         print(f"   Accuracy:     {acc:.6f}")
-#         return avg_loss, acc, 0.0, 0.0
-
-#     elif task_type == "qa":
-#         md = compute_metrics_for_task(
-#             "qa",
-#             pred_texts=pred_texts,
-#             ref_texts_list=ref_texts_list,
-#         )
-#         f1 = float(md.get("f1", 0.0))
-#         em = float(md.get("em", 0.0))
-#         print(f"\n  {task.upper()} Evaluation Complete:")
-#         print(f"   Average Loss: {avg_loss:.4f}")
-#         print(f"   F1:           {f1:.6f}")
-#         print(f"   EM:           {em:.6f}")
-#         return avg_loss, f1, em, 0.0
-
-#     else:  # "sum"
-#         md = compute_metrics_for_task(
-#             "sum",
-#             pred_texts=pred_texts,
-#             ref_texts_list=ref_texts_list,
-#         )
-#         r1 = float(md.get("rouge1", 0.0))
-#         r2 = float(md.get("rouge2", 0.0))
-#         rL = float(md.get("rougeL", 0.0))
-#         print(f"\n  {task.upper()} Evaluation Complete:")
-#         print(f"   Average Loss: {avg_loss:.4f}")
-#         print(f"   ROUGE-1:      {r1:.6f}")
-#         print(f"   ROUGE-2:      {r2:.6f}")
-#         print(f"   ROUGE-L:      {rL:.6f}")
-#         return avg_loss, r1, r2, rL
-        
-# def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
-#     """SQUAD-specific evaluation with imported metrics"""
-#     print("  Starting SQUAD evaluation...")
+            except Exception as e:
+                print(f"\n⚠️ Error in evaluation batch {batch_idx}: {e}")
+                continue
     
-#     # Test generation capability first
-#     print("  Testing generation capability...")
-#     gen_works = test_generation_simple(model, tokenizer, device)
-#     print(f"  Generation test result: {'✅ PASS' if gen_works else '❌ FAIL'}")
+    # Calculate averages
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_answer_accuracy = total_answer_accuracy / num_batches if num_batches > 0 else 0.0
+    avg_f1 = total_f1 / num_batches if num_batches > 0 else 0.0
+    avg_em = total_em / num_batches if num_batches > 0 else 0.0
     
-#     model.eval()
-#     total_loss = 0.0
-#     total_answer_accuracy = 0.0
-#     total_f1 = 0.0
-#     total_em = 0.0
-#     num_batches = 0
-
-#     with torch.no_grad():
-#         # just before: for batch in eval_loader:
-#         # _refreshed = _refresh_eval_prefixes(full_model, server_model, trainer)
-#         if server_model is not None and trainer is not None:
-#             _refreshed = _refresh_eval_prefixes(model, server_model, trainer)
-#             if not _refreshed:
-#                 print("⚠️ Prefix-aware eval unavailable; falling back to frozen no-prefix eval.")
-
-#         for batch_idx, batch in enumerate(tqdm(test_loader, desc="SQUAD Evaluation")):
-#             try:
-#                 input_ids = batch['input_ids'].to(device)
-#                 attention_mask = batch['attention_mask'].to(device)
-#                 # labels = batch['labels'].to(device)
-#                 # --- server.py (inside evaluate_model(...) before the forward) ---
-#                 labels = input_ids.clone()
-#                 labels[attention_mask == 0] = -100
-#                 pad_id = getattr(tokenizer, 'pad_token_id', None)
-#                 if pad_id is not None:
-#                     labels[input_ids == pad_id] = -100
-#                 labels = labels.long()
-
-#                 outputs = model(input_ids, attention_mask, labels)  # proceed as before
-
-                
-#                 # Debug: Check data structure for first batch
-#                 if batch_idx == 0:
-#                     print(f"\n  First batch debug:")
-#                     print(f"   Input shape: {input_ids.shape}")
-#                     print(f"   Has formatted_text: {'formatted_text' in batch}")
-#                     print(f"   Has original_example: {'original_example' in batch}")
-#                     if 'formatted_text' in batch:
-#                         print(f"   Formatted text count: {len(batch['formatted_text'])}")
-#                         print(f"   Sample: {batch['formatted_text'][0][:100]}...")
-                
-#                 # Forward pass
-#                 outputs = model(input_ids, attention_mask, labels)
-                
-#                 # Calculate SQUAD metrics using imported function
-#                 loss, answer_acc, f1, em = calculate_squad_metrics(
-#                     outputs, labels, batch, tokenizer, model, device
-#                 )
-                
-#                 total_loss += loss
-#                 total_answer_accuracy += answer_acc
-#                 total_f1 += f1
-#                 total_em += em
-#                 num_batches += 1
-                
-#                 # Print progress for first few batches
-#                 if batch_idx < 3:
-#                     print(f"\nBatch {batch_idx}: Loss={loss:.4f}, Acc={answer_acc:.6f}, F1={f1:.6f}, EM={em:.6f}")
-                
-#             except Exception as e:
-#                 print(f"\n⚠️ Error in evaluation batch {batch_idx}: {e}")
-#                 continue
+    print(f"\n  SQUAD Evaluation Complete:")
+    print(f"   Average Loss: {avg_loss:.4f}")
+    print(f"   Answer Token Accuracy: {avg_answer_accuracy:.6f}")
+    print(f"   F1 Score: {avg_f1:.6f}")
+    print(f"   Exact Match: {avg_em:.6f}")
     
-#     # Calculate averages
-#     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-#     avg_answer_accuracy = total_answer_accuracy / num_batches if num_batches > 0 else 0.0
-#     avg_f1 = total_f1 / num_batches if num_batches > 0 else 0.0
-#     avg_em = total_em / num_batches if num_batches > 0 else 0.0
-    
-#     print(f"\n  SQUAD Evaluation Complete:")
-#     print(f"   Average Loss: {avg_loss:.4f}")
-#     print(f"   Answer Token Accuracy: {avg_answer_accuracy:.6f}")
-#     print(f"   F1 Score: {avg_f1:.6f}")
-#     print(f"   Exact Match: {avg_em:.6f}")
-    
-#     return avg_loss, avg_answer_accuracy, avg_f1, avg_em
+    return avg_loss, avg_answer_accuracy, avg_f1, avg_em
     
 def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader,
                              optimizer, scheduler, trainer, device, tokenizer, args):
@@ -1622,30 +1286,40 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
 
-                    # Build labels JUST like the SGD path: -100 on pads
-                    labels = input_ids.clone()
-                    labels[attention_mask == 0] = -100
-                    pad_id = getattr(tokenizer, 'pad_token_id', None)
-                    if pad_id is not None:
-                        labels[input_ids == pad_id] = -100
-                    labels = labels.long()
+                    # Prefer dataset-provided labels (answer-only), fallback to pad-masked copy
+                    labels = batch.get('labels', None)
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.to(device)
+                    else:
+                        labels = input_ids.clone()
+                        labels[attention_mask == 0] = -100
+                        pad_id = getattr(tokenizer, 'pad_token_id', None)
+                        if pad_id is not None:
+                            labels[input_ids == pad_id] = -100
+                        labels = labels.long()
 
                     optimizer.zero_grad(set_to_none=True)
 
                     def objective_fn():
-                        h_cut_live, pkg = _server_forward_to_cut_payload(
-                            server_model,
-                            input_ids, attention_mask, labels,
-                            send_fp16=True
-                        )
+                        # Ensure deterministic probe: disable dropout temporarily
+                        was_training = server_model.training
+                        server_model.eval()
+                        with torch.no_grad():
+                            h_cut_live, pkg = _server_forward_to_cut_payload(
+                                server_model,
+                                input_ids, attention_mask, labels,
+                                send_fp16=True
+                            )
                         pkg["tgt_len"] = int(h_cut_live.shape[1])
-
-                        # Server is ZOO; the client should skip g_cut and return loss only
                         trainer.send_data({"type": "forward_cut", "mode": "train",
                         "data": pkg, "meta": {"zoo_eval": True}})
-                        resp = trainer.receive_data()  # {'loss': float}
-                        return torch.as_tensor(resp["loss"], device=h_cut_live.device, dtype=h_cut_live.dtype)
-                    
+                        # Server is ZOO; the client should skip g_cut and return loss only
+                        resp = trainer.receive_data()  # {'type': 'loss_report', 'loss': float}
+                        loss_val = float(resp.get("loss", 0.0))
+                        if was_training:
+                            server_model.train()
+                        return torch.as_tensor(loss_val, device=h_cut_live.device, dtype=h_cut_live.dtype)
+
                     def objective_fn_c(*_args,**_kwargs):
                         return objective_fn()
 
@@ -1692,8 +1366,12 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     # periodic eval (uses the safe FullLLMModel)
                     if global_step % args.eval_steps == 0:
                         print(f"\nStep {global_step}: Running ZOO evaluation...")
+                        # eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
+                        #     full_model, eval_loader, device, tokenizer, args
+                        # )
                         eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
-                            full_model, eval_loader, device, tokenizer, args
+                            full_model, eval_loader, device, tokenizer, args,
+                            server_model=server_model, trainer=trainer
                         )
                         print(f".  Step {global_step} ZOO Evaluation:")
                         print(f"   Loss: {eval_loss:.4f}")
@@ -1755,12 +1433,17 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     # labels = batch['labels'].to(device)
                     
                     optimizer.zero_grad()
-                    labels = input_ids.clone()
-                    labels[attention_mask == 0] = -100
-                    pad_id = getattr(tokenizer, 'pad_token_id', None)
-                    if pad_id is not None:
-                        labels[input_ids == pad_id] = -100
-                    labels = labels.long()
+                    # Prefer dataset-provided labels (answer-only), fallback to pad-masked copy
+                    labels = batch.get('labels', None)
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.to(device)
+                    else:
+                        labels = input_ids.clone()
+                        labels[attention_mask == 0] = -100
+                        pad_id = getattr(tokenizer, 'pad_token_id', None)
+                        if pad_id is not None:
+                            labels[input_ids == pad_id] = -100
+                        labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
                     h_cut_live, pkg = _server_forward_to_cut_payload(
@@ -1774,35 +1457,13 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
 
                     # === Receive loss + g_cut; backprop on server ===
                     resp = trainer.receive_data()  # {'loss': float, 'g_cut': tensor}
-                    # loss_val = float(resp["loss"])
-                    # Harden against out-of-band messages
-                    if not isinstance(resp, dict):
-                        raise RuntimeError(f"Invalid client reply: {type(resp)}")
-                    if "loss" not in resp:
-                        # Surface client-side exceptions helpfully
-                        if resp.get("type") == "client_error":
-                            where = resp.get("where", "?")
-                            msg   = resp.get("msg", "?")
-                            raise RuntimeError(f"Client error during {where}: {msg}")
-                        raise KeyError(f"Missing 'loss' in client reply. Keys={list(resp.keys())}")
-
                     loss_val = float(resp["loss"])
                     print(f"Loss: {loss_val:.4f}")
 
-                    if "g_cut" not in resp:
-                        raise RuntimeError("SGD training requires g_cut from client")
-
-                    # Convert numpy array back to tensor and move to correct device
-                    g_cut_np = resp["g_cut"]
-                    g_cut = torch.from_numpy(g_cut_np).to(device=h_cut_live.device, dtype=h_cut_live.dtype)
-
-                    # Verify shapes match
+                    g_cut = torch.as_tensor(resp["g_cut"])
                     if g_cut.shape != h_cut_live.shape:
                         raise RuntimeError(f"g_cut shape {tuple(g_cut.shape)} != h_cut {tuple(h_cut_live.shape)}")
-
-                    # Verify gradient requirements
-                    if not h_cut_live.requires_grad:
-                        raise RuntimeError("h_cut_live doesn't require grad - server prefixes may not be trainable")
+                    g_cut = g_cut.to(device=h_cut_live.device, dtype=h_cut_live.dtype)
 
                     optimizer.zero_grad(set_to_none=True)
                     h_cut_live.backward(g_cut)
@@ -1832,7 +1493,8 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     if global_step % args.eval_steps == 0:
                         print(f"\nStep {global_step}: Running evaluation...")
                         eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
-                            full_model, eval_loader, device, tokenizer, args
+                            full_model, eval_loader, device, tokenizer, args,
+                            server_model=server_model, trainer=trainer
                         )
 
                         print(f"   Step {global_step} Evaluation:")
@@ -1874,12 +1536,9 @@ def parse_args():
     
     # Model parameters
     parser.add_argument('--model_name', type=str, default='facebook/opt-125m', help='Model name')
-    parser.add_argument('--num_prefix', type=int, default=10, help='Number of prefix tokens')
+    parser.add_argument('--num_prefix', type=int, default=20, help='Number of prefix tokens')
     parser.add_argument('--cut_layer', type=int, default=6, help='Split index: 0..L-1 goes to server; cut..L-1 to client')
     parser.add_argument('--max_length', type=int, default=512, help='Max sequence length')
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=12345)
-
     
     # Training parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -1889,7 +1548,6 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
-    parser.add_argument('--task', choices=["squad", "xsum", "drop", "sst2"], default="squad", help='Use ZOO for client')
 
     # Dataset sizes - NEW ARGUMENTS
     parser.add_argument('--train_examples', type=int, default=1000, help='Number of training examples')  # TRAIN=1000
@@ -1899,7 +1557,6 @@ def parse_args():
     # Training steps - NEW ARGUMENTS
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')  # STEPS=4000
     parser.add_argument('--eval_steps', type=int, default=4000, help='Evaluate every N steps')  # EVAL_STEPS=4000
-    
     
     # ZOO parameters
     parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
@@ -1912,6 +1569,13 @@ def parse_args():
     parser.add_argument('--f1_method', type=str, default='micro', 
                        choices=['micro', 'macro', 'sequence'],
                        help='F1 score calculation method')
+
+    parser.add_argument('--task', choices=["squad", "xsum", "drop", "sst2"], default="squad", help='Use ZOO for client')
+    parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
+    parser.add_argument('--lora_r', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    parser.add_argument('--lora_targets', type=str, default='q_proj,v_proj')
     
     return parser.parse_args()
 
@@ -1942,34 +1606,63 @@ if __name__ == "__main__":
         # Load tokenizer
         print(f"  Loading tokenizer: {args.model_name}")
         tokenizer = safe_get_hf_tokenizer(args.model_name)
-        print("  Tokenizer loaded successfully")
         
+        print("  Tokenizer loaded successfully")
+
         # Create models
         print("  Creating models...")
-        server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
+        if args.tuning == 'lora':
+            server_model = LoRAServerModel(
+                args.model_name, args.cut_layer,
+                r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
+                targets=tuple(args.lora_targets.split(','))
+            ).to(device)
+            trainable_params = list(server_model.trainable_parameters())
+            print(f"Server owns layers [0, {args.cut_layer-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+            _assert_only_expected_trainables(server_model, args.tuning, side="server")
+
+        else:
+            # existing PrefixKV server path (keep yours)
+            server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
+            trainable_params = list(server_model.kv.parameters())  # unchanged
+            _assert_only_expected_trainables(server_model, args.tuning, side="server")
+
+
+        if args.tuning == 'lora':
+            assert all((not p.requires_grad) for n,p in server_model.named_parameters()
+                    if ("lora_A" not in n and "lora_B" not in n)), "Only LoRA params must be trainable in LoRA mode!"
         
-        # full_model = FullLLMModel(args.model_name, args.num_prefix).to(device)
         full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
-        # give it a live pointer to server prefixes (no copy)
-        full_model.attach_live_server_kv(server_model.kv)
+        # Only attach server KV in prefix mode; in LoRA there is no live server KV to use
+        if args.tuning != 'lora':
+            full_model.attach_live_server_kv(server_model.kv)
 
         # Synchronize models
         print("  Models created and synchronized")
-        
         # Create data loaders
         print(" Creating dataloaders...")
-        train_loader, eval_loader = get_squad_dataloaders(args, tokenizer)
+        if getattr(args, "task", "squad") == "squad":
+            train_loader, eval_loader = get_squad_dataloaders(args, tokenizer)
+        else:
+            print(f" Creating dataloaders for task: {args.task}")
+            train_loader, eval_loader = get_task_dataloaders(
+                args.task,
+                tokenizer,
+                train_batch_size=args.train_batch_size,
+                test_batch_size=args.test_batch_size,
+                max_length=args.max_length,
+                num_train_examples=args.train_examples,
+                num_eval_examples=args.eval_examples,
+            )
         print("  Dataloaders created successfully")
         # Setup optimizer
         print("  Setting up optimizer...")
         if args.use_zeroth_order:
-            # ZOO needs higher learning rate and no momentum
-            optimizer = optim.SGD(server_model.kv.parameters(), 
-                                lr=args.zoo_lr, momentum=0.0)
+            # ZOO needs higher learning rate and no momentum (optimizer used for applying estimated grads)
+            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=0.0)
         else:
             # Regular SGD can use lower learning rate with momentum
-            optimizer = optim.SGD(server_model.kv.parameters(), 
-                                lr=args.lr, momentum=args.momentum)
+            optimizer = optim.SGD(trainable_params, lr=args.lr, momentum=args.momentum)
         
         
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
@@ -1979,7 +1672,7 @@ if __name__ == "__main__":
         print("Setting up network...")
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((args.host, args.port))
+        server_socket.bind(('localhost', 12345))
         server_socket.listen(1)
         
         # Debug: Print model dimensions
@@ -1991,72 +1684,17 @@ if __name__ == "__main__":
         print("Server listening on localhost:12345")
         print("Start client with same parameters")
         print("=" * 60)
-
-        # Accept client connection(s) until we get a valid hello/config
-        client_config = None
+        
         # Accept client connection
-        def _is_valid_client_config(msg: dict) -> bool:
-            if not isinstance(msg, dict):
-                return False
-            # include the keys you actually use later during setup
-            required = {"model_name", "num_prefix"}
-            return required.issubset(msg.keys())
-
-        client_config = None
-
-        while True:
-            conn, addr = server_socket.accept()
-            print(f"✅ Client connected from {addr}")
-            trainer = Trainer(conn)
-
-            # Expect the client to speak first (hello or config)
-            msg = trainer.receive_data()
-            if msg is None:
-                print("⚠️ Client disconnected before sending any message; closing and waiting for next client.")
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                conn.close()
-                continue  # back to accept()
-
-            if isinstance(msg, dict) and msg.get("type") == "fatal":
-                print(f"⚠️ Client reported fatal error during init: {msg.get('error')}")
-                conn.close()
-                continue  # wait for next client
-
-            if isinstance(msg, dict) and msg.get("type") == "client_hello":
-                # safe to send now
-                if not trainer.send_data({"type": "server_hello", "version": 1}):
-                    print("⚠️ Failed to send server_hello; closing.")
-                    conn.close()
-                    continue
-                if not trainer.send_data({"type": "request_client_config"}):
-                    print("⚠️ Failed to request client config; closing.")
-                    conn.close()
-                    continue
-                cfg = trainer.receive_data()
-                if _is_valid_client_config(cfg):
-                    client_config = cfg
-                else:
-                    print(f"⚠️ Expected client config, got: {cfg}. Closing.")
-                    conn.close()
-                    continue
-
-            elif _is_valid_client_config(msg):
-                # Legacy client that sends config first
-                client_config = msg
-
-            else:
-                print(f"⚠️ Unexpected message before config: {msg}. Closing.")
-                conn.close()
-                continue
-
-            print(f"Received client config: {client_config}")
-            # ----- proceed into your training setup using client_config -----
-            print("Starting training...")
-            break
-            
+        conn, addr = server_socket.accept()
+        print(f"✅ Client connected from {addr}")
+        
+        trainer = Trainer(conn)
+        client_config = trainer.receive_data()
+        print(f"Received client config: {client_config}")
+        
+        print("Starting training...")
+        
         # Training loop
         for epoch in range(args.epochs):
             print(f"\nEpoch {epoch+1}/{args.epochs}")
@@ -2078,24 +1716,18 @@ if __name__ == "__main__":
             # Evaluation
             if (epoch + 1) % args.evaluate_every == 0:
                 print(f"Running evaluation...")
-                # eval_loss, eval_acc, eval_f1 = evaluate_model(full_model, test_loader, device, tokenizer, args)
-                eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
-
-                
+                eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
+                    full_model, eval_loader, device, tokenizer, args,
+                    server_model=server_model, trainer=trainer
+                )
                 print(f"\nEPOCH {epoch+1} RESULTS:")
                 print(f"{'='*60}")
                 print(f"TRAINING   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
                 print(f"EVALUATION - Loss: {eval_loss:.4f}, Accuracy: {eval_acc:.4f}, F1: {eval_f1:.4f}")
                 print(f"{'='*60}")
-        
-        # Training completed — final evaluation will run before notifying client
-        
+                
         # Final evaluation
         print("\nFinal model evaluation...")
-        # final_loss, final_acc, final_f1 = evaluate_model(full_model, test_loader, device, tokenizer, args)
-        # final_loss, final_acc, final_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
-        # --- server.py (main) ---
-        # Final evaluation — do this first so client is alive to send its KV
         final_loss, final_acc, final_f1, final_em = evaluate_model(
             full_model, eval_loader, device, tokenizer, args, server_model=server_model, trainer=trainer
         )
@@ -2131,214 +1763,3 @@ if __name__ == "__main__":
         except:
             pass
         print("  Server shutdown complete")
-
-# if __name__ == "__main__":
-#     args = parse_args()
-#     torch.manual_seed(args.seed)
-#     np.random.seed(args.seed)
-#     try:
-#         print("STARTING ENHANCED SPLIT LEARNING SERVER")
-#         print("=" * 60)
-
-#         HOST = getattr(args, "host", "127.0.0.1")
-#         PORT = int(getattr(args, "port", 12345))
-
-#         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-#         try:
-#             server_socket.bind((HOST, PORT))
-#         except OSError as e:
-#             print(f"❌ Failed to bind {HOST}:{PORT}: {e}")
-#             sys.exit(1)
-#         server_socket.listen(1)
-#         print(f"Server listening on {HOST}:{PORT}")
-
-#         conn, addr = server_socket.accept()
-#         print(f"✅ Client connected from {addr}")
-#         trainer = Trainer(conn)
-#         trainer.send_data({"type": "server_hello"})
-        
-#         print(f"  Configuration:")
-#         print(f"   Model: {args.model_name}")
-#         print(f"   Batch size: {args.train_batch_size}")
-#         print(f"   Max length: {args.max_length}")
-#         print(f"   ZOO server: {args.use_zeroth_order}")
-#         print(f"   ZOO client: {args.use_zeroth_order_client}")
-#         print(f"   F1 method: {args.f1_method}")
-#         if args.use_zeroth_order:
-#             print(f"   ZOO mu: {args.mu}")
-#             print(f"   ZOO perturbations: {args.num_pert}")
-        
-#         # Device configuration
-#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#         print(f"  Using device: {device}")
-        
-#         # Load tokenizer
-#         print(f"  Loading tokenizer: {args.model_name}")
-#         tokenizer = safe_get_hf_tokenizer(args.model_name)
-#         print("  Tokenizer loaded successfully")
-        
-#         # Create models
-#         print("  Creating models...")
-#         server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
-        
-#         # full_model = FullLLMModel(args.model_name, args.num_prefix).to(device)
-#         full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
-#         # give it a live pointer to server prefixes (no copy)
-#         full_model.attach_live_server_kv(server_model.kv)
-
-#         # Synchronize models
-#         print("  Models created and synchronized")
-        
-#         # Create data loaders
-#         print(" Creating dataloaders...")
-#         # train_loader, eval_loader = get_squad_dataloaders(args, tokenizer)
-#         train_ds, val_ds, collate, task_type = build_task_datasets(args.task, tokenizer, args.max_length)
-
-#         train_loader = DataLoader(train_ds, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate)
-#         eval_loader   = DataLoader(val_ds, batch_size=args.test_batch_size,  shuffle=False, collate_fn=collate)
-#         print("  Dataloaders created successfully")
-#         # Setup optimizer
-#         print("  Setting up optimizer...")
-#         if args.use_zeroth_order:
-#             # ZOO needs higher learning rate and no momentum
-#             optimizer = optim.SGD(server_model.kv.parameters(), 
-#                                 lr=args.zoo_lr, momentum=0.0)
-#         else:
-#             # Regular SGD can use lower learning rate with momentum
-#             optimizer = optim.SGD(server_model.kv.parameters(), 
-#                                 lr=args.lr, momentum=args.momentum)
-        
-        
-#         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-#         print("✅ Optimizer ready")
-        
-#         # Setup network
-#         # print("Setting up network...")
-#         # server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#         # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-#         # server_socket.bind((args.host, args.port))
-#         # server_socket.listen(1)
-
-#         # print(f"Server listening on {args.host}:{args.port}")
-        
-#         # Debug: Print model dimensions
-#         print(f"  Debug - Server model info:")
-        
-#         print("=" * 60)
-#         print("SERVER READY - WAITING FOR CLIENT")
-#         print("=" * 60)
-#         print("Server listening on localhost:12345")
-#         print("Start client with same parameters")
-#         print("=" * 60)
-
-#         client_cfg = None
-#         ready_seen = False
-#         while True:
-#             try:
-#                 msg = trainer.receive_data()
-#             except Exception as e:
-#                 print(f"⚠️ Preflight receive failed: {e}")
-#                 break
-
-#             if not isinstance(msg, dict):
-#                 print(f"⚠️ Ignoring non-dict preflight message: {type(msg)}")
-#                 continue
-
-#             t = msg.get("type")
-#             if t == "client_status":
-#                 print(f"Client status: {msg.get('phase')}")
-#                 if msg.get("phase") == "ready":
-#                     ready_seen = True
-#                 continue
-            
-#             if t == "client_config":
-#                 client_cfg = msg
-#                 print("Received client configuration from client.")
-#                 continue
-
-#             # Not a preflight message; stash nothing—break and let train loop handle it
-#             # (All training receives are robust now, see below)
-#             print(f"Leaving preflight on message: {t}")
-#             break
-
-#         if not ready_seen:
-#             print("⚠️ Did not see client 'ready' status; continuing anyway…")
-
-#         print("Starting training...", flush=True)
-        
-#         # Training loop
-#         for epoch in range(args.epochs):
-#             print(f"\nEpoch {epoch+1}/{args.epochs}")
-            
-#             # Choose training method based on SERVER configuration only
-#             if args.use_zeroth_order:
-#                 train_loss, train_acc = train_split_learning_zoo(
-#                     server_model, full_model, train_loader, eval_loader, optimizer, 
-#                     scheduler, trainer, device, tokenizer, args
-#                 )
-#             else:
-#                 train_loss, train_acc = train_split_learning_sgd(
-#                     server_model, full_model, train_loader, eval_loader, optimizer, 
-#                     scheduler, trainer, device, tokenizer, args
-#                 )
-            
-#             print(f"✅ Epoch {epoch+1} Training: Loss {train_loss:.4f}, Acc {train_acc:.6f}")
-            
-#             # Evaluation
-#             if (epoch + 1) % args.evaluate_every == 0:
-#                 print(f"Running evaluation...")
-#                 # eval_loss, eval_acc, eval_f1 = evaluate_model(full_model, test_loader, device, tokenizer, args)
-#                 eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
-
-                
-#                 print(f"\nEPOCH {epoch+1} RESULTS:")
-#                 print(f"{'='*60}")
-#                 print(f"TRAINING   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
-#                 print(f"EVALUATION - Loss: {eval_loss:.4f}, Accuracy: {eval_acc:.4f}, F1: {eval_f1:.4f}")
-#                 print(f"{'='*60}")
-        
-#         # Training completed — final evaluation will run before notifying client
-        
-#         # Final evaluation
-#         print("\nFinal model evaluation...")
-#         # final_loss, final_acc, final_f1 = evaluate_model(full_model, test_loader, device, tokenizer, args)
-#         # final_loss, final_acc, final_f1, eval_em = evaluate_model(full_model, eval_loader, device, tokenizer, args)
-#         # --- server.py (main) ---
-#         # Final evaluation — do this first so client is alive to send its KV
-#         final_loss, final_acc, final_f1, final_em = evaluate_model(
-#             full_model, eval_loader, device, tokenizer, args, server_model=server_model, trainer=trainer
-#         )
-#         # now signal completion (non-fatal if client already closed)
-#         try:
-#             trainer.send_data({'type': 'training_complete'})
-#         except Exception as _e:
-#             print(f"⚠️ Could not notify client of completion (likely closed): {_e}")
-
-        
-#         print(f"\nFINAL RESULTS:")
-#         print(f"{'='*60}")
-#         print(f"Model: {args.model_name}")
-#         print(f"Epochs: {args.epochs}")
-#         print(f"Optimization: {'ZOO' if args.use_zeroth_order else 'SGD'}")
-#         print(f"Final Loss: {final_loss:.4f}")
-#         print(f"Final Accuracy: {final_acc:.4f}")
-#         print(f"Final F1 Score: {final_f1:.4f}")
-#         print(f"{'='*60}")
-        
-#     except Exception as e:
-#         print(f"❌ CRITICAL SERVER ERROR: {e}")
-#         print("  Full traceback:")
-#         traceback.print_exc()
-#         sys.exit(1)
-        
-#     finally:
-#         try:
-#             if 'conn' in locals():
-#                 conn.close()
-#             if 'server_socket' in locals():
-#                 server_socket.close()
-#         except:
-#             pass
-#         print("  Server shutdown complete")
-
