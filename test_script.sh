@@ -3,8 +3,8 @@
 #SBATCH --account=fl-het
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=squad_prefix_ZOO_SGD/%x_%j.out
+#SBATCH --error=squad_prefix_ZOO_SGD/%x_%j.err
 #SBATCH --time=0-02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -28,6 +28,28 @@ conda activate mezo
 echo "All required files present"
 
 
+# Network settings: choose a unique free port per job
+HOST="127.0.0.1"
+JOB_ID=${SLURM_JOB_ID:-$$}
+# Derive a base port from job id to reduce collisions, then probe forward for a free one
+BASE_PORT=$((20000 + (JOB_ID % 20000)))
+PORT=$BASE_PORT
+
+is_port_free() {
+    # returns 0 if free
+    ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1$"
+}
+
+for i in $(seq 0 99); do
+    CAND=$((BASE_PORT + i))
+    if is_port_free "$CAND"; then
+        PORT=$CAND
+        break
+    fi
+done
+
+echo "Using host $HOST and port $PORT"
+
 # MODEL_NAME="facebook/opt-125m"
 # EPOCHS=1
 # BATCH_SIZE=16  # Small for testing
@@ -36,11 +58,11 @@ echo "All required files present"
 # ZOO_LR=1e-2
 # EPS=1e-1        # ZOO epsilon (perturbation scale)
 # SEED=0          # Random seed
-# TRAIN=1000      # Training examples
-# DEV=500         # Dev examples
-# EVAL=1000       # Evaluation examples
-# STEPS=1000      # Training steps
-# EVAL_STEPS=1000 # Evaluation steps
+TRAIN=1000      # Training examples
+DEV=500         # Dev examples
+EVAL=1000       # Evaluation examples
+STEPS=1000      # Training steps
+EVAL_STEPS=1000 # Evaluation steps
 # NUM_PERT=5
 
 MODEL_NAME="facebook/opt-125m"
@@ -54,16 +76,16 @@ SEED=42
 TRAIN=1000
 DEV=500
 EVAL=1000
-STEPS=1000
-EVAL_STEPS=1000
+STEPS=4000
+EVAL_STEPS=4000
 NUM_PERT=10         # More perturbations
-NUM_PREFIX=20
+NUM_PREFIX=5
 # LR2=1e-1
-TASK="xsum"
+TASK="squad"
 TUNING="lora"
 LR=5e-3          # For AdamW (prefix tuning)
-ZOO_LR=5e-4      # For ZOO
-EPS=5e-4         # Even smaller perturbation
+ZOO_LR=3e-4      # For ZOO
+EPS=1e-4         # Even smaller perturbation
 LORA_R=8
 # MODEL_NAME="facebook/opt-125m"
 # EPOCHS=1
@@ -95,12 +117,15 @@ python3 server.py \
     --model_name $MODEL_NAME \
     --epochs $EPOCHS \
     --mu $EPS \
+    --host $HOST \
+    --port $PORT \
     --train_batch_size $BATCH_SIZE \
     --test_batch_size $BATCH_SIZE \
     --max_length $MAX_LENGTH \
     --lr $LR \
     --zoo_lr $ZOO_LR \
     --seed $SEED \
+    --use_zeroth_order \
     --train_examples $TRAIN \
     --dev_examples $DEV \
     --eval_examples $EVAL \
@@ -134,6 +159,8 @@ echo "Starting client..."
 python3 client.py \
     --model_name $MODEL_NAME \
     --epochs $EPOCHS \
+    --host $HOST \
+    --port $PORT \
     --max_length $MAX_LENGTH \
     --lr $LR \
     --zoo_lr $ZOO_LR \

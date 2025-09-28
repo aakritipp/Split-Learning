@@ -113,6 +113,44 @@ def _get_current_lr(optimizer: optim.Optimizer) -> float:
     except Exception:
         return 0.0
 
+def _use_fp16_for_hcut(args, mode: str) -> bool:
+    """Decide wire precision for h_cut payloads.
+
+    mode in {"train_zoo", "train_sgd", "eval"}.
+    - fp16 reduces bandwidth.
+    - fp32 preserves numeric fidelity (important for ZOO finite-difference probes).
+    """
+    pref = str(getattr(args, "hcut_dtype", "auto")).lower()
+    if pref == "fp16":
+        return True
+    if pref == "fp32":
+        return False
+    # auto
+    if mode == "train_zoo":
+        return False
+    # Prefer fp16 for SGD/eval to reduce bandwidth; client casts back to model dtype
+    return True
+
+def _choose_send_fp16(args, mode: str) -> bool:
+    """Decide wire precision for h_cut payloads.
+    policy 'auto': fp32 for ZOO training to avoid FD quantization; fp16 otherwise.
+    policy 'on'/'off': force fp16/fp32 respectively.
+    """
+    try:
+        policy = getattr(args, 'wire_fp16', 'auto')
+    except Exception:
+        policy = 'auto'
+    if policy == 'on':
+        return True
+    if policy == 'off':
+        return False
+    # auto
+    if mode in ('zoo_train', 'zoo_eval'):
+        return False
+    if getattr(args, 'use_zeroth_order', False):
+        return False
+    return True
+
 def _refresh_eval_prefixes(full_model, server_model, trainer, args):
     """
     Pull the latest client prefix snapshot for eval,
@@ -703,10 +741,17 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
 
                 # If split eval context exists, ask client to compute loss on its half once
                 if split_eval:
+                    # Choose wire precision dynamically for eval
+                    if args.wire_fp16 == 'on':
+                        _use_fp16 = True
+                    elif args.wire_fp16 == 'off':
+                        _use_fp16 = False
+                    else:  # auto
+                        _use_fp16 = not bool(getattr(args, 'use_zeroth_order', False))
                     h_cut_live, pkg = _server_forward_to_cut_payload(
                         server_model,
                         input_ids, attention_mask, labels,
-                        send_fp16=True
+                        send_fp16=_use_fp16
                     )
 
                     trainer.send_data({
@@ -781,8 +826,25 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
     print(f"   Number of perturbations: {args.num_pert}")
     print(f"   Eval every: {args.eval_steps} steps")
 
-    # --- FIX 1: define params to perturb (server KV prefixes only) ---
-    server_params = list(server_model.kv.parameters())
+    # --- FIX 1: define params to perturb depending on tuning mode ---
+    # In prefix mode, perturb server KV prefixes; in LoRA mode, perturb LoRA adapters.
+    try:
+        if getattr(args, 'tuning', 'prefix') == 'lora':
+            # LoRA server wraps base model; only LoRA params are trainable
+            try:
+                from lora import iter_lora_parameters
+                server_params = list(iter_lora_parameters(getattr(server_model, 'base_model', server_model), layer_range=(0, getattr(args, 'cut_layer', 0)-1)))
+                if not server_params:
+                    # Fallback: collect any requires_grad params (LoRA A/B)
+                    server_params = [p for p in getattr(server_model, 'base_model', server_model).parameters() if p.requires_grad]
+            except Exception:
+                server_params = [p for p in getattr(server_model, 'base_model', server_model).parameters() if p.requires_grad]
+        else:
+            # Prefix mode
+            server_params = list(server_model.kv.parameters())
+    except Exception:
+        # Ultimate fallback: any trainable parameter
+        server_params = [p for p in server_model.parameters() if p.requires_grad]
 
     # Create gradient estimator for server KV
     grad_estimator = StochasticGradientApproximator(
@@ -833,14 +895,26 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         was_training = server_model.training
                         server_model.eval()
                         with torch.no_grad():
+                            # ZOO probe wire precision
+                            if args.wire_fp16 == 'on':
+                                _use_fp16 = True
+                            elif args.wire_fp16 == 'off':
+                                _use_fp16 = False
+                            else:  # auto -> use fp32 for ZOO
+                                _use_fp16 = False
                             h_cut_live, pkg = _server_forward_to_cut_payload(
                                 server_model,
                                 input_ids, attention_mask, labels,
-                                send_fp16=True
+                                send_fp16=_use_fp16
                             )
                         pkg["tgt_len"] = int(h_cut_live.shape[1])
-                        trainer.send_data({"type": "forward_cut", "mode": "train",
-                        "data": pkg, "meta": {"zoo_eval": True}})
+                        # Request client to compute loss only (no local update, no g_cut)
+                        trainer.send_data({
+                            "type": "forward_cut",
+                            "mode": "train",
+                            "data": pkg,
+                            "meta": {"zoo_eval": True, "need_g_cut": False}
+                        })
                         # Server is ZOO; the client should skip g_cut and return loss only
                         resp = trainer.receive_data()  # {'type': 'loss_report', 'loss': float}
                         loss_val = float(resp.get("loss", 0.0))
@@ -882,6 +956,20 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     except Exception:
                         pass
                     optimizer.step()
+
+                    # Optional: trigger a small client-side SGD update per step for stability when client uses SGD
+                    try:
+                        if not bool(getattr(args, 'use_zeroth_order_client', False)):
+                            # Reuse the last pkg; ask client to perform local SGD step and return only loss
+                            trainer.send_data({
+                                "type": "forward_cut",
+                                "mode": "train",
+                                "data": pkg,
+                                "meta": {"zoo_eval": False, "need_g_cut": False}
+                            })
+                            _ = trainer.receive_data()  # {'loss': float}
+                    except Exception:
+                        pass
 
                     # --- monitor (safe) ---
                     try:
@@ -1018,10 +1106,17 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
+                    # Choose wire precision dynamically
+                    if args.wire_fp16 == 'on':
+                        _use_fp16 = True
+                    elif args.wire_fp16 == 'off':
+                        _use_fp16 = False
+                    else:  # auto
+                        _use_fp16 = not bool(getattr(args, 'use_zeroth_order', False))
                     h_cut_live, pkg = _server_forward_to_cut_payload(
                         server_model,                 # ServerKVOnly instance
                         input_ids, attention_mask, labels,
-                        send_fp16=False
+                        send_fp16=_use_fp16
                     )
                     pkg["tgt_len"] = int(h_cut_live.shape[1])
 
@@ -1201,6 +1296,14 @@ def parse_args():
     parser.add_argument('--lora_dropout', type=float, default=0.0)
     parser.add_argument('--lora_targets', type=str, default='q_proj,v_proj')
     
+    # Network configuration
+    parser.add_argument('--host', type=str, default='localhost', help='Server host to bind')
+    parser.add_argument('--port', type=int, default=12345, help='Server port to bind')
+    
+    # Wire precision for h_cut payload (fp16 reduces bandwidth, fp32 improves ZOO stability)
+    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='auto',
+                        help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
+    
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -1319,7 +1422,7 @@ if __name__ == "__main__":
         print("Setting up network...")
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('localhost', 12345))
+        server_socket.bind((args.host, args.port))
         server_socket.listen(1)
         
         # Debug: Print model dimensions
@@ -1328,7 +1431,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print("SERVER READY - WAITING FOR CLIENT")
         print("=" * 60)
-        print("Server listening on localhost:12345")
+        print(f"Server listening on {args.host}:{args.port}")
         print("Start client with same parameters")
         print("=" * 60)
         

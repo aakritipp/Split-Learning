@@ -412,7 +412,8 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
       pkt: payload from server with keys ['h_cut','attention_mask','labels','cut']
       meta: meta dict, expects meta.get('need_g_cut', bool)
     """
-    need_g_cut = not bool(meta.get("zoo_eval", False)) 
+    # Prefer explicit flag; default to legacy behavior (no zoo_eval => need g_cut)
+    need_g_cut = bool(meta.get("need_g_cut", not bool(meta.get("zoo_eval", False)))) 
     client_sgd = (not args.use_zeroth_order_client)  # True => SGD, False => ZOO
 
     model_ref = getattr(kv_model, "base_model", kv_model)
@@ -644,7 +645,9 @@ def parse_args():
     parser.add_argument('--lora_alpha', type=int, default=16)
     parser.add_argument('--lora_dropout', type=float, default=0.0)
     parser.add_argument('--lora_targets', type=str, default='q_proj,v_proj')
-
+    parser.add_argument('--host', type=str, default='127.0.0.1', help='Server host to connect')
+    parser.add_argument('--port', type=int, default=12345, help='Server port to connect')
+    
     # argparse setup
     parser.add_argument("--gcut-dtype", choices=["fp16", "fp32"], default="fp32", help="Wire precision for g_cut payloads.")
 
@@ -751,9 +754,9 @@ if __name__ == "__main__":
         print("=" * 60)
         print("CLIENT STARTING - ATTEMPTING TO CONNECT TO SERVER")
         print("=" * 60)
-        print("Trying to connect to server at localhost:12345...")
+        print(f"Trying to connect to server at {args.host}:{args.port}...")
         
-        client = Client('localhost', 12345)
+        client = Client(args.host, args.port)
         
         print("=" * 60)
         print("CLIENT SUCCESSFULLY CONNECTED TO SERVER!")
@@ -867,7 +870,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print("⌠CONNECTION FAILED!")
         print("=" * 60)
-        print("Could not connect to server at localhost:12345")
+        print(f"Could not connect to server at {args.host}:{args.port}")
         print("Make sure the server is running first:")
         print(f"   python server.py --model_name {args.model_name}")
         print("=" * 60)
