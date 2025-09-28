@@ -18,14 +18,32 @@ import sys
 import traceback
 from SGDGradientEst import StochasticGradientApproximator
 import torch.nn.functional as F
-from prefix_kv import PrefixKV, load_grad_state_into
-from lora import apply_lora_to_opt, iter_lora_parameters, get_lora_state_dict, load_lora_state_dict
-from dataset import get_enhanced_dataloaders as get_task_dataloaders
-
-
+from lora import (
+    apply_lora_to_opt, 
+    iter_lora_parameters, 
+    get_lora_state_dict, 
+    load_lora_state_dict
+)
+from dataset import (
+    get_enhanced_dataloaders as get_task_dataloaders,
+    get_squad_dataloaders
+)
+from metrics import (
+    calculate_squad_metrics,
+    calculate_generation_f1_em, 
+    test_generation_simple,
+    normalize_answer,
+    squad_f1_score,
+    squad_exact_match,
+    calculate_metrics
+)
 # Ensure merge_past_key_values is available for prefix-aware eval
 try:
-    from prefix_kv import merge_past_key_values
+    from prefix_kv import (
+        merge_past_key_values,
+        PrefixKV, 
+        load_grad_state_into
+    )
 except Exception:
     merge_past_key_values = None
 
@@ -38,86 +56,15 @@ def right_trim(input_ids, attention_mask, labels=None):
         labels = labels[:, :int(L)]
     return input_ids, attention_mask, labels
 
-@torch.no_grad()
-def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, k=4):
-    """Print generation examples during evaluation"""
-    print("\n=== GENERATION SAMPLES ===")
-    
-    if "prompt_only" not in batch:
-        print("No prompt_only field available for generation testing")
-        return
-    
-    model.eval()
-    prompts = batch["prompt_only"][:k]
-    refs = batch["refs"][:k]
-    
-    # Tokenize prompts
-    enc = tokenizer(
-        prompts, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=350
-    ).to(device)
-
-    input_ids, attention_mask = right_trim(enc["input_ids"], enc["attention_mask"])
-    enc = {"input_ids": input_ids, "attention_mask": attention_mask}
-    
-    
-    # Generate
-    try:
-        outputs = model.generate(
-            enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-            do_sample=False,
-            num_beams=1,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
-        )
-    except Exception as e:
-        print(f"Generation failed: {e}")
-        return
-    
-    # Process outputs
-    for i in range(min(k, outputs.size(0))):
-        try:
-            # Decode full generated sequence
-            full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
-            
-            # Remove prompt to get just the answer
-            prompt_text = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=True)
-            if len(full_text) > len(prompt_text):
-                pred_answer = full_text[len(prompt_text):].strip()
-            else:
-                pred_answer = ""
-            
-            # Clean up prediction
-            pred_answer = pred_answer.split('\n')[0].strip('.,!?"\'')
-            
-            # Get ground truth
-            gold_answers = refs[i] if i < len(refs) else [""]
-            gold_answer = gold_answers[0] if gold_answers else ""
-            
-            # Extract question for display
-            question_part = prompts[i].split('Question:', 1)[-1].split('Answer:', 1)[0].strip()
-            
-            # Calculate metrics
-            from metrics import squad_f1_score, squad_exact_match
-            f1 = squad_f1_score(pred_answer, gold_answers)
-            em = squad_exact_match(pred_answer, gold_answers)
-            
-            print(f"\nExample {i+1}:")
-            print(f"Q: {question_part}")
-            print(f"Pred: '{pred_answer}'")
-            print(f"Gold: '{gold_answer}'")
-            print(f"EM={em:.3f} F1={f1:.3f}")
-            
-        except Exception as e:
-            print(f"Error processing example {i}: {e}")
-    
-    print("=== END SAMPLES ===\n")
-
+def _right_trim(input_ids, attention_mask, labels):
+    with torch.no_grad():
+        seq_lens = attention_mask.sum(dim=1)
+        max_len = int(seq_lens.max().item())
+    return (
+        input_ids[:, :max_len],
+        attention_mask[:, :max_len],
+        labels[:, :max_len] if labels is not None else None,
+    )
 def adapt_batch(batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -158,6 +105,13 @@ def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=N
 def _neg_inf(dtype: torch.dtype) -> float:
     # Use the representable minimum as the additive mask value
     return torch.finfo(dtype).min
+
+def _get_current_lr(optimizer: optim.Optimizer) -> float:
+    """Return the learning rate of the first param group for logging."""
+    try:
+        return float(optimizer.param_groups[0].get("lr", 0.0))
+    except Exception:
+        return 0.0
 
 def _refresh_eval_prefixes(full_model, server_model, trainer, args):
     """
@@ -225,19 +179,6 @@ def _build_self_attn_mask(attention_mask: torch.Tensor,
         src_pad = pad
     attn = attn + src_pad.view(bsz, 1, 1, prefix_len + tgt_len) * _neg_inf(dtype)
     return attn
-
-import torch
-import torch.nn.functional as F
-
-def _right_trim(input_ids, attention_mask, labels):
-    with torch.no_grad():
-        seq_lens = attention_mask.sum(dim=1)
-        max_len = int(seq_lens.max().item())
-    return (
-        input_ids[:, :max_len],
-        attention_mask[:, :max_len],
-        labels[:, :max_len] if labels is not None else None,
-    )
 
 def _server_forward_to_cut_payload(
     server_wrap,                    # ServerKVOnly instance
@@ -470,8 +411,6 @@ class ServerKVOnly(nn.Module):
         Load an OPT-style LM and keep only embeddings + first `cut_layer` decoder blocks.
         Enough to produce h_cut on the server.
         """
-        from transformers import AutoModelForCausalLM
-        import torch.nn as nn
 
         base = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -490,57 +429,6 @@ class ServerKVOnly(nn.Module):
         # minimal state dict to send to client
         return {"k": self.kv.k.detach().cpu(), "v": self.kv.v.detach().cpu()}
 
-from metrics import (
-    calculate_squad_metrics,
-    calculate_generation_f1_em, 
-    test_generation_simple,
-    normalize_answer,
-    squad_f1_score,
-    squad_exact_match
-)
-
-
-def squad_collate_fn(batch):
-    """Custom collate function for SQUAD dataset with mixed data types"""
-    try:
-        # Separate tensor and non-tensor data
-        input_ids = []
-        attention_masks = []
-        labels = []
-        formatted_texts = []
-        original_examples = []
-        
-        for item in batch:
-            input_ids.append(item['input_ids'])
-            attention_masks.append(item['attention_mask'])
-            labels.append(item['labels'])
-            # Optional fields (some codepaths expect server_kv_state even in LoRA mode)
-            formatted_texts.append(item.get('formatted_text', ""))
-            original_examples.append(item.get('original_example', {}))
-            if 'server_kv_state' in item:
-                pass
-        
-        # Stack tensors
-        batch_dict = {
-            'input_ids': torch.stack(input_ids),
-            'attention_mask': torch.stack(attention_masks),
-            'labels': torch.stack(labels),
-        }
-        
-        # Always include non-tensor metadata lists for downstream logging/metrics
-        batch_dict['formatted_text'] = formatted_texts
-        batch_dict['original_example'] = original_examples
-        
-        return batch_dict
-        
-    except Exception as e:
-        print(f"Collate function error: {e}")
-        print(f"Batch info: {len(batch)} items")
-        for i, item in enumerate(batch):
-            print(f"  Item {i}: keys={list(item.keys())}, shapes={[item[k].shape if torch.is_tensor(item[k]) else type(item[k]) for k in item.keys()]}")
-        raise
-
-
 def safe_get_hf_tokenizer(model_name):
     """Safe tokenizer loading with error handling"""
     try:
@@ -551,231 +439,6 @@ def safe_get_hf_tokenizer(model_name):
     except Exception as e:
         print(f"Failed to load tokenizer for {model_name}: {e}")
         raise
-
-def get_squad_dataloaders(args, tokenizer):
-    """Create SQUAD dataloaders with custom collate function"""
-    print(f"Creating SQUAD dataset with MeZO hyperparameters...")
-    print(f"Train examples: {args.train_examples}")
-    print(f"Dev examples: {args.dev_examples}")
-    print(f"Eval examples: {args.eval_examples}")
-    print(f"Batch size: {args.train_batch_size}")
-    
-    try:
-        from datasets import load_dataset
-        
-        # Load SQUAD dataset
-        dataset = load_dataset('squad')
-        
-        # Use the specified sizes
-        train_size = min(args.train_examples, len(dataset['train']))
-        dev_size = min(args.dev_examples, len(dataset['validation']))
-        eval_size = min(args.eval_examples, len(dataset['validation']))
-        
-        # Create datasets with specified sizes
-        train_dataset = dataset['train'].shuffle(seed=args.seed).select(range(train_size))
-        val_dataset = dataset['validation'].shuffle(seed=args.seed)
-        dev_dataset = val_dataset.select(range(dev_size))
-        eval_dataset = val_dataset.select(range(dev_size, min(dev_size + eval_size, len(val_dataset))))
-        
-        print(f"Dataset sizes: Train={len(train_dataset)}, Dev={len(dev_dataset)}, Eval={len(eval_dataset)}")
-        
-        # Format datasets
-        def format_squad_example(example):
-            context = example['context']
-            question = example['question']
-            answer = example['answers']['text'][0] if len(example['answers']['text']) > 0 else ""
-            return f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
-        
-        # Create formatted texts
-        train_texts = [format_squad_example(ex) for ex in train_dataset]
-        eval_examples = list(eval_dataset)  # Keep original for evaluation
-        eval_texts = [format_squad_example(ex) for ex in eval_examples]
-        
-        # Create datasets
-        train_squad_dataset = SQuADDataset(train_texts, tokenizer, args.max_length)
-        eval_squad_dataset = SQuADDataset(eval_texts, tokenizer, args.max_length, eval_examples)
-        
-            # Create dataloaders with custom collate function
-        train_loader = DataLoader(
-            train_squad_dataset, 
-            batch_size=args.train_batch_size, 
-            shuffle=True,
-            collate_fn=squad_collate_fn  # Use custom collate function
-        )
-        eval_loader = DataLoader(
-            eval_squad_dataset, 
-            batch_size=args.test_batch_size, 
-            shuffle=False,
-            collate_fn=squad_collate_fn  # Use custom collate function
-        )
-        
-        print(f"SQUAD dataloaders created successfully with custom collate function")
-        print(f"   Train batches: {len(train_loader)}")
-        print(f"   Eval batches: {len(eval_loader)}")
-        
-        # Test the dataloader
-        print("  Testing dataloader...")
-        try:
-            test_batch = next(iter(train_loader))
-            print(f"Dataloader test passed")
-            print(f"   Batch keys: {list(test_batch.keys())}")
-            print(f"   Batch shapes: {[f'{k}: {v.shape if torch.is_tensor(v) else len(v)}' for k, v in test_batch.items()]}")
-        except Exception as test_error:
-            print(f"❌ Dataloader test failed: {test_error}")
-            raise
-        
-        return train_loader, eval_loader
-        
-    except Exception as e:
-        print(f"❌ SQUAD dataset creation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-
-class SQuADDataset(Dataset):
-    """SQUAD dataset with consistent output structure"""
-    def __init__(self, texts, tokenizer, max_length=512, original_examples=None):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.original_examples = original_examples or []
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        
-        try:
-            # Ensure the suffix containing "Answer:" + answer is retained
-            old_side = getattr(self.tokenizer, 'truncation_side', 'right')
-            try:
-                self.tokenizer.truncation_side = 'left'
-            except Exception:
-                pass
-            encoding = self.tokenizer(
-                text,
-                truncation=True,
-                padding='max_length',
-                max_length=self.max_length,
-                return_tensors='pt'
-            )
-            try:
-                self.tokenizer.truncation_side = old_side
-            except Exception:
-                pass
-            
-            input_ids = encoding['input_ids'].squeeze()
-            attention_mask = encoding['attention_mask'].squeeze()
-            
-            # Ensure consistent tensor shapes
-            if input_ids.dim() == 0:
-                input_ids = input_ids.unsqueeze(0)
-            if attention_mask.dim() == 0:
-                attention_mask = attention_mask.unsqueeze(0)
-            
-            # Build labels that supervise ONLY the answer tokens (ignore prefix + padding)
-            labels = input_ids.clone()
-            valid_len = int(attention_mask.sum().item())
-            ids_list = input_ids.tolist()
-
-            # Helper to find token subsequence
-            def _find_subseq(hay, needle):
-                n = len(needle)
-                if n == 0 or n > len(hay):
-                    return -1
-                for i in range(0, len(hay) - n + 1):
-                    if hay[i:i+n] == needle:
-                        return i
-                return -1
-
-            # Try several encodings of the marker to be robust to whitespace/newlines
-            candidates = []
-            for marker in ["\nAnswer:", " Answer:", "Answer:"]:
-                try:
-                    tok = self.tokenizer.encode(marker, add_special_tokens=False)
-                    if tok:
-                        candidates.append(tok)
-                except Exception:
-                    pass
-
-            pos = -1
-            match_len = 0
-            for cand in candidates:
-                p = _find_subseq(ids_list, cand)
-                if p != -1 and (pos == -1 or p < pos):
-                    pos = p
-                    match_len = len(cand)
-
-            if pos != -1:
-                start_idx = pos + match_len
-            else:
-                # Fallback via character split
-                astart = text.find("Answer:")
-                if astart == -1:
-                    start_idx = 0
-                else:
-                    prefix = text[:astart + len("Answer:")]
-                    old_side2 = getattr(self.tokenizer, 'truncation_side', 'right')
-                    try:
-                        self.tokenizer.truncation_side = 'left'
-                    except Exception:
-                        pass
-                    prefix_tokens = self.tokenizer.encode(prefix, add_special_tokens=False)
-                    try:
-                        self.tokenizer.truncation_side = old_side2
-                    except Exception:
-                        pass
-                    start_idx = len(prefix_tokens)
-
-            # Clamp to valid sequence length
-            start_idx = max(0, min(start_idx, valid_len))
-            # Ignore everything before the answer prefix
-            if start_idx > 0:
-                labels[:start_idx] = -100
-            # Ignore padding
-            labels[attention_mask == 0] = -100
-            pad_id = getattr(self.tokenizer, 'pad_token_id', None)
-            if pad_id is not None:
-                labels[input_ids == pad_id] = -100
-            labels = labels.long()
-            
-            result = {
-                'input_ids': input_ids,
-                'cut_layer': args.cut_layer,
-                'attention_mask': attention_mask,
-                'labels': labels
-            }
-            # Only include server_kv_state in prefix mode
-            try:
-                if args.tuning != 'lora':
-                    result['server_kv_state'] = server_model.state_dict_kv()
-            except Exception:
-                pass
-            
-            # Add optional fields consistently
-            result['formatted_text'] = text  # Always include text
-            
-            # Add original example if available
-            if idx < len(self.original_examples):
-                result['original_example'] = self.original_examples[idx]
-            else:
-                result['original_example'] = {}  # Empty dict as placeholder
-            
-            return result
-            
-        except Exception as e:
-            print(f"❌ Error processing item {idx}: {e}")
-            # Return a dummy item with consistent structure
-            dummy_ids = torch.zeros(self.max_length, dtype=torch.long)
-            return {
-                'input_ids': dummy_ids,
-                'attention_mask': torch.ones_like(dummy_ids),
-                'labels': dummy_ids.clone(),
-                'formatted_text': "",
-                'original_example': {}
-            }
 
 
 class FullLLMModel(nn.Module):
@@ -944,148 +607,11 @@ class Trainer:
         except Exception as e:
             print(f"❌ Failed to receive data: {e}")
             raise
-
-
-def _classification_metrics(outputs, labels, batch, tokenizer):
-    """Compute simple classification accuracy when 'class_label' is present."""
-    try:
-        # Predict the next token after the marker as a word and map to class
-        logits = outputs.logits
-        # position for first answer token: find via formatted_text
-        preds = []
-        trues = []
-        for i, text in enumerate(batch.get('formatted_text', [])):
-            if 'Answer:' not in text:
-                continue
-            ctx = text[: text.find('Answer:') + len('Answer:')]
-            ctx_tokens = tokenizer.encode(ctx, add_special_tokens=False)
-            pos = max(len(ctx_tokens) - 1, 0)
-            if pos >= logits.shape[1]-1:
-                continue
-            token_id = int(torch.argmax(logits[i, pos, :]).item())
-            token_str = tokenizer.decode([token_id]).strip().lower()
-            mapped = 1 if token_str in {"great", "positive", "good"} else 0
-            preds.append(mapped)
-            if 'class_label' in batch:
-                trues.append(int(batch['class_label'][i].item()))
-        if preds and trues and len(preds) == len(trues):
-            correct = sum(int(p==t) for p,t in zip(preds, trues))
-            return float(correct/len(trues))
-    except Exception:
-        return 0.0
-    return 0.0
-
-
-def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
-    """Task-aware metrics: classification (SST-2) vs generation (QA/summary)."""
-    try:
-        # 1. Calculate standard next-token loss
-        loss = outputs.loss.item() if outputs.loss is not None else 0.0
-        
-        # 2. Calculate token-level accuracy (for monitoring)
-        logits = outputs.logits
-        if logits.shape[1] != labels.shape[1]:
-            min_len = min(logits.shape[1], labels.shape[1])
-            logits = logits[:, :min_len, :]
-            labels = labels[:, :min_len]
-        
-        # For next token prediction
-        if logits.shape[1] > 1:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-        else:
-            shift_logits = logits
-            shift_labels = labels
-        
-        predictions = torch.argmax(shift_logits, dim=-1)
-        # Classification branch: if batch has class labels, compute classification acc
-        if 'class_label' in batch:
-            answer_accuracy = _classification_metrics(outputs, labels, batch, tokenizer)
-        else:
-            # Calculate answer token accuracy for generation tasks
-            answer_accuracy = calculate_answer_token_accuracy(
-                predictions, shift_labels, batch, tokenizer
-            )
-        
-        # 3. Calculate F1/EM by generating answers (with error handling)
-        f1_score = 0.0
-        em_score = 0.0
-        
-        # Only try generation if we have the required data
-        if ('original_example' in batch and 'formatted_text' in batch and 
-            len(batch.get('original_example', [])) > 0 and 
-            len(batch.get('formatted_text', [])) > 0):
             
-            try:
-                f1_score, em_score = calculate_generation_f1_em(
-                    model, batch, tokenizer, device
-                )
-            except Exception as gen_error:
-                print(f"⚠️ Generation metrics failed: {gen_error}")
-                f1_score, em_score = 0.0, 0.0
-        
-        return loss, answer_accuracy, f1_score, em_score
-        
-    except Exception as e:
-        print(f"❌ SQUAD metrics calculation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0.0, 0.0, 0.0, 0.0
-
-
-def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
-    """Calculate accuracy only on answer portion tokens"""
-    try:
-        if 'formatted_text' not in batch:
-            # Fallback to general accuracy
-            mask = (labels != -100)
-            if mask.sum() == 0:
-                return 0.0
-            correct = (predictions == labels) & mask
-            return correct.sum().float() / mask.sum().float()
-        
-        # Find answer tokens in each example
-        accuracies = []
-        for i in range(len(batch['formatted_text'])):
-            text = batch['formatted_text'][i]
-            
-            # Find "Answer:" position
-            answer_start = text.find("Answer:")
-            if answer_start == -1:
-                continue
-                
-            # Tokenize to find answer token positions
-            context_question = text[:answer_start + len("Answer:")]
-            answer_part = text[answer_start + len("Answer:"):]
-            
-            context_tokens = tokenizer.encode(context_question, add_special_tokens=False)
-            answer_tokens = tokenizer.encode(answer_part, add_special_tokens=False)
-            
-            if len(answer_tokens) == 0:
-                continue
-            
-            # Get accuracy for answer tokens only
-            start_idx = len(context_tokens)
-            end_idx = start_idx + len(answer_tokens)
-            
-            if end_idx <= predictions.shape[1] and end_idx <= labels.shape[1]:
-                answer_preds = predictions[i, start_idx:end_idx]
-                answer_labels = labels[i, start_idx:end_idx]
-                
-                if len(answer_preds) > 0:
-                    correct = (answer_preds == answer_labels).sum().item()
-                    total = len(answer_preds)
-                    accuracies.append(correct / total)
-        
-        return sum(accuracies) / len(accuracies) if accuracies else 0.0
-        
-    except Exception as e:
-        print(f"❌ Answer token accuracy failed: {e}")
-        return 0.0
-
 def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
     """Task-aware evaluation; generation metrics for QA/summary, class acc for SST-2."""
-    print("  Starting SQUAD evaluation...")
+    task_name = str(getattr(args, 'task', 'squad')).upper()
+    print(f"  Starting {task_name} evaluation...")
     
     # Only test generation if not a pure classification task
     if getattr(args, 'task', 'squad') != 'sst2':
@@ -1114,7 +640,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                 else:
                     split_eval = True
 
-        for batch_idx, batch in enumerate(tqdm(test_loader, desc="SQUAD Evaluation")):
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"{task_name} Evaluation")):
             try:
                 input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
                 input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
@@ -1209,6 +735,8 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                     gen_max = 8
                 elif task == 'xsum':
                     gen_max = 20
+                elif task in ('boolq','copa','multirc','cb','wic','wsc','rte'):
+                    gen_max = 4
                 loss, answer_acc, f1, em = calculate_squad_metrics(
                     outputs, labels, batch, tokenizer, model, device,
                     generation_max_new_tokens=gen_max
@@ -1233,7 +761,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
     avg_f1 = total_f1 / num_batches if num_batches > 0 else 0.0
     avg_em = total_em / num_batches if num_batches > 0 else 0.0
     
-    print(f"\n  SQUAD Evaluation Complete:")
+    print(f"\n  {task_name} Evaluation Complete:")
     print(f"   Average Loss: {avg_loss:.4f}")
     print(f"   Answer Token Accuracy: {avg_answer_accuracy:.6f}")
     print(f"   F1 Score: {avg_f1:.6f}")
@@ -1325,7 +853,7 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
 
                     
                     # Estimate gradients for server KV via ZOO
-                    pbar.set_postfix_str("Computing ZOO gradients...")
+                    pbar.set_description("Training (ZOO) | Computing ZOO gradients...")
                     try:
                         # Newer API (keyword)
                         grad_estimator.model_params = server_params
@@ -1341,6 +869,18 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         )
 
                     # Apply the ZOO estimated gradients to server KV
+                    # Optional gradient clipping for stability
+                    try:
+                        if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                            params_to_clip = []
+                            for group in optimizer.param_groups:
+                                for p in group.get('params', []):
+                                    if p.grad is not None:
+                                        params_to_clip.append(p)
+                            if params_to_clip:
+                                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                    except Exception:
+                        pass
                     optimizer.step()
 
                     # --- monitor (safe) ---
@@ -1360,8 +900,17 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     global_step += 1
                     cur_loss = sum(losses[-10:]) / min(len(losses), 10)
                     cur_acc  = sum(accs[-10:]) / min(len(accs), 10)
-                    pbar.set_postfix_str(f"{cur_loss:.4f}, Acc: {cur_acc:.6f}")
+                    pbar.set_description(f"Training (ZOO) | Loss: {cur_loss:.4f} | Acc: {cur_acc:.6f}")
                     pbar.update(1)
+
+                    # Periodically step LR scheduler on a smoothed training loss (fallback when eval is infrequent)
+                    if global_step > 0 and (global_step % 200 == 0):
+                        try:
+                            smooth_loss = sum(losses[-50:]) / min(len(losses), 50)
+                            scheduler.step(float(smooth_loss))
+                            print(f"[LR] Plateau step on train MA (ZOO) @ step {global_step}: metric={smooth_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
 
                     # periodic eval (uses the safe FullLLMModel)
                     if global_step % args.eval_steps == 0:
@@ -1378,7 +927,20 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         print(f"   Answer Accuracy: {eval_acc:.6f}")
                         print(f"   F1 Score: {eval_f1:.6f}")
                         print(f"   Exact Match: {eval_em:.6f}")
+                        # Step LR scheduler on eval metric when available
+                        try:
+                            scheduler.step(float(eval_loss))
+                            print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
                         server_model.train()
+
+                        # Step LR scheduler on evaluation loss immediately
+                        try:
+                            scheduler.step(float(eval_loss))
+                            print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
 
                 except Exception as e:
                     print(f"\n✖ Error in ZOO step {global_step}: {e}")
@@ -1386,7 +948,17 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     continue
 
         pbar.close()
-        scheduler.step()
+        # Step LR scheduler using latest eval loss if available
+        try:
+            scheduler.step(eval_loss)
+            print(f"[LR] Final plateau step (ZOO) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+        except Exception:
+            try:
+                last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
+                scheduler.step(last_loss)
+                print(f"[LR] Final plateau step (ZOO) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+            except Exception:
+                pass
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
         avg_acc  = sum(accs) / len(accs) if accs else 0.0
@@ -1449,7 +1021,7 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     h_cut_live, pkg = _server_forward_to_cut_payload(
                         server_model,                 # ServerKVOnly instance
                         input_ids, attention_mask, labels,
-                        send_fp16=True
+                        send_fp16=False
                     )
                     pkg["tgt_len"] = int(h_cut_live.shape[1])
 
@@ -1467,6 +1039,18 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
 
                     optimizer.zero_grad(set_to_none=True)
                     h_cut_live.backward(g_cut)
+                    # Optional gradient clipping for stability
+                    try:
+                        if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                            params_to_clip = []
+                            for group in optimizer.param_groups:
+                                for p in group.get('params', []):
+                                    if p.grad is not None:
+                                        params_to_clip.append(p)
+                            if params_to_clip:
+                                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                    except Exception:
+                        pass
                     optimizer.step()
 
                     # Calculate accuracy for monitoring using full model
@@ -1481,9 +1065,18 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     current_loss = sum(losses[-10:]) / min(len(losses), 10)  # Moving average of last 10
                     current_acc = sum(accs[-10:]) / min(len(accs), 10)
                     
-                    pbar.set_postfix_str(f"{current_loss:.4f}, Acc: {current_acc:.3f}")
+                    pbar.set_description(f"Training (SGD) | Loss: {current_loss:.4f} | Acc: {current_acc:.3f}")
                     pbar.update(1)
                     
+                    # Periodically step LR scheduler on a smoothed training loss (fallback when eval is infrequent)
+                    if global_step > 0 and (global_step % 200 == 0):
+                        try:
+                            smooth_loss = sum(losses[-50:]) / min(len(losses), 50)
+                            scheduler.step(float(smooth_loss))
+                            print(f"[LR] Plateau step on train MA (SGD) @ step {global_step}: metric={smooth_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
+
                     # Print detailed stats every 20 batches
                     if (i + 1) % 20 == 0:
                         avg_loss = sum(losses) / len(losses)
@@ -1506,6 +1099,13 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         # Return to training mode
                         server_model.train()
 
+                        # Step LR scheduler on evaluation loss immediately
+                        try:
+                            scheduler.step(float(eval_loss))
+                            print(f"[LR] Plateau step on eval (SGD) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
+
                     # Print progress every 100 steps
                     if global_step % 100 == 0:
                         avg_loss = sum(losses[-100:]) / min(len(losses), 100)
@@ -1517,7 +1117,16 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     print(f"Batch {global_step} Error: {e}")
                     continue
         
-        scheduler.step()
+        try:
+            scheduler.step(eval_loss)
+            print(f"[LR] Final plateau step (SGD) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+        except Exception:
+            try:
+                last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
+                scheduler.step(last_loss)
+                print(f"[LR] Final plateau step (SGD) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+            except Exception:
+                pass
         
         avg_loss = sum(losses) / len(losses) if losses else 0.0
         avg_acc = sum(accs) / len(accs) if accs else 0.0
@@ -1548,6 +1157,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
+    parser.add_argument('--clip_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
 
     # Dataset sizes - NEW ARGUMENTS
     parser.add_argument('--train_examples', type=int, default=1000, help='Number of training examples')  # TRAIN=1000
@@ -1557,6 +1167,12 @@ def parse_args():
     # Training steps - NEW ARGUMENTS
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')  # STEPS=4000
     parser.add_argument('--eval_steps', type=int, default=4000, help='Evaluate every N steps')  # EVAL_STEPS=4000
+    parser.add_argument('--sched_factor', type=float, default=0.5, help='LR scheduler reduce factor')
+    parser.add_argument('--sched_patience', type=int, default=2, help='LR scheduler patience')
+    parser.add_argument('--sched_threshold', type=float, default=1e-3, help='LR scheduler threshold')
+    parser.add_argument('--sched_threshold_mode', type=str, default='rel', choices=['rel','abs'], help='LR scheduler threshold mode')
+    parser.add_argument('--sched_cooldown', type=int, default=1, help='LR scheduler cooldown')
+    parser.add_argument('--sched_min_lr', type=float, default=1e-5, help='LR scheduler minimum learning rate')
     
     # ZOO parameters
     parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
@@ -1570,7 +1186,15 @@ def parse_args():
                        choices=['micro', 'macro', 'sequence'],
                        help='F1 score calculation method')
 
-    parser.add_argument('--task', choices=["squad", "xsum", "drop", "sst2"], default="squad", help='Use ZOO for client')
+    parser.add_argument(
+        '--task',
+        choices=[
+            'squad','xsum','drop','sst2',
+            'boolq','copa','multirc','cb','wic','wsc','record','rte'
+        ],
+        default='squad',
+        help='Task/dataset to load'
+    )
     parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
     parser.add_argument('--lora_r', type=int, default=8)
     parser.add_argument('--lora_alpha', type=int, default=16)
@@ -1665,8 +1289,31 @@ if __name__ == "__main__":
             optimizer = optim.SGD(trainable_params, lr=args.lr, momentum=args.momentum)
         
         
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-        print("✅ Optimizer ready")
+        try:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=args.sched_factor,
+                patience=args.sched_patience,
+                threshold=args.sched_threshold,
+                threshold_mode=args.sched_threshold_mode,
+                cooldown=args.sched_cooldown,
+                min_lr=args.sched_min_lr,
+                verbose=True,
+            )
+        except TypeError:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=args.sched_factor,
+                patience=args.sched_patience,
+                threshold=args.sched_threshold,
+            )
+        print("✅ Optimizer ready (ReduceLROnPlateau)")
+        try:
+            print(f"  Initial LR: {_get_current_lr(optimizer):.6g}")
+        except Exception:
+            pass
         
         # Setup network
         print("Setting up network...")
@@ -1738,7 +1385,7 @@ if __name__ == "__main__":
             print(f"⚠️ Could not notify client of completion (likely closed): {_e}")
 
         
-        print(f"\nFINAL RESULTS:")
+        print(f"\nFINAL RESULTS ({getattr(args, 'task', 'squad').upper()}):")
         print(f"{'='*60}")
         print(f"Model: {args.model_name}")
         print(f"Epochs: {args.epochs}")

@@ -9,24 +9,7 @@ import re
 import string
 from collections import Counter
 from tqdm import tqdm
-
-
-def normalize_answer(s):
-    """Lower text and remove punctuation, articles and extra whitespace."""
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-    
-    def white_space_fix(text):
-        return ' '.join(text.split())
-    
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-    
-    def lower(text):
-        return text.lower()
-    
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+from dataset import normalize_answer
 
 
 def get_ground_truth_answers(batch, index):
@@ -61,6 +44,23 @@ def get_ground_truth_answers(batch, index):
                     squad_answers = original_ex['answers']['text']
                     if isinstance(squad_answers, list) and len(squad_answers) > 0:
                         return [str(ans) for ans in squad_answers if str(ans).strip()]
+                
+                # XSUM format: direct summary field
+                if 'summary' in original_ex:
+                    try:
+                        summ = str(original_ex['summary']).strip()
+                        if summ:
+                            return [summ]
+                    except Exception:
+                        pass
+                # CNN/DailyMail fallback: highlights
+                if 'highlights' in original_ex:
+                    try:
+                        hl = str(original_ex['highlights']).strip()
+                        if hl:
+                            return [hl]
+                    except Exception:
+                        pass
                 
                 # SST2 format: reconstruct from label
                 if 'label' in original_ex:
@@ -106,6 +106,90 @@ def get_ground_truth_answers(batch, index):
         print(f"Error extracting ground truth for example {index}: {e}")
         return []
 
+def _classification_metrics(outputs, labels, batch, tokenizer):
+    """Compute simple classification accuracy when 'class_label' is present."""
+    try:
+        # Predict the next token after the marker as a word and map to class
+        logits = outputs.logits
+        # position for first answer token: find via formatted_text
+        preds = []
+        trues = []
+        for i, text in enumerate(batch.get('formatted_text', [])):
+            if 'Answer:' not in text:
+                continue
+            ctx = text[: text.find('Answer:') + len('Answer:')]
+            ctx_tokens = tokenizer.encode(ctx, add_special_tokens=False)
+            pos = max(len(ctx_tokens) - 1, 0)
+            if pos >= logits.shape[1]-1:
+                continue
+            token_id = int(torch.argmax(logits[i, pos, :]).item())
+            token_str = tokenizer.decode([token_id]).strip().lower()
+            mapped = 1 if token_str in {"great", "positive", "good"} else 0
+            preds.append(mapped)
+            if 'class_label' in batch:
+                trues.append(int(batch['class_label'][i].item()))
+        if preds and trues and len(preds) == len(trues):
+            correct = sum(int(p==t) for p,t in zip(preds, trues))
+            return float(correct/len(trues))
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def calculate_metrics(outputs, labels, batch, tokenizer, model, device):
+    """Task-aware metrics: classification (SST-2) vs generation (QA/summary)."""
+    try:
+        # 1. Calculate standard next-token loss
+        loss = outputs.loss.item() if outputs.loss is not None else 0.0
+        
+        # 2. Calculate token-level accuracy (for monitoring)
+        logits = outputs.logits
+        if logits.shape[1] != labels.shape[1]:
+            min_len = min(logits.shape[1], labels.shape[1])
+            logits = logits[:, :min_len, :]
+            labels = labels[:, :min_len]
+        
+        # For next token prediction
+        if logits.shape[1] > 1:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+        else:
+            shift_logits = logits
+            shift_labels = labels
+        
+        predictions = torch.argmax(shift_logits, dim=-1)
+        # Classification branch: if batch has class labels, compute classification acc
+        if 'class_label' in batch:
+            answer_accuracy = _classification_metrics(outputs, labels, batch, tokenizer)
+        else:
+            # Calculate answer token accuracy for generation tasks
+            answer_accuracy = calculate_answer_token_accuracy(
+                predictions, shift_labels, batch, tokenizer
+            )
+        
+        # 3. Calculate F1/EM by generating answers (with error handling)
+        f1_score = 0.0
+        em_score = 0.0
+        
+        # Only try generation if we have the required data
+        if ('original_example' in batch and 'formatted_text' in batch and 
+            len(batch.get('original_example', [])) > 0 and 
+            len(batch.get('formatted_text', [])) > 0):
+            
+            try:
+                f1_score, em_score = calculate_generation_f1_em(
+                    model, batch, tokenizer, device
+                )
+            except Exception as gen_error:
+                print(f"⚠️ Generation metrics failed: {gen_error}")
+                f1_score, em_score = 0.0, 0.0
+        
+        return loss, answer_accuracy, f1_score, em_score
+        
+    except Exception as e:
+        print(f"❌ SQUAD metrics calculation failed: {e}")
+        traceback.print_exc()
+        return 0.0, 0.0, 0.0, 0.0
 
 def squad_f1_score(prediction, ground_truth_list):
     """
@@ -188,7 +272,7 @@ def squad_exact_match(prediction, ground_truth_list):
 def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
     """Calculate accuracy only on answer portion tokens"""
     try:
-        if 'formatted_text' not in batch or tokenizer is None:
+        if 'formatted_text' not in batch:
             # Fallback to general accuracy
             mask = (labels != -100)
             if mask.sum() == 0:
@@ -217,27 +301,121 @@ def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
                 continue
             
             # Get accuracy for answer tokens only
-            # NOTE: predictions/labels are computed from shifted logits/labels.
-            # The first answer token at position `start_idx` in the unshifted sequence
-            # corresponds to index `start_idx-1` in the shifted tensors.
             start_idx = len(context_tokens)
             end_idx = start_idx + len(answer_tokens)
+            
+            if end_idx <= predictions.shape[1] and end_idx <= labels.shape[1]:
+                answer_preds = predictions[i, start_idx:end_idx]
+                answer_labels = labels[i, start_idx:end_idx]
+                
+                if len(answer_preds) > 0:
+                    correct = (answer_preds == answer_labels).sum().item()
+                    total = len(answer_preds)
+                    accuracies.append(correct / total)
+        
+        return sum(accuracies) / len(accuracies) if accuracies else 0.0
+        
+    except Exception as e:
+        print(f"❌ Answer token accuracy failed: {e}")
+        return 0.0
 
-            # Align indices for shifted tensors
+
+def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
+    """Calculate accuracy on answer tokens, aligned with left-truncated input."""
+    try:
+        if 'formatted_text' not in batch or tokenizer is None:
+            mask = (labels != -100)
+            if mask.sum() == 0:
+                return 0.0
+            correct = (predictions == labels) & mask
+            return (correct.sum().float() / mask.sum().float()).item()
+
+        accuracies = []
+        seq_len_shifted = int(predictions.shape[1])
+        # unshifted length is +1 when using next-token prediction
+        target_len = seq_len_shifted + 1
+
+        for i in range(len(batch['formatted_text'])):
+            text = batch['formatted_text'][i]
+
+            # Encode FULL text with the same left truncation behavior and target length
+            old_side = getattr(tokenizer, 'truncation_side', 'right')
+            try:
+                tokenizer.truncation_side = 'left'
+            except Exception:
+                pass
+            full_tokens = tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=target_len)
+            try:
+                tokenizer.truncation_side = old_side
+            except Exception:
+                pass
+
+            if not full_tokens:
+                continue
+
+            # Locate the 'Answer:' marker inside the tokenized sequence
+            marker_variants = ["\nAnswer:", " Answer:", "Answer:"]
+            marker_pos = -1
+            marker_len = 0
+            for mv in marker_variants:
+                try:
+                    mv_tok = tokenizer.encode(mv, add_special_tokens=False)
+                except Exception:
+                    mv_tok = []
+                if not mv_tok:
+                    continue
+                # subsequence search
+                n = len(mv_tok)
+                for j in range(0, len(full_tokens) - n + 1):
+                    if full_tokens[j:j+n] == mv_tok:
+                        if marker_pos == -1 or j < marker_pos:
+                            marker_pos = j
+                            marker_len = n
+                        break
+
+            if marker_pos == -1:
+                # Fallback via splitting text
+                astart = text.find("Answer:")
+                if astart == -1:
+                    continue
+                prefix = text[:astart + len("Answer:")]
+                old_side2 = getattr(tokenizer, 'truncation_side', 'right')
+                try:
+                    tokenizer.truncation_side = 'left'
+                except Exception:
+                    pass
+                prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False, truncation=True, max_length=target_len)
+                try:
+                    tokenizer.truncation_side = old_side2
+                except Exception:
+                    pass
+                start_idx = len(prefix_tokens)
+            else:
+                start_idx = marker_pos + marker_len
+
+            # Estimate answer token count by re-encoding only the answer suffix
+            answer_text = text.split('Answer:', 1)[-1]
+            ans_tokens = tokenizer.encode(answer_text, add_special_tokens=False)
+            if len(ans_tokens) == 0:
+                continue
+            end_idx = min(start_idx + len(ans_tokens), target_len)
+
+            # Shifted alignment (next-token prediction)
             start_shifted = max(start_idx - 1, 0)
             end_shifted = max(end_idx - 1, 0)
 
             if end_shifted <= predictions.shape[1] and end_shifted <= labels.shape[1] and end_shifted > start_shifted:
                 answer_preds = predictions[i, start_shifted:end_shifted]
                 answer_labels = labels[i, start_shifted:end_shifted]
-
                 if answer_preds.numel() > 0:
-                    correct = (answer_preds == answer_labels).sum().item()
-                    total = int(answer_preds.numel())
-                    accuracies.append(correct / total)
-        
-        return sum(accuracies) / len(accuracies) if accuracies else 0.0
-        
+                    mask = (answer_labels != -100)
+                    valid_total = int(mask.sum().item())
+                    if valid_total > 0:
+                        correct = ((answer_preds == answer_labels) & mask).sum().item()
+                        accuracies.append(correct / valid_total)
+
+        return float(sum(accuracies) / len(accuracies)) if accuracies else 0.0
+
     except Exception as e:
         print(f"Answer token accuracy failed: {e}")
         return 0.0
@@ -319,8 +497,6 @@ def calculate_client_answer_accuracy(predictions, labels, batch, tokenizer):
     except Exception as e:
         print(f"Client answer accuracy calculation failed: {e}")
         return 0.0
-
-
 
 def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5):
     """
@@ -433,96 +609,6 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5
     except Exception as e:
         print(f"Evaluation failed: {e}")
         return 0.0, 0.0
-
-def constrained_sentiment_generation(model, tokenizer, prompt, device):
-    """
-    Alternative: Constrained generation that forces valid sentiment tokens
-    """
-    try:
-        # Define valid sentiment tokens
-        sentiment_tokens = {
-            'great': tokenizer.encode('great', add_special_tokens=False)[0],
-            'terrible': tokenizer.encode('terrible', add_special_tokens=False)[0],
-            'positive': tokenizer.encode('positive', add_special_tokens=False)[0],  
-            'negative': tokenizer.encode('negative', add_special_tokens=False)[0]
-        }
-        
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-        
-        with torch.no_grad():
-            # Get logits for next token
-            outputs = model(**inputs)
-            next_token_logits = outputs.logits[0, -1, :]  # Last token logits
-            
-            # Zero out all tokens except sentiment tokens
-            constrained_logits = torch.full_like(next_token_logits, -float('inf'))
-            for token_id in sentiment_tokens.values():
-                constrained_logits[token_id] = next_token_logits[token_id]
-            
-            # Sample from constrained distribution
-            probs = torch.softmax(constrained_logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)
-            
-            # Decode the chosen token
-            return tokenizer.decode(next_token, skip_special_tokens=True).strip()
-    
-    except Exception as e:
-        print(f"Constrained generation failed: {e}")
-        return ""
-
-
-def debug_model_output(model, tokenizer, device):
-    """
-    Debug function to understand what the model is actually learning
-    """
-    model.eval()
-    
-    test_prompts = [
-        "Context: This movie is amazing\nQuestion: What is the overall sentiment?\nAnswer:",
-        "Context: This movie is awful\nQuestion: What is the overall sentiment?\nAnswer:",
-        "Review: Great film\nSentiment:",
-        "Sentiment of 'I love this': "
-    ]
-    
-    print("=== MODEL DEBUG ===")
-    
-    for i, prompt in enumerate(test_prompts):
-        print(f"\nTest {i+1}: {prompt}")
-        
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-        
-        # Try different generation strategies
-        strategies = [
-            {"do_sample": False, "max_new_tokens": 3},  # Greedy
-            {"do_sample": True, "temperature": 0.1, "max_new_tokens": 3},  # Low temp
-            {"do_sample": True, "temperature": 1.0, "max_new_tokens": 3},  # High temp
-        ]
-        
-        for j, params in enumerate(strategies):
-            try:
-                # Preserve suffix during debug tokenization as well
-                _old_side = getattr(tokenizer, 'truncation_side', 'right')
-                try:
-                    tokenizer.truncation_side = 'left'
-                except Exception:
-                    pass
-                outputs = model.generate(inputs['input_ids'], **params)
-                try:
-                    tokenizer.truncation_side = _old_side
-                except Exception:
-                    pass
-                generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                answer = generated[len(prompt):].strip()
-                print(f"  Strategy {j+1}: '{answer}'")
-            except Exception as e:
-                print(f"  Strategy {j+1}: FAILED - {e}")
-    
-    print("\n=== TOKEN ANALYSIS ===")
-    # Check if sentiment tokens are in vocabulary
-    sentiment_words = ['great', 'terrible', 'positive', 'negative', 'good', 'bad']
-    for word in sentiment_words:
-        tokens = tokenizer.encode(word, add_special_tokens=False)
-        print(f"'{word}' -> tokens: {tokens}")
 
 
 def evaluate_without_generation(outputs, labels, batch, tokenizer):
@@ -670,13 +756,81 @@ def test_generation_simple(model, tokenizer, device, max_new_tokens=16):
         print(f"Generation test failed: {e}")
         return False
 
+@torch.no_grad()
+def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, k=4):
+    """Print generation examples during evaluation"""
+    print("\n=== GENERATION SAMPLES ===")
+    
+    if "prompt_only" not in batch:
+        print("No prompt_only field available for generation testing")
+        return
+    
+    model.eval()
+    prompts = batch["prompt_only"][:k]
+    refs = batch["refs"][:k]
+    
+    # Tokenize prompts
+    enc = tokenizer(
+        prompts, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=350
+    ).to(device)
 
-# Legacy functions for backward compatibility
-def f1_score(prediction, ground_truth):
-    """Legacy function - use squad_f1_score instead"""
-    return squad_f1_score(prediction, [ground_truth])
-
-
-def exact_match_score(prediction, ground_truth):
-    """Legacy function - use squad_exact_match instead"""
-    return squad_exact_match(prediction, [ground_truth])
+    input_ids, attention_mask = right_trim(enc["input_ids"], enc["attention_mask"])
+    enc = {"input_ids": input_ids, "attention_mask": attention_mask}
+    
+    
+    # Generate
+    try:
+        outputs = model.generate(
+            enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
+        )
+    except Exception as e:
+        print(f"Generation failed: {e}")
+        return
+    
+    # Process outputs
+    for i in range(min(k, outputs.size(0))):
+        try:
+            # Decode full generated sequence
+            full_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+            
+            # Remove prompt to get just the answer
+            prompt_text = tokenizer.decode(enc["input_ids"][i], skip_special_tokens=True)
+            if len(full_text) > len(prompt_text):
+                pred_answer = full_text[len(prompt_text):].strip()
+            else:
+                pred_answer = ""
+            
+            # Clean up prediction
+            pred_answer = pred_answer.split('\n')[0].strip('.,!?"\'')
+            
+            # Get ground truth
+            gold_answers = refs[i] if i < len(refs) else [""]
+            gold_answer = gold_answers[0] if gold_answers else ""
+            
+            # Extract question for display
+            question_part = prompts[i].split('Question:', 1)[-1].split('Answer:', 1)[0].strip()
+            
+            # Calculate metrics
+            f1 = squad_f1_score(pred_answer, gold_answers)
+            em = squad_exact_match(pred_answer, gold_answers)
+            
+            print(f"\nExample {i+1}:")
+            print(f"Q: {question_part}")
+            print(f"Pred: '{pred_answer}'")
+            print(f"Gold: '{gold_answer}'")
+            print(f"EM={em:.3f} F1={f1:.3f}")
+            
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+    
+    print("=== END SAMPLES ===\n")

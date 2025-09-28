@@ -4,21 +4,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoTokenizer,
+    AutoConfig
+)
 import numpy as np
 import argparse
 import traceback
 from metrics import calculate_client_answer_accuracy
 from SGDGradientEst import StochasticGradientApproximator
-
+import types
+from prefix_kv import (
+    PrefixKV, 
+    merge_past_key_values, 
+    flatten_grad_state
+)
 # Global KV model holder (set in main)
 kv_model = None
 
-from lora import apply_lora_to_opt, iter_lora_parameters, get_lora_state_dict
-
-class _NoPrefixStub:
-    def get_local_past(self, bsz): return {}
-    def set_requires_grad(self, flag: bool): pass
+from lora import (
+    apply_lora_to_opt, 
+    iter_lora_parameters, 
+    get_lora_state_dict
+)
 
 try:
     from transformers.cache_utils import DynamicCache, StaticCache
@@ -26,7 +35,10 @@ except Exception:
     DynamicCache = None
     StaticCache = None
 
-import torch.nn.functional as F
+class _NoPrefixStub:
+    def get_local_past(self, bsz): return {}
+    def set_requires_grad(self, flag: bool): pass
+
 
 def right_trim(input_ids, attention_mask, labels=None):
     """Remove right padding for efficiency"""
@@ -242,10 +254,6 @@ def safe_get_hf_tokenizer(model_name):
     except Exception as e:
         print(f"⌠Failed to load tokenizer for {model_name}: {e}")
         raise
-
-
-import types
-from prefix_kv import PrefixKV, merge_past_key_values, flatten_grad_state
 
 class ClientKVModel(nn.Module):
     """
@@ -530,6 +538,10 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         # True first-order update of client prefixes
         optimizer.zero_grad(set_to_none=True)
         loss_tensor.backward()  # grads flow into client prefixes (and h_cut.grad if required)
+        try:
+            torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
+        except Exception:
+            pass
         if need_g_cut:
             if h_cut.grad is None:
                 raise RuntimeError("need_g_cut=True but h_cut.grad is None. Ensure h_cut.requires_grad_(True).")
@@ -618,7 +630,15 @@ def parse_args():
     parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
     parser.add_argument('--num_pert', type=int, default=5, help='Number of ZOO perturbations')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
-    parser.add_argument('--task', choices=["squad", "xsum", "drop", "sst2"], default="squad", help='Use ZOO for client')
+    parser.add_argument(
+        '--task',
+        choices=[
+            'squad','xsum','drop','sst2',
+            'boolq','copa','multirc','cb','wic','wsc','record','rte'
+        ],
+        default='squad',
+        help='Task/dataset to load'
+    )
     parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
     parser.add_argument('--lora_r', type=int, default=8)
     parser.add_argument('--lora_alpha', type=int, default=16)
@@ -672,7 +692,6 @@ if __name__ == "__main__":
     
     print("Creating client model...")
     # KV prefix model (new): always create so handlers can access
-    from transformers import AutoConfig
     tmp_cfg = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map=None).config
     total_layers = tmp_cfg.num_hidden_layers
     if args.tuning == 'lora':
@@ -686,7 +705,6 @@ if __name__ == "__main__":
 
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
     else:
-        from prefix_kv import PrefixKV
         kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix).to(device)
         for p in getattr(kv_model, "base_model", kv_model).parameters():
             p.requires_grad = False
