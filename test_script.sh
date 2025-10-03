@@ -3,8 +3,8 @@
 #SBATCH --account=fl-het
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=squad_prefix_ZOO_SGD/%x_%j.out
-#SBATCH --error=squad_prefix_ZOO_SGD/%x_%j.err
+#SBATCH --output=cb_prefix_ZOO_SGD/%x_%j.out
+#SBATCH --error=cb_prefix_ZOO_SGD/%x_%j.err
 #SBATCH --time=0-02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -27,6 +27,29 @@ conda activate mezo
 
 echo "All required files present"
 
+
+# Optional CLI overrides (e.g., --task cb --train 250 --dev 56 --eval 56)
+while (( "$#" )); do
+    case "$1" in
+        --task) TASK="$2"; shift 2;;
+        --train) TRAIN="$2"; shift 2;;
+        --dev) DEV="$2"; shift 2;;
+        --eval) EVAL="$2"; shift 2;;
+        --steps) STEPS="$2"; shift 2;;
+        --eval-steps) EVAL_STEPS="$2"; shift 2;;
+        --batch|--batch_size|--train_batch_size) BATCH_SIZE="$2"; shift 2;;
+        --lr) LR="$2"; shift 2;;
+        --zoo_lr) ZOO_LR="$2"; shift 2;;
+        --mu|--eps) EPS="$2"; shift 2;;
+        --tuning) TUNING="$2"; shift 2;;
+        --num-prefix) NUM_PREFIX="$2"; shift 2;;
+        --lora-r) LORA_R="$2"; shift 2;;
+        --num-pert) NUM_PERT="$2"; shift 2;;
+        --seed) SEED="$2"; shift 2;;
+        --model|--model_name) MODEL_NAME="$2"; shift 2;;
+        *) break;;
+    esac
+done
 
 # Network settings: choose a unique free port per job
 HOST="127.0.0.1"
@@ -58,35 +81,43 @@ echo "Using host $HOST and port $PORT"
 # ZOO_LR=1e-2
 # EPS=1e-1        # ZOO epsilon (perturbation scale)
 # SEED=0          # Random seed
-TRAIN=1000      # Training examples
-DEV=500         # Dev examples
-EVAL=1000       # Evaluation examples
-STEPS=1000      # Training steps
-EVAL_STEPS=1000 # Evaluation steps
+# Defaults (can be overridden above/by CLI)
+TRAIN=${TRAIN:-1000}      # Training examples
+DEV=${DEV:-500}           # Dev examples
+EVAL=${EVAL:-1000}        # Evaluation examples
+STEPS=${STEPS:-4000}      # Training steps
+EVAL_STEPS=${EVAL_STEPS:-1000} # Evaluation steps
 # NUM_PERT=5
 
-MODEL_NAME="facebook/opt-125m"
-EPOCHS=1
-BATCH_SIZE=16        # Smaller for stability
-MAX_LENGTH=512      # Reduced
+MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"
+EPOCHS=${EPOCHS:-1}
+BATCH_SIZE=${BATCH_SIZE:-16}        # Smaller for stability
+MAX_LENGTH=${MAX_LENGTH:-512}      # Reduced
 # LR=5e-4             # SGD learning rate
 # ZOO_LR=5e-4         # ZOO learning rate (reduced)
 # EPS=1e-3            # Smaller perturbation scale
-SEED=42
-TRAIN=1000
-DEV=500
-EVAL=1000
-STEPS=4000
-EVAL_STEPS=4000
-NUM_PERT=10         # More perturbations
-NUM_PREFIX=5
-# LR2=1e-1
-TASK="squad"
-TUNING="lora"
-LR=5e-3          # For AdamW (prefix tuning)
-ZOO_LR=3e-4      # For ZOO
-EPS=1e-4         # Even smaller perturbation
-LORA_R=8
+SEED=${SEED:-42}
+# Task-specific sane defaults (CB is tiny)
+TASK="${TASK:-sst2}"
+TUNING="${TUNING:-prefix}"
+# If CB and sizes not provided, pick CB-appropriate sizes
+if [ "$TASK" = "cb" ]; then
+    TRAIN=${TRAIN:-250}
+    DEV=${DEV:-56}
+    EVAL=${EVAL:-56}
+fi
+
+# Steps and eval cadence
+STEPS=${STEPS:-4000}
+EVAL_STEPS=${EVAL_STEPS:-500}
+
+# ZOO/optimization knobs
+NUM_PERT=${NUM_PERT:-10}         # More perturbations for better ZOO signal
+NUM_PREFIX=${NUM_PREFIX:-10}
+LR=${LR:-1e-3}          # Client SGD lr (stability)
+ZOO_LR=${ZOO_LR:-5e-4}  # Server ZOO lr (apply FD grads)
+EPS=${EPS:-5e-4}        # ZOO perturbation scale (finite-diff mu base; RMS-scaled)
+LORA_R=${LORA_R:-8}
 # MODEL_NAME="facebook/opt-125m"
 # EPOCHS=1
 # BATCH_SIZE=16  # Small for testing
@@ -109,14 +140,17 @@ echo "   Epochs: $EPOCHS"
 echo "   Batch Size: $BATCH_SIZE"
 echo "   Max Length: $MAX_LENGTH"
 echo "   Learning Rate: $LR"
+echo "   Task: $TASK"
+echo "   Tuning: $TUNING"
+echo "   Train/Dev/Eval: $TRAIN/$DEV/$EVAL"
+echo "   Steps/EvalSteps: $STEPS/$EVAL_STEPS"
 echo ""
 
 # Start server in background
-echo "Starting server..."
+echo "Starting coordinator (server app)..."
 python3 server.py \
     --model_name $MODEL_NAME \
     --epochs $EPOCHS \
-    --mu $EPS \
     --host $HOST \
     --port $PORT \
     --train_batch_size $BATCH_SIZE \
@@ -126,6 +160,7 @@ python3 server.py \
     --zoo_lr $ZOO_LR \
     --seed $SEED \
     --use_zeroth_order \
+    --mu $EPS \
     --train_examples $TRAIN \
     --dev_examples $DEV \
     --eval_examples $EVAL \
@@ -135,7 +170,8 @@ python3 server.py \
     --task $TASK \
     --tuning $TUNING \
     --lora_r $LORA_R \
-    --num_pert $NUM_PERT &     
+    --num_pert $NUM_PERT \
+    --wire_fp16 off &
 
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -155,7 +191,7 @@ fi
 echo "Server is running"
 
 # Start client
-echo "Starting client..."
+echo "Starting learner (client app)..."
 python3 client.py \
     --model_name $MODEL_NAME \
     --epochs $EPOCHS \
