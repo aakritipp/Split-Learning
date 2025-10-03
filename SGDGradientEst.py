@@ -16,6 +16,20 @@ class StochasticGradientApproximator:
         for param in self.trainable_params:
             self.original_params.append(param.data.clone())
 
+    # Allow external callers to update the parameter set dynamically
+    @property
+    def model_params(self):
+        return self.trainable_params
+
+    @model_params.setter
+    def model_params(self, params):
+        # Reset trainable parameter references and derived metadata
+        self.trainable_params = [p for p in params if p.requires_grad]
+        self.param_count = sum(p.numel() for p in self.trainable_params)
+        self.original_params = []
+        for param in self.trainable_params:
+            self.original_params.append(param.data.clone())
+
     def estimate_gradients(self, input_batch, target_labels, objective_fn, random_seed):
         """
         Fixed gradient estimation based on MeZO approach
@@ -33,6 +47,7 @@ class StochasticGradientApproximator:
             param.grad = torch.zeros_like(param.data)
         
         total_loss_diff = 0.0
+        loss_diffs = []  # monitor |f+ - f-|
         
         for sample_idx in range(self.sample_count):
             # Generate random direction
@@ -72,8 +87,10 @@ class StochasticGradientApproximator:
             if isinstance(loss_minus, torch.Tensor):
                 loss_minus = loss_minus.item()
                 
-            finite_diff = (loss_plus - loss_minus) / (2.0 * self.perturbation_scale)
+            fd_num = (loss_plus - loss_minus)
+            finite_diff = fd_num / (2.0 * self.perturbation_scale)
             total_loss_diff += finite_diff
+            loss_diffs.append(abs(fd_num))
             
             # Accumulate gradients: g += (f(θ+μz) - f(θ-μz)) / (2μ) * z
             for param, direction in zip(self.trainable_params, directions):
@@ -84,6 +101,15 @@ class StochasticGradientApproximator:
             param.grad.div_(self.sample_count)
             
         print(f"ZOO: Avg loss diff: {total_loss_diff/self.sample_count:.6f}")
+        try:
+            import math
+            if loss_diffs:
+                mu_abs = sum(loss_diffs)/len(loss_diffs)
+                var = sum((x-mu_abs)**2 for x in loss_diffs)/max(1,len(loss_diffs)-1)
+                std = math.sqrt(max(0.0, var))
+                print(f"ZOO: |f+-f-| mean: {mu_abs:.6e}, std: {std:.6e}")
+        except Exception:
+            pass
         
         # Check gradient norms for debugging
         total_grad_norm = 0.0

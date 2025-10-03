@@ -281,19 +281,8 @@ def _server_forward_to_cut_payload(
             )
         # else: no-op if p == 0.0
 
-    try:
-        prefix_len = int(server_wrap.kv.k.shape[-2])  # [L, H, P, D] -> P
-    except Exception:
-        prefix_len = 0
-
+    # Build attention mask per-layer to match the actual prefix length of that layer
     tgt_len = x.shape[1]
-    attn_mask_4d = _build_self_attn_mask(
-        attention_mask=attention_mask,
-        tgt_len=tgt_len,
-        prefix_len=prefix_len,
-        dtype=x.dtype,
-        device=x.device,
-    )
 
     # Build per-layer past_kv from server prefixes
     bsz = input_ids.size(0)
@@ -307,6 +296,20 @@ def _server_forward_to_cut_payload(
         if pkv is not None:
             # pkv is (k,v) shaped [B,H,P,D] each — wrap to cache-like object
             pkv = _PrefixConcatCache(pkv[0], pkv[1])
+
+        # Determine this layer's prefix length from server_past to avoid mask/prefix mismatch
+        try:
+            prefix_len_cur = int(server_past.get(li, (None, None))[0].shape[2]) if server_past.get(li, None) is not None else 0
+        except Exception:
+            prefix_len_cur = 0
+
+        attn_mask_4d = _build_self_attn_mask(
+            attention_mask=attention_mask,
+            tgt_len=tgt_len,
+            prefix_len=prefix_len_cur,
+            dtype=x.dtype,
+            device=x.device,
+        )
 
         layer_out = layer(
             x,
@@ -542,12 +545,57 @@ class FullLLMModel(nn.Module):
             client_past = self._client_kv_eval.get_local_past(bsz)   # {layer_idx: (k,v)}
             legacy_cache = merge_past_key_values(self.total_layers, server_past, client_past)
 
-            # Infer prefix length P from any present layer
-            past_len = 0
+            # Normalize per-layer past lengths to a uniform max P across layers
+            # This avoids width mismatches inside attention when some layers have different P.
+            try:
+                cfg = getattr(self.base_model, 'config', None)
+                num_heads = int(getattr(cfg, 'num_attention_heads', 1)) if cfg is not None else legacy_cache[0][0].shape[1] if legacy_cache and legacy_cache[0] is not None else 1
+                head_dim = int(getattr(cfg, 'hidden_size', num_heads)) // int(max(1, num_heads)) if cfg is not None else legacy_cache[0][0].shape[-1] if legacy_cache and legacy_cache[0] is not None else 1
+            except Exception:
+                num_heads = 1
+                head_dim = 1
+
+            # Determine maximum past length across layers
+            past_len_max = 0
             for kv in legacy_cache:
-                if kv is not None:
-                    past_len = kv[0].shape[-2]  # [B,H,P,D]
-                    break
+                if kv is not None and isinstance(kv, (tuple, list)) and isinstance(kv[0], torch.Tensor):
+                    try:
+                        past_len_max = max(past_len_max, int(kv[0].shape[-2]))
+                    except Exception:
+                        pass
+
+            # Pad each layer's K/V to past_len_max; fill missing layers with zeros so mask width matches everywhere
+            if past_len_max > 0:
+                device = next(self.base_model.parameters()).device
+                dtype  = next(self.base_model.parameters()).dtype
+                padded_legacy = []
+                for kv in legacy_cache:
+                    if kv is None:
+                        k_pad = torch.zeros((bsz, num_heads, past_len_max, head_dim), dtype=dtype, device=device)
+                        v_pad = torch.zeros((bsz, num_heads, past_len_max, head_dim), dtype=dtype, device=device)
+                        padded_legacy.append((k_pad, v_pad))
+                    else:
+                        k, v = kv
+                        try:
+                            cur_len = int(k.shape[-2])
+                        except Exception:
+                            cur_len = past_len_max
+                        if cur_len == past_len_max:
+                            padded_legacy.append((k, v))
+                        elif cur_len < past_len_max:
+                            pad_len = past_len_max - cur_len
+                            z_k = torch.zeros((k.shape[0], k.shape[1], pad_len, k.shape[3]), dtype=k.dtype, device=k.device)
+                            z_v = torch.zeros((v.shape[0], v.shape[1], pad_len, v.shape[3]), dtype=v.dtype, device=v.device)
+                            # Prepend zeros so real prefixes remain the most recent segment
+                            padded_legacy.append((torch.cat([z_k, k], dim=2), torch.cat([z_v, v], dim=2)))
+                        else:
+                            # Truncate if somehow longer (shouldn't happen in practice)
+                            padded_legacy.append((k[:, :, -past_len_max:, :], v[:, :, -past_len_max:, :]))
+            else:
+                padded_legacy = list(legacy_cache)
+
+            # Use the uniform max past length for positions
+            past_len = int(past_len_max)
 
             # Use explicit positions (matches client forward_full)
             position_ids = torch.arange(
@@ -555,14 +603,14 @@ class FullLLMModel(nn.Module):
             ).unsqueeze(0).expand(bsz, -1)
 
             # Convert to HF Cache object if available for newer transformers
-            cache_obj = legacy_cache
+            cache_obj = padded_legacy
             try:
                 if StaticCache is not None and hasattr(StaticCache, "from_legacy_cache"):
-                    cache_obj = StaticCache.from_legacy_cache(tuple(legacy_cache))
+                    cache_obj = StaticCache.from_legacy_cache(tuple(padded_legacy))
                 elif DynamicCache is not None and hasattr(DynamicCache, "from_legacy_cache"):
-                    cache_obj = DynamicCache.from_legacy_cache(tuple(legacy_cache))
+                    cache_obj = DynamicCache.from_legacy_cache(tuple(padded_legacy))
             except Exception:
-                cache_obj = legacy_cache
+                cache_obj = padded_legacy
 
             return self.base_model(
                 input_ids=input_ids,
@@ -590,25 +638,64 @@ class FullLLMModel(nn.Module):
             client_past = self._client_kv_eval.get_local_past(bsz)
             legacy_cache = merge_past_key_values(self.total_layers, server_past, client_past)
 
-            # infer prefix length P
-            past_len = 0
+            # Normalize per-layer past lengths to uniform max P
+            try:
+                cfg = getattr(self.base_model, 'config', None)
+                num_heads = int(getattr(cfg, 'num_attention_heads', 1)) if cfg is not None else legacy_cache[0][0].shape[1] if legacy_cache and legacy_cache[0] is not None else 1
+                head_dim = int(getattr(cfg, 'hidden_size', num_heads)) // int(max(1, num_heads)) if cfg is not None else legacy_cache[0][0].shape[-1] if legacy_cache and legacy_cache[0] is not None else 1
+            except Exception:
+                num_heads = 1
+                head_dim = 1
+
+            past_len_max = 0
             for kv in legacy_cache:
-                if kv is not None:
-                    past_len = kv[0].shape[-2]  # [B,H,P,D]
-                    break
+                if kv is not None and isinstance(kv, (tuple, list)) and isinstance(kv[0], torch.Tensor):
+                    try:
+                        past_len_max = max(past_len_max, int(kv[0].shape[-2]))
+                    except Exception:
+                        pass
+
+            if past_len_max > 0:
+                device = next(self.base_model.parameters()).device
+                dtype  = next(self.base_model.parameters()).dtype
+                padded_legacy = []
+                for kv in legacy_cache:
+                    if kv is None:
+                        k_pad = torch.zeros((bsz, num_heads, past_len_max, head_dim), dtype=dtype, device=device)
+                        v_pad = torch.zeros((bsz, num_heads, past_len_max, head_dim), dtype=dtype, device=device)
+                        padded_legacy.append((k_pad, v_pad))
+                    else:
+                        k, v = kv
+                        try:
+                            cur_len = int(k.shape[-2])
+                        except Exception:
+                            cur_len = past_len_max
+                        if cur_len == past_len_max:
+                            padded_legacy.append((k, v))
+                        elif cur_len < past_len_max:
+                            pad_len = past_len_max - cur_len
+                            z_k = torch.zeros((k.shape[0], k.shape[1], pad_len, k.shape[3]), dtype=k.dtype, device=k.device)
+                            z_v = torch.zeros((v.shape[0], v.shape[1], pad_len, v.shape[3]), dtype=v.dtype, device=v.device)
+                            padded_legacy.append((torch.cat([z_k, k], dim=2), torch.cat([z_v, v], dim=2)))
+                        else:
+                            padded_legacy.append((k[:, :, -past_len_max:, :], v[:, :, -past_len_max:, :]))
+            else:
+                padded_legacy = list(legacy_cache)
+
+            past_len = int(past_len_max)
 
             position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device, dtype=torch.long)
             position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
 
             # Let HF generate with the prefilled cache; attention_mask becomes unnecessary
-            cache_obj = legacy_cache
+            cache_obj = padded_legacy
             try:
                 if StaticCache is not None and hasattr(StaticCache, "from_legacy_cache"):
-                    cache_obj = StaticCache.from_legacy_cache(tuple(legacy_cache))
+                    cache_obj = StaticCache.from_legacy_cache(tuple(padded_legacy))
                 elif DynamicCache is not None and hasattr(DynamicCache, "from_legacy_cache"):
-                    cache_obj = DynamicCache.from_legacy_cache(tuple(legacy_cache))
+                    cache_obj = DynamicCache.from_legacy_cache(tuple(padded_legacy))
             except Exception:
-                cache_obj = legacy_cache  # fallback
+                cache_obj = padded_legacy  # fallback
 
             return self.base_model.generate(
                 input_ids=input_ids,
@@ -747,7 +834,8 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                     elif args.wire_fp16 == 'off':
                         _use_fp16 = False
                     else:  # auto
-                        _use_fp16 = not bool(getattr(args, 'use_zeroth_order', False))
+                        # Avoid fp16 if either side is doing ZOO (server or client).
+                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_client', False)))
                     h_cut_live, pkg = _server_forward_to_cut_payload(
                         server_model,
                         input_ids, attention_mask, labels,
@@ -775,7 +863,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                 task = getattr(args, 'task', 'squad')
                 gen_max = 5
                 if task == 'squad':
-                    gen_max = 16
+                    gen_max = 24
                 elif task == 'drop':
                     gen_max = 8
                 elif task == 'xsum':
@@ -824,6 +912,10 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
     print(f"   Learning rate: {args.zoo_lr}")
     print(f"   Perturbation scale (eps): {args.mu}")
     print(f"   Number of perturbations: {args.num_pert}")
+    try:
+        print(f"   Client SGD warmup: {getattr(args, 'client_sgd_warmup_steps', 0)} steps | interval: {getattr(args, 'client_sgd_every', 1)}")
+    except Exception:
+        pass
     print(f"   Eval every: {args.eval_steps} steps")
 
     # --- FIX 1: define params to perturb depending on tuning mode ---
@@ -858,6 +950,14 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
     server_model.train()
     losses, accs = [], []
     global_step = 0
+
+    # Smoothing and accumulation controls for incremental ZOO updates
+    ema_beta = float(getattr(args, 'zoo_grad_ema_beta', 0.0))
+    accum_steps = max(1, int(getattr(args, 'zoo_accum_steps', 1)))
+    # Buffers are aligned to server_params order
+    ema_buffers = [None] * len(server_params)
+    accum_buffers = [None] * len(server_params)
+    accum_counter = 0
 
     try:
         pbar = tqdm(total=args.max_steps, desc="Training (ZOO)",
@@ -920,70 +1020,180 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         loss_val = float(resp.get("loss", 0.0))
                         if was_training:
                             server_model.train()
-                        return torch.as_tensor(loss_val, device=h_cut_live.device, dtype=h_cut_live.dtype)
+                        # Keep FD objective in full precision; no autograd path needed
+                        return torch.tensor(float(loss_val), dtype=torch.float32)
 
                     def objective_fn_c(*_args,**_kwargs):
                         return objective_fn()
 
-                    
-                    # Estimate gradients for server KV via ZOO
-                    pbar.set_description("Training (ZOO) | Computing ZOO gradients...")
-                    try:
-                        # Newer API (keyword)
-                        grad_estimator.model_params = server_params
-                        grad_estimator.estimate_gradients(
-                            random_seed=global_step * 1000 + args.seed,
-                            objective_fn=objective_fn_c
-                        )
-                    except TypeError:
-                        # Legacy API (positional)
-                        grad_estimator.estimate_gradients(
-                            input_ids, labels, objective_fn_c,
-                            random_seed=global_step * 1000 + args.seed
-                        )
-
-                    # Apply the ZOO estimated gradients to server KV
-                    # Optional gradient clipping for stability
-                    try:
-                        if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
-                            params_to_clip = []
-                            for group in optimizer.param_groups:
-                                for p in group.get('params', []):
-                                    if p.grad is not None:
-                                        params_to_clip.append(p)
-                            if params_to_clip:
-                                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
-                    except Exception:
-                        pass
-                    optimizer.step()
-
-                    # Optional: trigger a small client-side SGD update per step for stability when client uses SGD
-                    try:
-                        if not bool(getattr(args, 'use_zeroth_order_client', False)):
-                            # Reuse the last pkg; ask client to perform local SGD step and return only loss
+                    # Optional: request g_cut once and use a variance-reduced objective ⟨g_cut, h_cut(θ)⟩
+                    use_gcut = bool(getattr(args, 'zoo_use_gcut', False))
+                    g_cut_tensor = None
+                    pkg_probe = None
+                    if use_gcut:
+                        try:
+                            server_model.eval()
+                            with torch.no_grad():
+                                _use_fp16 = False  # force fp32 for ZOO
+                                h_probe, pkg_probe = _server_forward_to_cut_payload(
+                                    server_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                pkg_probe["tgt_len"] = int(h_probe.shape[1])
                             trainer.send_data({
                                 "type": "forward_cut",
                                 "mode": "train",
-                                "data": pkg,
-                                "meta": {"zoo_eval": False, "need_g_cut": False}
+                                "data": pkg_probe,
+                                "meta": {"zoo_eval": False, "need_g_cut": True, "local_sgd": False}
                             })
-                            _ = trainer.receive_data()  # {'loss': float}
+                            resp_gc = trainer.receive_data()
+                            if isinstance(resp_gc, dict) and ("g_cut" in resp_gc):
+                                g_cut_tensor = torch.as_tensor(resp_gc["g_cut"], dtype=torch.float32, device=h_probe.device)
+                        except Exception as _e:
+                            print(f"⚠️ zoo_use_gcut failed, falling back to loss objective: {_e}")
+                            g_cut_tensor = None
+                            pkg_probe = None
+
+                    def objective_fn_gcut(*_args, **_kwargs):
+                        # f(θ) = ⟨g_cut, h_cut(θ)⟩ with fixed g_cut from current client
+                        if g_cut_tensor is None:
+                            return objective_fn()
+                        was_training = server_model.training
+                        server_model.eval()
+                        with torch.no_grad():
+                            _use_fp16 = False
+                            h_tmp, _ = _server_forward_to_cut_payload(
+                                server_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                            )
+                        if was_training:
+                            server_model.train()
+                        v = (h_tmp.to(dtype=torch.float32) * g_cut_tensor).sum().item()
+                        return torch.tensor(float(v), dtype=torch.float32)
+
+                    # Estimate gradients for server KV via ZOO with RMS-scaled μ and diversified seed
+                    pbar.set_description("Training (ZOO) | Computing ZOO gradients...")
+                    grad_estimator.model_params = server_params
+                    # RMS scale μ per step
+                    with torch.no_grad():
+                        squares, count = 0.0, 0
+                        for p in server_params:
+                            squares += (p.data.float()**2).sum().item()
+                            count   += int(p.numel())
+                        rms = (squares / max(1, count))**0.5
+                    base_mu = float(getattr(args, 'mu', 1e-3))
+                    scaled_mu = max(1e-5, base_mu) * (rms if rms > 0 else 1.0)
+                    old_mu = getattr(grad_estimator, 'perturbation_scale', scaled_mu)
+                    grad_estimator.perturbation_scale = scaled_mu
+                    try:
+                        grad_estimator.estimate_gradients(
+                            input_ids, labels,
+                            (objective_fn_gcut if use_gcut else objective_fn_c),
+                            random_seed=global_step * 1000 + batch_idx + args.seed
+                        )
+                    finally:
+                        grad_estimator.perturbation_scale = old_mu
+
+                    # Optional gradient smoothing (EMA) for stability
+                    if ema_beta > 0.0:
+                        for idx, p in enumerate(server_params):
+                            if p.grad is None:
+                                continue
+                            buf = ema_buffers[idx]
+                            if buf is None:
+                                buf = p.grad.detach().clone()
+                            else:
+                                buf.mul_(ema_beta).add_(p.grad, alpha=(1.0 - ema_beta))
+                            ema_buffers[idx] = buf
+                            p.grad.copy_(buf)
+
+                    stepped_this_iter = False
+                    if accum_steps > 1:
+                        # Accumulate gradients for N steps before applying the update
+                        for idx, p in enumerate(server_params):
+                            if p.grad is None:
+                                continue
+                            if accum_buffers[idx] is None:
+                                accum_buffers[idx] = p.grad.detach().clone()
+                            else:
+                                accum_buffers[idx].add_(p.grad)
+                        accum_counter += 1
+
+                        if (accum_counter % accum_steps) == 0:
+                            # Load averaged gradients back into .grad and step
+                            for idx, p in enumerate(server_params):
+                                if accum_buffers[idx] is None:
+                                    continue
+                                avg = accum_buffers[idx].div(float(accum_steps))
+                                if p.grad is None:
+                                    p.grad = avg.detach().clone()
+                                else:
+                                    p.grad.copy_(avg)
+                            # Optional gradient clipping for stability
+                            try:
+                                if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                                    params_to_clip = []
+                                    for group in optimizer.param_groups:
+                                        for p in group.get('params', []):
+                                            if p.grad is not None:
+                                                params_to_clip.append(p)
+                                    if params_to_clip:
+                                        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                            except Exception:
+                                pass
+                            optimizer.step()
+                            # Reset accumulators
+                            accum_buffers = [None] * len(server_params)
+                            accum_counter = 0
+                            stepped_this_iter = True
+                        else:
+                            # Skip optimizer step this iteration
+                            stepped_this_iter = False
+                    else:
+                        # No accumulation: step every iteration
+                        try:
+                            if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                                params_to_clip = []
+                                for group in optimizer.param_groups:
+                                    for p in group.get('params', []):
+                                        if p.grad is not None:
+                                            params_to_clip.append(p)
+                                if params_to_clip:
+                                    torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                        except Exception:
+                            pass
+                        optimizer.step()
+                        stepped_this_iter = True
+
+                    # Optional: trigger a small client-side SGD update with cadence
+                    try:
+                        if not bool(getattr(args, 'use_zeroth_order_client', False)):
+                            warm = int(getattr(args, 'client_sgd_warmup_steps', 0))
+                            every = max(1, int(getattr(args, 'client_sgd_every', 1)))
+                            if (global_step >= warm) and (global_step % every == 0):
+                                # Build fresh pkg and ask client to do a local step
+                                server_model.eval()
+                                with torch.no_grad():
+                                    _use_fp16 = (False if (bool(getattr(args,'use_zeroth_order', False)) or bool(getattr(args,'use_zeroth_order_client', False))) else True)
+                                    h2, pkg2 = _server_forward_to_cut_payload(
+                                        server_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                    )
+                                    pkg2["tgt_len"] = int(h2.shape[1])
+                                trainer.send_data({
+                                    "type": "forward_cut",
+                                    "mode": "train",
+                                    "data": pkg2,
+                                    "meta": {"zoo_eval": False, "need_g_cut": False, "local_sgd": True}
+                                })
+                                _ = trainer.receive_data()
                     except Exception:
                         pass
 
-                    # --- monitor (safe) ---
+                    # --- monitor: use ZOO objective loss (authoritative for server ZOO) ---
                     try:
-                        with torch.no_grad():
-                            out = full_model(input_ids, attention_mask, labels)   # frozen full model, no prefixes
-                            loss_val, acc, _, _ = calculate_metrics(
-                                out, labels, batch, tokenizer, full_model, device
-                            )
+                        cur_obj_loss = float(objective_fn().item())
                     except Exception:
-                        # if monitoring hiccups, keep training
-                        loss_val, acc = float(objective_fn().item()), 0.0
-
-                    losses.append(loss_val)
-                    accs.append(acc)
+                        cur_obj_loss = 0.0
+                    losses.append(cur_obj_loss)
+                    accs.append(0.0)
 
                     global_step += 1
                     cur_loss = sum(losses[-10:]) / min(len(losses), 10)
@@ -991,12 +1201,30 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     pbar.set_description(f"Training (ZOO) | Loss: {cur_loss:.4f} | Acc: {cur_acc:.6f}")
                     pbar.update(1)
 
-                    # Periodically step LR scheduler on a smoothed training loss (fallback when eval is infrequent)
+                    # Periodically step LR scheduler on a smoothed ZOO objective (fallback when eval is infrequent)
                     if global_step > 0 and (global_step % 200 == 0):
                         try:
                             smooth_loss = sum(losses[-50:]) / min(len(losses), 50)
                             scheduler.step(float(smooth_loss))
                             print(f"[LR] Plateau step on train MA (ZOO) @ step {global_step}: metric={smooth_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                        except Exception:
+                            pass
+
+                    # Optional diagnostic: effect of -alpha * grad step on objective
+                    if (global_step % 100 == 0):
+                        try:
+                            base_loss = float(objective_fn().item())
+                            alpha = min(1e-2, float(getattr(args, 'zoo_lr', 1e-4)))
+                            with torch.no_grad():
+                                for p in server_params:
+                                    if p.grad is not None:
+                                        p.add_(p.grad, alpha=-alpha)
+                            new_loss = float(objective_fn().item())
+                            with torch.no_grad():
+                                for p in server_params:
+                                    if p.grad is not None:
+                                        p.add_(p.grad, alpha=+alpha)
+                            print(f"[diag] Δloss from -α·g step: {base_loss - new_loss:.6f}")
                         except Exception:
                             pass
 
@@ -1017,18 +1245,12 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         print(f"   Exact Match: {eval_em:.6f}")
                         # Step LR scheduler on eval metric when available
                         try:
-                            scheduler.step(float(eval_loss))
-                            print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                            if bool(getattr(args, 'sched_step_on_eval', False)):
+                                scheduler.step(float(eval_loss))
+                                print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
                         except Exception:
                             pass
                         server_model.train()
-
-                        # Step LR scheduler on evaluation loss immediately
-                        try:
-                            scheduler.step(float(eval_loss))
-                            print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
-                        except Exception:
-                            pass
 
                 except Exception as e:
                     print(f"\n✖ Error in ZOO step {global_step}: {e}")
@@ -1106,13 +1328,16 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
-                    # Choose wire precision dynamically
+                    # Choose wire precision dynamically.
+                    # IMPORTANT: If the client uses ZOO, force fp32 to preserve FD signal fidelity.
                     if args.wire_fp16 == 'on':
                         _use_fp16 = True
                     elif args.wire_fp16 == 'off':
                         _use_fp16 = False
                     else:  # auto
-                        _use_fp16 = not bool(getattr(args, 'use_zeroth_order', False))
+                        # Prefer fp16 unless either side is doing ZOO
+                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_client', False)))
+
                     h_cut_live, pkg = _server_forward_to_cut_payload(
                         server_model,                 # ServerKVOnly instance
                         input_ids, attention_mask, labels,
@@ -1241,12 +1466,12 @@ def parse_args():
     # Model parameters
     parser.add_argument('--model_name', type=str, default='facebook/opt-125m', help='Model name')
     parser.add_argument('--num_prefix', type=int, default=20, help='Number of prefix tokens')
-    parser.add_argument('--cut_layer', type=int, default=6, help='Split index: 0..L-1 goes to server; cut..L-1 to client')
+    parser.add_argument('--cut_layer', type=int, default=1, help='Split index: 0..L-1 goes to server; cut..L-1 to client')
     parser.add_argument('--max_length', type=int, default=512, help='Max sequence length')
     
     # Training parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--zoo_lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--zoo_lr', type=float, default=5e-4, help='ZOO learning rate')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate') 
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
@@ -1263,17 +1488,25 @@ def parse_args():
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')  # STEPS=4000
     parser.add_argument('--eval_steps', type=int, default=4000, help='Evaluate every N steps')  # EVAL_STEPS=4000
     parser.add_argument('--sched_factor', type=float, default=0.5, help='LR scheduler reduce factor')
-    parser.add_argument('--sched_patience', type=int, default=2, help='LR scheduler patience')
-    parser.add_argument('--sched_threshold', type=float, default=1e-3, help='LR scheduler threshold')
+    parser.add_argument('--sched_patience', type=int, default=6, help='LR scheduler patience')
+    parser.add_argument('--sched_threshold', type=float, default=1e-2, help='LR scheduler threshold')
     parser.add_argument('--sched_threshold_mode', type=str, default='rel', choices=['rel','abs'], help='LR scheduler threshold mode')
     parser.add_argument('--sched_cooldown', type=int, default=1, help='LR scheduler cooldown')
     parser.add_argument('--sched_min_lr', type=float, default=1e-5, help='LR scheduler minimum learning rate')
     
     # ZOO parameters
-    parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
-    parser.add_argument('--num_pert', type=int, default=5, help='ZOO perturbations')
+    parser.add_argument('--mu', type=float, default=5e-4, help='ZOO perturbation scale (base, will be RMS-scaled)')
+    parser.add_argument('--num_pert', type=int, default=64, help='ZOO perturbations (antithetic pairs internally)')
     parser.add_argument('--use_zeroth_order', action='store_true', help='Use ZOO for server')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
+    parser.add_argument('--zoo_momentum', type=float, default=0.5, help='Momentum for ZOO optimizer updates (0 disables)')
+    parser.add_argument('--zoo_accum_steps', type=int, default=1, help='Accumulate ZOO gradients for N steps before optimizer.step()')
+    parser.add_argument('--zoo_grad_ema_beta', type=float, default=0.0, help='EMA beta for ZOO grad smoothing (0 disables)')
+    # Make g_cut variance-reduced objective enabled by default; allow disabling via --no_zoo_use_gcut
+    parser.add_argument('--no_zoo_use_gcut', dest='zoo_use_gcut', action='store_false', help='Disable variance-reduced ZOO g_cut objective')
+    parser.set_defaults(zoo_use_gcut=True)
+    parser.add_argument('--client_sgd_warmup_steps', type=int, default=800, help='Delay client local SGD for N steps in server-ZOO mode')
+    parser.add_argument('--client_sgd_every', type=int, default=1, help='Perform client local SGD every K steps after warmup')
     
     # Evaluation
     parser.add_argument('--evaluate_every', type=int, default=1, help='Evaluate every N epochs')
@@ -1303,8 +1536,14 @@ def parse_args():
     # Wire precision for h_cut payload (fp16 reduces bandwidth, fp32 improves ZOO stability)
     parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='auto',
                         help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
+    # Control whether to step LR scheduler on eval loss for ZOO (default off)
+    parser.add_argument('--sched_step_on_eval', action='store_true', help='Also step LR scheduler on eval loss (ZOO)')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Safety: forbid forcing fp16 on wire when using any ZOO (server or client)
+    if args.wire_fp16 == 'on' and (args.use_zeroth_order or args.use_zeroth_order_client):
+        raise SystemExit("wire_fp16='on' is incompatible with ZOO. Use 'auto' or 'off'.")
+    return args
 
 if __name__ == "__main__":
     try:
@@ -1325,6 +1564,8 @@ if __name__ == "__main__":
         if args.use_zeroth_order:
             print(f"   ZOO mu: {args.mu}")
             print(f"   ZOO perturbations: {args.num_pert}")
+            print(f"   ZOO use g_cut objective: {getattr(args, 'zoo_use_gcut', False)}")
+        print(f"   Wire dtype policy: {getattr(args, 'wire_fp16', 'auto')}")
         
         # Device configuration
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1385,8 +1626,9 @@ if __name__ == "__main__":
         # Setup optimizer
         print("  Setting up optimizer...")
         if args.use_zeroth_order:
-            # ZOO needs higher learning rate and no momentum (optimizer used for applying estimated grads)
-            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=0.0)
+            # ZOO: allow small momentum for incremental updates
+            zoo_mom = float(getattr(args, 'zoo_momentum', 0.0))
+            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=zoo_mom)
         else:
             # Regular SGD can use lower learning rate with momentum
             optimizer = optim.SGD(trainable_params, lr=args.lr, momentum=args.momentum)

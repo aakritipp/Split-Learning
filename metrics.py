@@ -525,6 +525,24 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5
                 parts = full_text.split('Answer:')
                 context_question = 'Answer:'.join(parts[:-1]) + 'Answer:'
 
+                # Detect Yes/No/Maybe (CB) or Yes/No (BoolQ) ground truth to use logits classification
+                gold_answers = get_ground_truth_answers(batch, i)
+                gold_ynm_mode = False
+                gold_yesno_mode = False
+                try:
+                    if gold_answers and all(str(ans).strip().lower() in {"yes", "no", "maybe"} for ans in gold_answers):
+                        # If any answer is 'maybe', do 3-way; otherwise it could still be 2-way
+                        la = {str(ans).strip().lower() for ans in gold_answers}
+                        gold_ynm_mode = ("maybe" in la) or (la == {"yes", "no"} or la == {"yes"} or la == {"no"})
+                        # Prefer 3-way if maybe present; else we will fall back to 2-way branch
+                        if "maybe" not in la:
+                            gold_yesno_mode = True
+                    elif gold_answers and all(str(ans).strip().lower() in {"yes", "no"} for ans in gold_answers):
+                        gold_yesno_mode = True
+                except Exception:
+                    gold_ynm_mode = False
+                    gold_yesno_mode = False
+
                 if is_classification:
                     # next-token classification between ' great' vs ' terrible'
                     prompt = context_question + ' '
@@ -554,6 +572,164 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5
                         print(f"   Predicted: '{predicted}' (logits: great={logit_great:.2f}, terrible={logit_terr:.2f})")
                         print(f"   Ground truth: {gold}")
                         print(f"   F1: {f1:.4f}, EM: {em:.4f}")
+                elif gold_ynm_mode and any(str(ans).strip().lower() == "maybe" for ans in (gold_answers or [])):
+                    # Strict Yes/No/Maybe classification via next-token logits (CB dataset)
+                    prompt = context_question + ' '
+                    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                    out = model(**inputs)
+                    next_logits = out.logits[0, -1, :]
+
+                    def _first_token_ids(candidates):
+                        token_ids = []
+                        for s in candidates:
+                            try:
+                                ids = tokenizer.encode(s, add_special_tokens=False)
+                                if isinstance(ids, list) and len(ids) > 0:
+                                    token_ids.append(int(ids[0]))
+                            except Exception:
+                                continue
+                        return sorted(list(set(token_ids)))
+
+                    yes_token_ids = _first_token_ids([' yes', ' Yes', 'YES', 'Yes', 'y', ' Y'])
+                    no_token_ids  = _first_token_ids([' no',  ' No',  'NO',  'No',  'n', ' N'])
+                    maybe_token_ids = _first_token_ids([' maybe', ' Maybe', 'Maybe', 'MAYBE', ' m', ' M'])
+
+                    if not yes_token_ids or not no_token_ids or not maybe_token_ids:
+                        # Fallback: minimal greedy 1-2 tokens and map first char
+                        _old_side = getattr(tokenizer, 'truncation_side', 'right')
+                        try:
+                            tokenizer.truncation_side = 'left'
+                        except Exception:
+                            pass
+                        gen_inputs = tokenizer(context_question, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                        try:
+                            tokenizer.truncation_side = _old_side
+                        except Exception:
+                            pass
+                        eos_id = tokenizer.eos_token_id
+                        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+                        gen = model.generate(
+                            gen_inputs['input_ids'],
+                            attention_mask=gen_inputs.get('attention_mask', None),
+                            max_new_tokens=2,
+                            min_new_tokens=1,
+                            do_sample=False,
+                            num_beams=1,
+                            pad_token_id=pad_id,
+                            eos_token_id=eos_id,
+                            use_cache=True,
+                        )
+                        full_generated = tokenizer.decode(gen[0], skip_special_tokens=True)
+                        input_text = tokenizer.decode(gen_inputs['input_ids'][0], skip_special_tokens=True)
+                        generated_answer = full_generated[len(input_text):].strip()
+                        gen_norm = generated_answer.strip().lower()
+                        if gen_norm.startswith('y'):
+                            predicted = 'Yes'
+                        elif gen_norm.startswith('n'):
+                            predicted = 'No'
+                        elif gen_norm.startswith('m'):
+                            predicted = 'Maybe'
+                        else:
+                            predicted = 'No'
+                    else:
+                        ys = torch.stack([next_logits[idx] for idx in yes_token_ids])
+                        ns = torch.stack([next_logits[idx] for idx in no_token_ids])
+                        ms = torch.stack([next_logits[idx] for idx in maybe_token_ids])
+                        score_yes = float(torch.logsumexp(ys, dim=0).item())
+                        score_no  = float(torch.logsumexp(ns, dim=0).item())
+                        score_may = float(torch.logsumexp(ms, dim=0).item())
+                        if score_yes >= score_no and score_yes >= score_may:
+                            predicted = 'Yes'
+                        elif score_no >= score_yes and score_no >= score_may:
+                            predicted = 'No'
+                        else:
+                            predicted = 'Maybe'
+
+                    gold = gold_answers if gold_answers else ['No']
+                    f1 = squad_f1_score(predicted, gold)
+                    em = squad_exact_match(predicted, gold)
+                    f1_scores.append(f1)
+                    em_scores.append(em)
+                    if i < 3:
+                        print(f"Example {i}:")
+                        print(f"   Predicted: '{predicted}'")
+                        print(f"   Ground truth: {gold}")
+                        print(f"   F1: {f1:.4f}, EM: {em:.4f}")
+
+                elif gold_yesno_mode:
+                    # Strict Yes/No classification via next-token logits
+                    prompt = context_question + ' '
+                    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                    out = model(**inputs)
+                    next_logits = out.logits[0, -1, :]
+
+                    # Collect candidate token ids for Yes/No across common variants
+                    def _first_token_ids(candidates):
+                        token_ids = []
+                        for s in candidates:
+                            try:
+                                ids = tokenizer.encode(s, add_special_tokens=False)
+                                if isinstance(ids, list) and len(ids) > 0:
+                                    token_ids.append(int(ids[0]))
+                            except Exception:
+                                continue
+                        # unique
+                        return sorted(list(set(token_ids)))
+
+                    yes_token_ids = _first_token_ids([' yes', ' Yes', 'YES', 'Yes', 'y', ' Y'])
+                    no_token_ids  = _first_token_ids([' no',  ' No',  'NO',  'No',  'n', ' N'])
+
+                    if not yes_token_ids or not no_token_ids:
+                        # Fallback to minimal greedy generation of 1 token
+                        _old_side = getattr(tokenizer, 'truncation_side', 'right')
+                        try:
+                            tokenizer.truncation_side = 'left'
+                        except Exception:
+                            pass
+                        gen_inputs = tokenizer(context_question, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                        try:
+                            tokenizer.truncation_side = _old_side
+                        except Exception:
+                            pass
+                        eos_id = tokenizer.eos_token_id
+                        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+                        gen = model.generate(
+                            gen_inputs['input_ids'],
+                            attention_mask=gen_inputs.get('attention_mask', None),
+                            max_new_tokens=2,
+                            min_new_tokens=1,
+                            do_sample=False,
+                            num_beams=1,
+                            pad_token_id=pad_id,
+                            eos_token_id=eos_id,
+                            use_cache=True,
+                        )
+                        full_generated = tokenizer.decode(gen[0], skip_special_tokens=True)
+                        input_text = tokenizer.decode(gen_inputs['input_ids'][0], skip_special_tokens=True)
+                        generated_answer = full_generated[len(input_text):].strip()
+                        # Post-process to Yes/No
+                        gen_norm = generated_answer.strip().lower()
+                        predicted = 'Yes' if gen_norm.startswith('y') else 'No' if gen_norm.startswith('n') else 'No'
+                    else:
+                        # Score candidates via logit values (log-sum-exp across variants)
+                        yes_scores = torch.stack([next_logits[idx] for idx in yes_token_ids])
+                        no_scores  = torch.stack([next_logits[idx] for idx in no_token_ids])
+                        from torch import logsumexp as _lse
+                        score_yes = float(torch.logsumexp(yes_scores, dim=0).item())
+                        score_no  = float(torch.logsumexp(no_scores,  dim=0).item())
+                        predicted = 'Yes' if score_yes >= score_no else 'No'
+
+                    gold = gold_answers if gold_answers else ['No']
+                    f1 = squad_f1_score(predicted, gold)
+                    em = squad_exact_match(predicted, gold)
+                    f1_scores.append(f1)
+                    em_scores.append(em)
+                    if i < 3:
+                        print(f"Example {i}:")
+                        print(f"   Predicted: '{predicted}'")
+                        print(f"   Ground truth: {gold}")
+                        print(f"   F1: {f1:.4f}, EM: {em:.4f}")
+
                 else:
                     # generation path
                     # Ensure suffix with 'Answer:' is preserved like training (left truncation)
@@ -568,17 +744,54 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5
                         tokenizer.truncation_side = _old_side
                     except Exception:
                         pass
-                    gen = model.generate(
-                        inputs['input_ids'],
-                        attention_mask=inputs.get('attention_mask', None),
-                        max_new_tokens=max_new_tokens,
-                        min_new_tokens=1,
-                        do_sample=False,
-                        num_beams=1,
-                        pad_token_id=tokenizer.eos_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        use_cache=True,
-                    )
+                    eos_id = tokenizer.eos_token_id
+                    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+                    try:
+                        # Primary: greedy with anti-repetition constraints
+                        gen = model.generate(
+                            inputs['input_ids'],
+                            attention_mask=inputs.get('attention_mask', None),
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=1,
+                            do_sample=False,
+                            num_beams=1,
+                            no_repeat_ngram_size=3,
+                            repetition_penalty=1.2,
+                            pad_token_id=pad_id,
+                            eos_token_id=eos_id,
+                            use_cache=True,
+                        )
+                    except Exception as e_primary:
+                        print(f"Generation failed (constrained greedy): {e_primary}")
+                        try:
+                            # Fallback: plain greedy w/o constraints
+                            gen = model.generate(
+                                inputs['input_ids'],
+                                max_new_tokens=max_new_tokens,
+                                do_sample=False,
+                                num_beams=1,
+                                pad_token_id=pad_id,
+                                eos_token_id=eos_id,
+                            )
+                        except Exception as e_plain:
+                            print(f"Generation failed (plain greedy): {e_plain}")
+                            try:
+                                # Ultimate fallback: call base_model.generate if wrapped
+                                base = getattr(model, 'base_model', None)
+                                if base is None or not hasattr(base, 'generate'):
+                                    raise e_plain
+                                gen = base.generate(
+                                    inputs['input_ids'],
+                                    max_new_tokens=max_new_tokens,
+                                    do_sample=False,
+                                    num_beams=1,
+                                    pad_token_id=pad_id,
+                                    eos_token_id=eos_id,
+                                )
+                            except Exception as e_base:
+                                print(f"Generation failed (base fallback): {e_base}")
+                                # Skip this example
+                                continue
                     full_generated = tokenizer.decode(gen[0], skip_special_tokens=True)
                     input_text = tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True)
                     generated_answer = full_generated[len(input_text):].strip() if len(full_generated) > len(input_text) else ''
@@ -693,13 +906,19 @@ def calculate_squad_metrics(outputs, labels, batch, tokenizer, model, device, ge
             shift_labels = labels
         
         predictions = torch.argmax(shift_logits, dim=-1)
-        answer_accuracy = calculate_answer_token_accuracy(predictions, shift_labels, batch, tokenizer)
+        # Use classification accuracy when discrete class labels are available (e.g., SST-2)
+        if 'class_label' in batch:
+            answer_accuracy = _classification_metrics(outputs, labels, batch, tokenizer)
+        else:
+            answer_accuracy = calculate_answer_token_accuracy(predictions, shift_labels, batch, tokenizer)
         
         # Try generation-based evaluation
         f1_score, em_score = 0.0, 0.0
         try:
+            # Allow slightly longer answers for SQuAD-like prompts by default
+            max_nt = int(max(5, generation_max_new_tokens))
             f1_score, em_score = calculate_generation_f1_em(
-                model, batch, tokenizer, device, max_new_tokens=generation_max_new_tokens
+                model, batch, tokenizer, device, max_new_tokens=max_nt
             )
         except Exception as gen_error:
             print(f"Generation evaluation failed: {gen_error}")
@@ -784,15 +1003,49 @@ def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, 
     
     # Generate
     try:
-        outputs = model.generate(
-            enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-            do_sample=False,
-            num_beams=1,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
-        )
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+        try:
+            outputs = model.generate(
+                enc["input_ids"],
+                attention_mask=enc["attention_mask"],
+                do_sample=False,
+                num_beams=1,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.2,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_id,
+                pad_token_id=pad_id
+            )
+        except Exception as e_primary:
+            print(f"Generation failed (constrained greedy): {e_primary}")
+            try:
+                outputs = model.generate(
+                    enc["input_ids"],
+                    do_sample=False,
+                    num_beams=1,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_id,
+                    pad_token_id=pad_id
+                )
+            except Exception as e_plain:
+                print(f"Generation failed (plain greedy): {e_plain}")
+                base = getattr(model, 'base_model', None)
+                if base is not None and hasattr(base, 'generate'):
+                    try:
+                        outputs = base.generate(
+                            enc["input_ids"],
+                            do_sample=False,
+                            num_beams=1,
+                            max_new_tokens=max_new_tokens,
+                            eos_token_id=eos_id,
+                            pad_token_id=pad_id
+                        )
+                    except Exception as e_base:
+                        print(f"Generation failed (base fallback): {e_base}")
+                        return
+                else:
+                    return
     except Exception as e:
         print(f"Generation failed: {e}")
         return

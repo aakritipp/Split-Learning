@@ -432,9 +432,9 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         model_ref = getattr(kv_model, "base_model", kv_model)
         param0 = next(model_ref.parameters())
         target_device = param0.device
-        target_dtype  = param0.dtype
+        # Force fp32 for strict ZOO probes to preserve FD signal
+        target_dtype  = torch.float32
 
-        h_cut = server_data["h_cut"].to(device=target_device, dtype=target_dtype)
         attn_mask = server_data.get("attention_mask", None)
         labels = server_data.get("labels", None)
         if attn_mask is not None:
@@ -445,17 +445,20 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
 
         cut = int(server_data.get("cut_layer", pkt.get("meta", {}).get("cut_layer", args.cut_layer)))
 
+        from torch.cuda.amp import autocast
         kv_model.eval()  # disable dropout for stability
         with torch.no_grad():
-            out = _client_forward_from_cut(
-                kv_model,
-                h_cut=h_cut.detach(),
-                attention_mask=attn_mask,
-                labels=labels,
-                cut=cut,
-                compute_g_cut=False,
-                return_loss_tensor=False,
-            )
+            with autocast(enabled=False):
+                h_cut = server_data["h_cut"].to(device=target_device, dtype=torch.float32)
+                out = _client_forward_from_cut(
+                    kv_model,
+                    h_cut=h_cut.detach(),
+                    attention_mask=attn_mask,
+                    labels=labels,
+                    cut=cut,
+                    compute_g_cut=False,
+                    return_loss_tensor=False,
+                )
 
         if bool(meta.get("zoo_eval", False)):
             # Strict ZOO probe: return scalar loss only
@@ -556,27 +559,64 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
 
     else:
         # Zeroth order update of client prefixes (loss-only objective)
-        # If server needs g_cut, compute it via autograd.grad wrt h_cut (no client param grads cross boundary)
+        # If server needs g_cut, compute it via finite-difference on h_cut
         if need_g_cut:
-            g = _estimate_g_cut_fd(
-                kv_model, h_cut, attn_mask, labels, cut,
-                mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-3)),
-                num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 8)),
-            )
+            was_training = kv_model.training
+            kv_model.eval()
+            try:
+                g = _estimate_g_cut_fd(
+                    kv_model,
+                    h_cut.to(dtype=torch.float32, device=target_device),
+                    attn_mask, labels, cut,
+                    mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-2)),
+                    num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 16)),
+                )
+            finally:
+                if was_training:
+                    kv_model.train()
             g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
 
+    # else:
+    #     # Zeroth order update of client prefixes (loss-only objective)
+    #     # If server needs g_cut, compute it via autograd.grad wrt h_cut (no client param grads cross boundary)
+    #     if need_g_cut:
+    #         g = _estimate_g_cut_fd(
+    #             kv_model, h_cut, attn_mask, labels, cut,
+    #             mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-3)),
+    #             num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 8)),
+    #         )
+    #         g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
+
         # Define a pure loss-only objective for ZOO (no gradients, just returns float loss)
+        # def client_objective(_x, _y):
+        #     with torch.no_grad():
+        #         o = _client_forward_from_cut(
+        #             kv_model,
+        #             h_cut=server_data["h_cut"].to(device).detach(),
+        #             attention_mask=attn_mask,
+        #             labels=labels, cut=cut,
+        #             compute_g_cut=False,
+        #             return_loss_tensor=False
+        #         )
+        #         return torch.tensor(float(o["loss"]), device="cpu")
+
         def client_objective(_x, _y):
-            with torch.no_grad():
-                o = _client_forward_from_cut(
-                    kv_model,
-                    h_cut=server_data["h_cut"].to(device).detach(),
-                    attention_mask=attn_mask,
-                    labels=labels, cut=cut,
-                    compute_g_cut=False,
-                    return_loss_tensor=False
-                )
-                return torch.tensor(float(o["loss"]), device="cpu")
+            was_training = kv_model.training
+            kv_model.eval()
+            try:
+                with torch.no_grad():
+                    o = _client_forward_from_cut(
+                        kv_model,
+                        h_cut=server_data["h_cut"].to(device=device, dtype=target_dtype),
+                        attention_mask=attn_mask,
+                        labels=labels, cut=cut,
+                        compute_g_cut=False,
+                        return_loss_tensor=False
+                    )
+                    return torch.tensor(float(o["loss"]), device="cpu")
+            finally:
+                if was_training:
+                    kv_model.train()
 
         _dummy_x = torch.zeros(1)
         _dummy_y = torch.zeros(1)
@@ -597,6 +637,12 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         # STRICT ZOO probe: return scalar loss only, no client updates here
         # with torch.no_grad():
         #     pass  # ensure no autograd graph kept
+        # Apply FD gradients to client params
+        try:
+            torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
+        except Exception:
+            pass
+        optimizer.step()
 
     # ---- Reply to server ----
     reply = {"loss": float(loss_tensor.item())}
@@ -617,19 +663,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Split Learning LLM Client')
     parser.add_argument('--model_name', type=str, default='facebook/opt-125m', help='Pretrained model name')
     parser.add_argument('--num_prefix', type=int, default=20, help='Number of prefix tokens')
-    parser.add_argument('--cut_layer', type=int, default=6, help='Split index: 0..cut-1 server; cut..L-1 client')
+    parser.add_argument('--cut_layer', type=int, default=1, help='Split index: 0..cut-1 server; cut..L-1 client')
     parser.add_argument('--max_length', type=int, default=512, help='Maximum sequence length')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--zoo_lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--zoo_lr', type=float, default=1e-4, help='ZOO learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs (fallback)')
     # ZOO parameters
-    parser.add_argument('--mu', type=float, default=1e-1, help='ZOO perturbation scale')
-    parser.add_argument('--num_pert', type=int, default=5, help='Number of ZOO perturbations')
+    parser.add_argument('--mu', type=float, default=1e-3, help='ZOO perturbation scale')
+    parser.add_argument('--num_pert', type=int, default=64, help='Number of ZOO perturbations')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
     parser.add_argument(
         '--task',
@@ -650,8 +696,10 @@ def parse_args():
     
     # argparse setup
     parser.add_argument("--gcut-dtype", choices=["fp16", "fp32"], default="fp32", help="Wire precision for g_cut payloads.")
+    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='auto', help='Precision for wire activations (client will honor server)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 
 def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=None, side: str = None):
@@ -766,7 +814,8 @@ if __name__ == "__main__":
             'model_name': args.model_name,
             'num_prefix': args.num_prefix,
             'lr': args.lr,
-            'client_sgd': args.use_zeroth_order_client,               # tell server which mode we’re in
+            # True => client uses SGD; False => client uses ZOO
+            'client_sgd': (not args.use_zeroth_order_client),
             'zoo_lr': getattr(args, "zoo_lr", None),
             'mu': getattr(args, "mu", None),
             'num_pert': getattr(args, "num_pert", None),
