@@ -117,6 +117,10 @@ NUM_PREFIX=${NUM_PREFIX:-10}
 LR=${LR:-1e-3}          # Client SGD lr (stability)
 ZOO_LR=${ZOO_LR:-5e-4}  # Server ZOO lr (apply FD grads)
 EPS=${EPS:-5e-4}        # ZOO perturbation scale (finite-diff mu base; RMS-scaled)
+
+# LR=${LR:-5.00E-06}
+# ZOO_LR=${ZOO_LR:-5.00E-06}
+# EPS=${EPS:-1.00E-03}
 LORA_R=${LORA_R:-8}
 # MODEL_NAME="facebook/opt-125m"
 # EPOCHS=1
