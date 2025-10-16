@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import os
 try:
     from transformers.cache_utils import DynamicCache, StaticCache
 except Exception:
@@ -65,6 +66,36 @@ def _right_trim(input_ids, attention_mask, labels):
         attention_mask[:, :max_len],
         labels[:, :max_len] if labels is not None else None,
     )
+
+def _get_hf_token_from_env():
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_API_TOKEN")
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+    if token:
+        token = token.strip()
+    return token or None
+
+def _hf_auth_kwargs():
+    token = _get_hf_token_from_env()
+    return {"token": token} if token else {}
+
+def try_hf_login():
+    token = _get_hf_token_from_env()
+    if not token:
+        return False
+    try:
+        from huggingface_hub import login as hf_login
+        # Avoid modifying git credential store on CI
+        hf_login(token=token, add_to_git_credential=False)
+        print("✅ Hugging Face login succeeded via HF_TOKEN")
+        return True
+    except Exception as _e:
+        # Non-fatal; we'll rely on passing token directly to loaders
+        print(f"⚠️ Hugging Face login skipped/failed: {_e}")
+        return False
 def adapt_batch(batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -112,6 +143,56 @@ def _get_current_lr(optimizer: optim.Optimizer) -> float:
         return float(optimizer.param_groups[0].get("lr", 0.0))
     except Exception:
         return 0.0
+
+# --- Scheduler helpers (support warmup + non-plateau schedulers) ---
+def _compute_warmup_steps(max_steps: int, warmup_steps: int = 0, warmup_ratio: float = 0.0) -> int:
+    try:
+        if warmup_steps and warmup_steps > 0:
+            return int(warmup_steps)
+        if warmup_ratio and warmup_ratio > 0.0:
+            return max(0, int(float(max_steps) * float(warmup_ratio)))
+    except Exception:
+        pass
+    return 0
+
+def _build_lambda_scheduler(optimizer: optim.Optimizer, kind: str, max_steps: int, warmup_steps: int) -> optim.lr_scheduler.LambdaLR:
+    import math
+    kind = str(kind).lower()
+    def lr_lambda(step: int) -> float:
+        s = int(step)
+        if warmup_steps > 0 and s < warmup_steps:
+            return float(s) / float(max(1, warmup_steps))
+        progress = (s - warmup_steps) / float(max(1, max_steps - warmup_steps))
+        progress = max(0.0, min(1.0, progress))
+        if kind == 'linear':
+            return max(0.0, 1.0 - progress)
+        if kind == 'cosine':
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        # none: constant after warmup
+        return 1.0
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+class _SchedAdapter:
+    """Adapter that lets us call step(metric) for Plateau and step() for LambdaLR transparently."""
+    def __init__(self, scheduler, plateau: bool):
+        self.scheduler = scheduler
+        self.is_plateau = bool(plateau)
+    def step(self, metric: float = None):
+        try:
+            if self.is_plateau:
+                if metric is None:
+                    # Fallback when metric not provided
+                    self.scheduler.step(0.0)
+                else:
+                    self.scheduler.step(metric)
+            else:
+                self.scheduler.step()
+        except Exception:
+            # Be forgiving if the underlying scheduler signature differs
+            try:
+                self.scheduler.step()
+            except Exception:
+                pass
 
 def _use_fp16_for_hcut(args, mode: str) -> bool:
     """Decide wire precision for h_cut payloads.
@@ -436,7 +517,12 @@ class ServerKVOnly(nn.Module):
     def __init__(self, model_name, cut_layer, num_prefix=10):
         super().__init__()
         # load config to size params correctly
-        tmp = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        tmp = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map=None,
+            **_hf_auth_kwargs(),
+        )
         self.total_layers = tmp.config.num_hidden_layers
         self.cut_layer = cut_layer
         self.kv = PrefixKV(tmp.config, list(range(0, cut_layer)), num_prefix=num_prefix, device=tmp.device)
@@ -456,7 +542,8 @@ class ServerKVOnly(nn.Module):
         base = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float32,
-            device_map=None
+            device_map=None,
+            **_hf_auth_kwargs(),
         )
         dec = base.model.decoder
         # keep only [0..cut_layer-1]
@@ -473,7 +560,7 @@ class ServerKVOnly(nn.Module):
 def safe_get_hf_tokenizer(model_name):
     """Safe tokenizer loading with error handling"""
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **_hf_auth_kwargs())
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
@@ -487,7 +574,10 @@ class FullLLMModel(nn.Module):
     def __init__(self, model_name, cut_layer, num_prefix=5):
         super(FullLLMModel, self).__init__()
         self.base_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32, device_map=None
+            model_name,
+            torch_dtype=torch.float32,
+            device_map=None,
+            **_hf_auth_kwargs(),
         )
         self.total_layers = self.base_model.config.num_hidden_layers
         self.cut_layer    = int(cut_layer)
@@ -753,11 +843,13 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
 
     with torch.no_grad():
         # Try to refresh prefix-aware eval when split context is available
+        # IMPORTANT: In LoRA mode, we unify evaluation by assembling a combined full model
+        # (server LoRA + client LoRA) locally and using that exclusively for metrics.
         split_eval = False
         if server_model is not None and trainer is not None:
             if getattr(args, 'tuning', 'prefix') == 'lora':
-                # In LoRA mode, use split pipeline (no prefix handshake needed)
-                split_eval = True
+                # Explicitly avoid split-eval path for LoRA to prevent mixing eval modes
+                split_eval = False
             else:
                 _refreshed = _refresh_eval_prefixes(model, server_model, trainer, args)
                 if not _refreshed:
@@ -770,11 +862,17 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                 input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
                 input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
 
-                # LoRA eval: combine server+client LoRA on a fresh full model and evaluate locally
-                if split_eval and getattr(args, 'tuning', 'prefix') == 'lora':
+                # LoRA eval: always combine server+client LoRA on a fresh full model and evaluate locally
+                if getattr(args, 'tuning', 'prefix') == 'lora':
                     try:
                         # 1) Build a fresh full model
-                        full_eval = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map=None).to(device)
+                        # Honor eval_on_cpu explicitly for combined LoRA eval to avoid GPU OOM
+                        dev_for_combined = (torch.device('cpu') if (bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora') else device)
+                        full_eval = AutoModelForCausalLM.from_pretrained(
+                            args.model_name,
+                            torch_dtype=torch.float32,
+                            device_map=None
+                        ).to(dev_for_combined)
                         for p in full_eval.parameters():
                             p.requires_grad = False
 
@@ -797,9 +895,12 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                         else:
                             print("⚠️ Could not fetch client LoRA state; proceeding with server half only")
 
-                        # 5) Compute outputs and metrics locally on combined model
-                        outputs = full_eval(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                        loss, answer_acc, f1, em = calculate_squad_metrics(outputs, labels, batch, tokenizer, full_eval, device)
+                        # 5) Compute outputs and metrics locally on combined model (ensure tensors on same device)
+                        ii = input_ids.to(dev_for_combined)
+                        am = attention_mask.to(dev_for_combined) if attention_mask is not None else None
+                        lb = labels.to(dev_for_combined) if labels is not None else None
+                        outputs = full_eval(input_ids=ii, attention_mask=am, labels=lb)
+                        loss, answer_acc, f1, em = calculate_squad_metrics(outputs, lb if lb is not None else labels, batch, tokenizer, full_eval, dev_for_combined)
 
                         total_loss += loss
                         total_answer_accuracy += answer_acc
@@ -808,6 +909,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                         num_batches += 1
                         if batch_idx < 3:
                             print(f"\nBatch {batch_idx}: Loss={loss:.4f}, Acc={answer_acc:.6f}, F1={f1:.6f}, EM={em:.6f}")
+                        # Use combined-model outputs for metrics and continue to next batch
                         continue
                     except Exception as e:
                         print(f"⚠️ Combined LoRA eval failed, falling back to client eval path: {e}")
@@ -944,7 +1046,8 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
         perturbation_scale=args.mu,
         sample_count=args.num_pert,
         compute_device=device,
-        data_type=torch.float32
+        data_type=torch.float32,
+        estimator_type=str(getattr(args, 'estimator', 'central'))
     )
 
     server_model.train()
@@ -960,6 +1063,7 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
     accum_counter = 0
 
     try:
+        is_plateau_sched = (str(getattr(args, 'scheduler', 'plateau')).lower() == 'plateau')
         pbar = tqdm(total=args.max_steps, desc="Training (ZOO)",
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] Loss: {postfix}')
 
@@ -1144,6 +1248,11 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                             accum_buffers = [None] * len(server_params)
                             accum_counter = 0
                             stepped_this_iter = True
+                            if not is_plateau_sched:
+                                try:
+                                    scheduler.step()
+                                except Exception:
+                                    pass
                         else:
                             # Skip optimizer step this iteration
                             stepped_this_iter = False
@@ -1162,6 +1271,11 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                             pass
                         optimizer.step()
                         stepped_this_iter = True
+                        if not is_plateau_sched:
+                            try:
+                                scheduler.step()
+                            except Exception:
+                                pass
 
                     # Optional: trigger a small client-side SGD update with cadence
                     try:
@@ -1201,8 +1315,8 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     pbar.set_description(f"Training (ZOO) | Loss: {cur_loss:.4f} | Acc: {cur_acc:.6f}")
                     pbar.update(1)
 
-                    # Periodically step LR scheduler on a smoothed ZOO objective (fallback when eval is infrequent)
-                    if global_step > 0 and (global_step % 200 == 0):
+                    # Periodically step LR scheduler on a smoothed ZOO objective (Plateau only)
+                    if is_plateau_sched and global_step > 0 and (global_step % 200 == 0):
                         try:
                             smooth_loss = sum(losses[-50:]) / min(len(losses), 50)
                             scheduler.step(float(smooth_loss))
@@ -1231,25 +1345,33 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     # periodic eval (uses the safe FullLLMModel)
                     if global_step % args.eval_steps == 0:
                         print(f"\nStep {global_step}: Running ZOO evaluation...")
-                        # eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
-                        #     full_model, eval_loader, device, tokenizer, args
-                        # )
-                        eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
-                            full_model, eval_loader, device, tokenizer, args,
-                            server_model=server_model, trainer=trainer
-                        )
+                        _moved = False
+                        _eval_device = device
+                        try:
+                            if bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora':
+                                full_model.to(torch.device('cpu'))
+                                _eval_device = torch.device('cpu')
+                                _moved = True
+                            eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
+                                full_model, eval_loader, _eval_device, tokenizer, args,
+                                server_model=server_model, trainer=trainer
+                            )
+                        finally:
+                            if _moved:
+                                full_model.to(device)
                         print(f".  Step {global_step} ZOO Evaluation:")
                         print(f"   Loss: {eval_loss:.4f}")
                         print(f"   Answer Accuracy: {eval_acc:.6f}")
                         print(f"   F1 Score: {eval_f1:.6f}")
                         print(f"   Exact Match: {eval_em:.6f}")
-                        # Step LR scheduler on eval metric when available
-                        try:
-                            if bool(getattr(args, 'sched_step_on_eval', False)):
-                                scheduler.step(float(eval_loss))
-                                print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
-                        except Exception:
-                            pass
+                        # Step LR scheduler on eval metric when available (Plateau only)
+                        if is_plateau_sched:
+                            try:
+                                if bool(getattr(args, 'sched_step_on_eval', False)):
+                                    scheduler.step(float(eval_loss))
+                                    print(f"[LR] Plateau step on eval (ZOO) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                            except Exception:
+                                pass
                         server_model.train()
 
                 except Exception as e:
@@ -1258,17 +1380,18 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     continue
 
         pbar.close()
-        # Step LR scheduler using latest eval loss if available
-        try:
-            scheduler.step(eval_loss)
-            print(f"[LR] Final plateau step (ZOO) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
-        except Exception:
+        # Final scheduler step behavior
+        if is_plateau_sched:
             try:
-                last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
-                scheduler.step(last_loss)
-                print(f"[LR] Final plateau step (ZOO) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                scheduler.step(eval_loss)
+                print(f"[LR] Final plateau step (ZOO) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
             except Exception:
-                pass
+                try:
+                    last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
+                    scheduler.step(last_loss)
+                    print(f"[LR] Final plateau step (ZOO) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                except Exception:
+                    pass
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
         avg_acc  = sum(accs) / len(accs) if accs else 0.0
@@ -1297,6 +1420,8 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
     global_step = 0
     
     try:
+        is_plateau_sched = (str(getattr(args, 'scheduler', 'plateau')).lower() == 'plateau')
+        accum_steps = max(1, int(getattr(args, 'sgd_accum_steps', 1)))
         pbar = tqdm(total=args.max_steps, desc="Training (SGD)", 
                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] Loss: {postfix}')
         
@@ -1314,7 +1439,7 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     attention_mask = batch['attention_mask'].to(device)
                     # labels = batch['labels'].to(device)
                     
-                    optimizer.zero_grad()
+                    # Note: zeroing is handled before accumulate or on step boundaries
                     # Prefer dataset-provided labels (answer-only), fallback to pad-masked copy
                     labels = batch.get('labels', None)
                     if isinstance(labels, torch.Tensor):
@@ -1357,21 +1482,29 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         raise RuntimeError(f"g_cut shape {tuple(g_cut.shape)} != h_cut {tuple(h_cut_live.shape)}")
                     g_cut = g_cut.to(device=h_cut_live.device, dtype=h_cut_live.dtype)
 
-                    optimizer.zero_grad(set_to_none=True)
+                    # Accumulation-aware backward and step
+                    if (global_step % accum_steps) == 0:
+                        optimizer.zero_grad(set_to_none=True)
                     h_cut_live.backward(g_cut)
-                    # Optional gradient clipping for stability
-                    try:
-                        if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
-                            params_to_clip = []
-                            for group in optimizer.param_groups:
-                                for p in group.get('params', []):
-                                    if p.grad is not None:
-                                        params_to_clip.append(p)
-                            if params_to_clip:
-                                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
-                    except Exception:
-                        pass
-                    optimizer.step()
+                    do_step = ((global_step + 1) % accum_steps) == 0
+                    if do_step:
+                        try:
+                            if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                                params_to_clip = []
+                                for group in optimizer.param_groups:
+                                    for p in group.get('params', []):
+                                        if p.grad is not None:
+                                            params_to_clip.append(p)
+                                if params_to_clip:
+                                    torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                        except Exception:
+                            pass
+                        optimizer.step()
+                        if not is_plateau_sched:
+                            try:
+                                scheduler.step()
+                            except Exception:
+                                pass
 
                     # Calculate accuracy for monitoring using full model
                     with torch.no_grad():
@@ -1388,8 +1521,8 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     pbar.set_description(f"Training (SGD) | Loss: {current_loss:.4f} | Acc: {current_acc:.3f}")
                     pbar.update(1)
                     
-                    # Periodically step LR scheduler on a smoothed training loss (fallback when eval is infrequent)
-                    if global_step > 0 and (global_step % 200 == 0):
+                    # Periodically step LR scheduler on a smoothed training loss (Plateau only)
+                    if is_plateau_sched and global_step > 0 and (global_step % 200 == 0):
                         try:
                             smooth_loss = sum(losses[-50:]) / min(len(losses), 50)
                             scheduler.step(float(smooth_loss))
@@ -1405,10 +1538,20 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
 
                     if global_step % args.eval_steps == 0:
                         print(f"\nStep {global_step}: Running evaluation...")
-                        eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
-                            full_model, eval_loader, device, tokenizer, args,
-                            server_model=server_model, trainer=trainer
-                        )
+                        _moved = False
+                        _eval_device = device
+                        try:
+                            if bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora':
+                                full_model.to(torch.device('cpu'))
+                                _eval_device = torch.device('cpu')
+                                _moved = True
+                            eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
+                                full_model, eval_loader, _eval_device, tokenizer, args,
+                                server_model=server_model, trainer=trainer
+                            )
+                        finally:
+                            if _moved:
+                                full_model.to(device)
 
                         print(f"   Step {global_step} Evaluation:")
                         print(f"   Loss: {eval_loss:.4f}")
@@ -1419,12 +1562,13 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         # Return to training mode
                         server_model.train()
 
-                        # Step LR scheduler on evaluation loss immediately
-                        try:
-                            scheduler.step(float(eval_loss))
-                            print(f"[LR] Plateau step on eval (SGD) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
-                        except Exception:
-                            pass
+                        # Step LR scheduler on evaluation loss immediately (Plateau only)
+                        if is_plateau_sched:
+                            try:
+                                scheduler.step(float(eval_loss))
+                                print(f"[LR] Plateau step on eval (SGD) @ step {global_step}: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                            except Exception:
+                                pass
 
                     # Print progress every 100 steps
                     if global_step % 100 == 0:
@@ -1437,16 +1581,17 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     print(f"Batch {global_step} Error: {e}")
                     continue
         
-        try:
-            scheduler.step(eval_loss)
-            print(f"[LR] Final plateau step (SGD) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
-        except Exception:
+        if is_plateau_sched:
             try:
-                last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
-                scheduler.step(last_loss)
-                print(f"[LR] Final plateau step (SGD) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                scheduler.step(eval_loss)
+                print(f"[LR] Final plateau step (SGD) on eval: metric={eval_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
             except Exception:
-                pass
+                try:
+                    last_loss = sum(losses[-100:]) / min(len(losses), 100) if losses else 0.0
+                    scheduler.step(last_loss)
+                    print(f"[LR] Final plateau step (SGD) on train MA: metric={last_loss:.4f}, lr={_get_current_lr(optimizer):.6g}")
+                except Exception:
+                    pass
         
         avg_loss = sum(losses) / len(losses) if losses else 0.0
         avg_acc = sum(accs) / len(accs) if accs else 0.0
@@ -1474,19 +1619,24 @@ def parse_args():
     parser.add_argument('--zoo_lr', type=float, default=5e-4, help='ZOO learning rate')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate') 
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
     parser.add_argument('--clip_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
 
     # Dataset sizes - NEW ARGUMENTS
-    parser.add_argument('--train_examples', type=int, default=1000, help='Number of training examples')  # TRAIN=1000
-    parser.add_argument('--dev_examples', type=int, default=500, help='Number of dev examples')  # DEV=500
-    parser.add_argument('--eval_examples', type=int, default=1000, help='Number of eval examples')  # EVAL=1000
+    parser.add_argument('--train_examples', type=int, default=None, help='Number of training examples (None => full dataset)')
+    parser.add_argument('--dev_examples', type=int, default=None, help='Number of dev examples (None => full dataset)')
+    parser.add_argument('--eval_examples', type=int, default=None, help='Number of eval examples (None => full dataset)')
     
     # Training steps - NEW ARGUMENTS
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')  # STEPS=4000
     parser.add_argument('--eval_steps', type=int, default=4000, help='Evaluate every N steps')  # EVAL_STEPS=4000
+    parser.add_argument('--scheduler', type=str, choices=['plateau','linear','cosine'], default='plateau', help='LR scheduler type')
+    parser.add_argument('--warmup_steps', type=int, default=0, help='Number of warmup steps (overrides ratio if > 0)')
+    parser.add_argument('--warmup_ratio', type=float, default=0.0, help='Warmup steps as a fraction of max_steps (used if warmup_steps==0)')
+    parser.add_argument('--sgd_accum_steps', type=int, default=1, help='Gradient accumulation steps for SGD server path')
     parser.add_argument('--sched_factor', type=float, default=0.5, help='LR scheduler reduce factor')
     parser.add_argument('--sched_patience', type=int, default=6, help='LR scheduler patience')
     parser.add_argument('--sched_threshold', type=float, default=1e-2, help='LR scheduler threshold')
@@ -1497,6 +1647,7 @@ def parse_args():
     # ZOO parameters
     parser.add_argument('--mu', type=float, default=5e-4, help='ZOO perturbation scale (base, will be RMS-scaled)')
     parser.add_argument('--num_pert', type=int, default=64, help='ZOO perturbations (antithetic pairs internally)')
+    parser.add_argument('--estimator', type=str, choices=['central','forward'], default='central', help='Finite-diff estimator type for ZOO/g_cut')
     parser.add_argument('--use_zeroth_order', action='store_true', help='Use ZOO for server')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
     parser.add_argument('--zoo_momentum', type=float, default=0.5, help='Momentum for ZOO optimizer updates (0 disables)')
@@ -1538,6 +1689,8 @@ def parse_args():
                         help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
     # Control whether to step LR scheduler on eval loss for ZOO (default off)
     parser.add_argument('--sched_step_on_eval', action='store_true', help='Also step LR scheduler on eval loss (ZOO)')
+    # Evaluation device control
+    parser.add_argument('--eval_on_cpu', action='store_true', help='Run evaluation on CPU to reduce GPU memory usage')
     
     args = parser.parse_args()
     # Safety: forbid forcing fp16 on wire when using any ZOO (server or client)
@@ -1549,7 +1702,10 @@ if __name__ == "__main__":
     try:
         print("STARTING ENHANCED SPLIT LEARNING SERVER")
         print("=" * 60)
-        
+
+        # Attempt Hugging Face login early to avoid rate limits when loading hub assets
+        try_hf_login()
+
         args = parse_args()
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
@@ -1628,33 +1784,63 @@ if __name__ == "__main__":
         if args.use_zeroth_order:
             # ZOO: allow small momentum for incremental updates
             zoo_mom = float(getattr(args, 'zoo_momentum', 0.0))
-            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=zoo_mom)
+            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=zoo_mom, weight_decay=args.weight_decay)
         else:
-            # Regular SGD can use lower learning rate with momentum
-            optimizer = optim.SGD(trainable_params, lr=args.lr, momentum=args.momentum)
-        
-        
-        try:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=args.sched_factor,
-                patience=args.sched_patience,
-                threshold=args.sched_threshold,
-                threshold_mode=args.sched_threshold_mode,
-                cooldown=args.sched_cooldown,
-                min_lr=args.sched_min_lr,
-                verbose=True,
+            # Regular optimizer path: SGD only
+            optimizer = optim.SGD(
+                trainable_params,
+                lr=args.lr,
+                momentum=args.momentum,
+                weight_decay=args.weight_decay,
             )
-        except TypeError:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=args.sched_factor,
-                patience=args.sched_patience,
-                threshold=args.sched_threshold,
-            )
-        print("✅ Optimizer ready (ReduceLROnPlateau)")
+
+        # Scheduler selection
+        if getattr(args, 'scheduler', 'plateau') == 'plateau':
+            try:
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',
+                    factor=args.sched_factor,
+                    patience=args.sched_patience,
+                    threshold=args.sched_threshold,
+                    threshold_mode=args.sched_threshold_mode,
+                    cooldown=args.sched_cooldown,
+                    min_lr=args.sched_min_lr,
+                    verbose=True,
+                )
+            except TypeError:
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',
+                    factor=args.sched_factor,
+                    patience=args.sched_patience,
+                    threshold=args.sched_threshold,
+                )
+            print("✅ Optimizer ready (Plateau scheduler)")
+        else:
+            total_steps = max(1, int(args.max_steps))
+            warmup_steps = int(args.warmup_steps) if int(args.warmup_steps) > 0 else int(float(args.warmup_ratio) * float(total_steps))
+            warmup_steps = max(0, warmup_steps)
+
+            if args.scheduler == 'linear':
+                def lr_lambda(current_step: int):
+                    if warmup_steps > 0 and current_step < warmup_steps:
+                        return float(current_step) / float(max(1, warmup_steps))
+                    progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                    return max(0.0, 1.0 - progress)
+            elif args.scheduler == 'cosine':
+                import math
+                def lr_lambda(current_step: int):
+                    if warmup_steps > 0 and current_step < warmup_steps:
+                        return float(current_step) / float(max(1, warmup_steps))
+                    progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+            else:
+                def lr_lambda(current_step: int):
+                    return 1.0
+
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+            print(f"✅ Optimizer ready ({args.scheduler} scheduler, warmup_steps={warmup_steps})")
         try:
             print(f"  Initial LR: {_get_current_lr(optimizer):.6g}")
         except Exception:
@@ -1720,9 +1906,19 @@ if __name__ == "__main__":
                 
         # Final evaluation
         print("\nFinal model evaluation...")
-        final_loss, final_acc, final_f1, final_em = evaluate_model(
-            full_model, eval_loader, device, tokenizer, args, server_model=server_model, trainer=trainer
-        )
+        _moved = False
+        _eval_device = device
+        try:
+            if bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora':
+                full_model.to(torch.device('cpu'))
+                _eval_device = torch.device('cpu')
+                _moved = True
+            final_loss, final_acc, final_f1, final_em = evaluate_model(
+                full_model, eval_loader, _eval_device, tokenizer, args, server_model=server_model, trainer=trainer
+            )
+        finally:
+            if _moved:
+                full_model.to(device)
         # now signal completion (non-fatal if client already closed)
         try:
             trainer.send_data({'type': 'training_complete'})
