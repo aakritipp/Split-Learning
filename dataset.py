@@ -6,6 +6,63 @@ import json
 import re
 from collections import Counter
 import string
+import os
+import time
+
+def _get_hf_token_from_env():
+    """Return a Hugging Face token from common environment variables if present."""
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_API_TOKEN")
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+    if token:
+        token = token.strip()
+    return token or None
+
+def safe_load_dataset(*args, **kwargs):
+    """
+    Wrapper around datasets.load_dataset that:
+      - passes HF auth token if available
+      - retries with exponential backoff on 429 Too Many Requests
+      - falls back to offline/cache mode if network continually fails
+    """
+    token = _get_hf_token_from_env()
+    extra_kwargs = {}
+    try:
+        # Add conservative retry policy at the download-manager level as well
+        from datasets import DownloadConfig  # re-exported by datasets
+        if token:
+            extra_kwargs["download_config"] = DownloadConfig(max_retries=5, token=token)
+        else:
+            extra_kwargs["download_config"] = DownloadConfig(max_retries=5)
+    except Exception:
+        pass
+
+    last_exception = None
+    backoff_seconds = 1.0
+    for _ in range(5):
+        try:
+            return load_dataset(*args, **{**kwargs, **extra_kwargs})
+        except Exception as e:
+            last_exception = e
+            message = str(e)
+            if ("429" in message) or ("Too Many Requests" in message):
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(60.0, backoff_seconds * 2.0)
+                continue
+            break
+
+    # Offline fallback: reuse local cache if available
+    try:
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        return load_dataset(*args, **{**kwargs, **extra_kwargs})
+    except Exception:
+        # Re-raise the original exception for clarity
+        if last_exception is not None:
+            raise last_exception
+        raise
 
 class SQuADDataset(Dataset):
     """SQUAD dataset with consistent output structure"""
@@ -157,40 +214,40 @@ class MultiTaskDataset(Dataset):
         
         if task == 'squad':
             # Use existing SQuAD logic - don't change!
-            dataset = load_dataset('squad', split=split)
+            dataset = safe_load_dataset('squad', split=split)
         elif task == 'drop':
-            dataset = load_dataset('drop', split=split)
+            dataset = safe_load_dataset('drop', split=split)
         elif task == 'xsum':
             # Fix XSum dataset loading to follow reference pattern
             try:
                 # Try the standard XSum dataset first
-                dataset = load_dataset('EdinburghNLP/xsum', split=split)
+                dataset = safe_load_dataset('EdinburghNLP/xsum', split=split)
             except:
                 try:
                     # Try alternative XSum loading
-                    dataset = load_dataset('xsum', split=split)
+                    dataset = safe_load_dataset('xsum', split=split)
                 except:
                     # Last resort: try CNN/DailyMail
                     alt_split = 'validation' if split == 'validation' else ('train' if split == 'train' else 'test')
-                    dataset = load_dataset('cnn_dailymail', '3.0.0', split=alt_split)
+                    dataset = safe_load_dataset('cnn_dailymail', '3.0.0', split=alt_split)
         elif task == 'sst2':
-            dataset = load_dataset('glue', 'sst2', split='train' if split == 'train' else 'validation')
+            dataset = safe_load_dataset('glue', 'sst2', split='train' if split == 'train' else 'validation')
         elif task == 'boolq':
-            dataset = load_dataset('boolq', split=split)
+            dataset = safe_load_dataset('boolq', split=split)
         elif task == 'copa':
-            dataset = load_dataset('super_glue', 'copa', split=split)
+            dataset = safe_load_dataset('super_glue', 'copa', split=split)
         elif task == 'multirc':
-            dataset = load_dataset('super_glue', 'multirc', split=split)
+            dataset = safe_load_dataset('super_glue', 'multirc', split=split)
         elif task == 'cb':
-            dataset = load_dataset('super_glue', 'cb', split=split)
+            dataset = safe_load_dataset('super_glue', 'cb', split=split)
         elif task == 'wic':
-            dataset = load_dataset('super_glue', 'wic', split=split)
+            dataset = safe_load_dataset('super_glue', 'wic', split=split)
         elif task == 'wsc':
-            dataset = load_dataset('super_glue', 'wsc.fixed', split=split)
+            dataset = safe_load_dataset('super_glue', 'wsc.fixed', split=split)
         elif task == 'record':
-            dataset = load_dataset('super_glue', 'record', split=split)
+            dataset = safe_load_dataset('super_glue', 'record', split=split)
         elif task == 'rte':
-            dataset = load_dataset('super_glue', 'rte', split=split)
+            dataset = safe_load_dataset('super_glue', 'rte', split=split)
         else:
             raise ValueError(f"Task {task} not supported")
         
@@ -482,10 +539,10 @@ class MultiTaskDataset(Dataset):
         elif task == 'rte':
             premise = example.get('premise', '')
             hypothesis = example.get('hypothesis', '')
-            label = int(example.get('label', 0))
-            answer = 'Yes' if label == 0 else 'No'
+            label = int(example.get('label', 0))  # 0=entailment, 1=not_entailment
+            answer = 'Entailment' if label == 0 else 'Not Entailment'
             formatted_text = (
-                f"Context: {premise}\nQuestion: Does this mean that \"{hypothesis}\" is true?\nAnswer: {answer}"
+                f"Context: {premise}\nQuestion: Is it entailed that \"{hypothesis}\"?\nAnswer: {answer}"
             )
             return {
                 'text': formatted_text,
@@ -596,7 +653,7 @@ class MultiTaskDataset(Dataset):
             'original_example': example['original_example']
         }
 
-        # Provide a discrete class label for classification tasks like SST-2
+        # Provide a discrete class label for classification tasks
         if self.task == 'sst2':
             # Prefer explicit label if present; else infer from answer word
             label = example.get('label', None)
@@ -604,6 +661,17 @@ class MultiTaskDataset(Dataset):
                 ans = str(example.get('answer', '')).strip().lower()
                 label = 1 if ans == 'great' else 0
             item['class_label'] = int(label)
+        elif self.task in ('boolq', 'wic', 'wsc', 'multirc'):
+            # Binary Yes/No style tasks -> map Yes=>1, No=>0
+            ans_text = str(example.get('answer', '')).strip().lower()
+            item['class_label'] = 1 if ans_text.startswith('y') else 0
+        elif self.task == 'rte':
+            # Entailment vs Not Entailment -> map Entailment=>1, Not Entailment=>0
+            ans_text = str(example.get('answer', '')).strip().lower()
+            if ans_text.startswith('entail'):
+                item['class_label'] = 1
+            else:
+                item['class_label'] = 0
 
         return item
 
@@ -679,7 +747,7 @@ def get_squad_dataloaders(args, tokenizer):
         from datasets import load_dataset
         
         # Load SQUAD dataset
-        dataset = load_dataset('squad')
+        dataset = safe_load_dataset('squad')
         
         # Use the specified sizes
         train_size = min(args.train_examples, len(dataset['train']))
@@ -749,18 +817,31 @@ def get_squad_dataloaders(args, tokenizer):
 
 # NEW: Enhanced dataloader function that maintains backward compatibility
 def get_enhanced_dataloaders(task='squad', tokenizer=None, train_batch_size=2, test_batch_size=2, 
-                           max_length=512, num_train_examples=1000, num_eval_examples=200):
+                           max_length=512, num_train_examples=None, num_eval_examples=None):
     """
     Enhanced version that supports multiple tasks but maintains SQuAD compatibility
     """
     if task == 'squad':
-        # Use your existing working SQuAD logic
-        train_dataset = SQuADDataset('train', tokenizer, max_length, num_train_examples)
-        test_dataset = SQuADDataset('validation', tokenizer, max_length, num_eval_examples)
+        # Use your existing working SQuAD logic; None => use full dataset
+        # Prefer test split for evaluation; fallback to validation if test isn't available in cache
+        train_dataset = MultiTaskDataset('squad', 'train', tokenizer, max_length, num_train_examples)
+        try:
+            test_dataset = MultiTaskDataset('squad', 'test', tokenizer, max_length, num_eval_examples)
+        except Exception:
+            test_dataset = MultiTaskDataset('squad', 'validation', tokenizer, max_length, num_eval_examples)
     else:
-        # Use new multi-task dataset for other tasks
+        # Use new multi-task dataset for other tasks; None => use full dataset
         train_dataset = MultiTaskDataset(task, 'train', tokenizer, max_length, num_train_examples)
-        test_dataset = MultiTaskDataset(task, 'validation', tokenizer, max_length, num_eval_examples)
+        # Many SuperGLUE tasks hide test labels; evaluate on validation instead
+        tasks_withheld_test = {'wic','rte','cb','boolq','multirc','wsc','copa','record'}
+        if task in tasks_withheld_test:
+            test_dataset = MultiTaskDataset(task, 'validation', tokenizer, max_length, num_eval_examples)
+        else:
+            # Prefer test split for evaluation when labels are available
+            try:
+                test_dataset = MultiTaskDataset(task, 'test', tokenizer, max_length, num_eval_examples)
+            except Exception:
+                test_dataset = MultiTaskDataset(task, 'validation', tokenizer, max_length, num_eval_examples)
     
     # Use your existing collate function
     def squad_collate_fn(batch):
