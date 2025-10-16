@@ -106,4 +106,4 @@ def load_grad_state_into(prefix_kv: "PrefixKV", grad_state: dict, device=None):
                 raise ValueError(f"v grad shape mismatch: got {tuple(gv.shape)} expected {tuple(prefix_kv.v.shape)}")
             prefix_kv.v.grad = gv.clone()
         else:
-            prefix_kv.v.grad = torch.zeros_like(prefix_kv.v, device=device)
+            prefix_kv.v.grad = torch.zeros_like(prefix_kv.v, device=device
