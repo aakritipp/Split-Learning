@@ -1,15 +1,15 @@
 #!/bin/bash -l
 #SBATCH --job-name=mezo_splitlearning
 #SBATCH --account=fl-het
-#SBATCH --partition=debug
+#SBATCH --partition=tier3
 #SBATCH --gres=gpu:a100:1
-#SBATCH --output=cb_prefix_ZOO_SGD/%x_%j.out
-#SBATCH --error=cb_prefix_ZOO_SGD/%x_%j.err
-#SBATCH --time=0-02:00:00
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+#SBATCH --time=0-04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32g
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=80g
 
 echo "Starting Split Learning Job"
 echo "================================"
@@ -26,7 +26,6 @@ conda activate mezo
 # module load cuda/11.7
 
 echo "All required files present"
-
 
 # Optional CLI overrides (e.g., --task cb --train 250 --dev 56 --eval 56)
 while (( "$#" )); do
@@ -47,9 +46,27 @@ while (( "$#" )); do
         --num-pert) NUM_PERT="$2"; shift 2;;
         --seed) SEED="$2"; shift 2;;
         --model|--model_name) MODEL_NAME="$2"; shift 2;;
+        # New overrides
+        --weight-decay|--weight_decay) WEIGHT_DECAY="$2"; shift 2;;
+        --scheduler) SCHEDULER="$2"; shift 2;;
+        --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2;;
+        --warmup-ratio|--warmup_ratio) WARMUP_RATIO="$2"; shift 2;;
+        --sgd-accum|--sgd_accum_steps) SGD_ACCUM_STEPS="$2"; shift 2;;
+        --client_sgd_warmup_steps) CLIENT_SGD_WARMUP_STEPS="$2"; shift 2;;
+        --client_sgd_every) CLIENT_SGD_EVERY="$2"; shift 2;;
+        # ZOO + scheduler fine-tuning
+        --zoo-momentum|--zoo_momentum) ZOO_MOMENTUM="$2"; shift 2;;
+        --zoo-accum|--zoo_accum_steps) ZOO_ACCUM_STEPS="$2"; shift 2;;
+        --sched-factor|--sched_factor) SCHED_FACTOR="$2"; shift 2;;
+        --sched-patience|--sched_patience) SCHED_PATIENCE="$2"; shift 2;;
+        --sched-threshold|--sched_threshold) SCHED_THRESHOLD="$2"; shift 2;;
+        --sched-threshold-mode|--sched_threshold_mode) SCHED_THRESHOLD_MODE="$2"; shift 2;;
+        --sched-cooldown|--sched_cooldown) SCHED_COOLDOWN="$2"; shift 2;;
+        --sched-min-lr|--sched_min_lr) SCHED_MIN_LR="$2"; shift 2;;
         *) break;;
     esac
 done
+
 
 # Network settings: choose a unique free port per job
 HOST="127.0.0.1"
@@ -73,84 +90,94 @@ done
 
 echo "Using host $HOST and port $PORT"
 
-# MODEL_NAME="facebook/opt-125m"
-# EPOCHS=1
-# BATCH_SIZE=16  # Small for testing
-# MAX_LENGTH=512  # Short for speed
-# LR=1e-3
-# ZOO_LR=1e-2
-# EPS=1e-1        # ZOO epsilon (perturbation scale)
-# SEED=0          # Random seed
 # Defaults (can be overridden above/by CLI)
-TRAIN=${TRAIN:-1000}      # Training examples
-DEV=${DEV:-500}           # Dev examples
-EVAL=${EVAL:-1000}        # Evaluation examples
-STEPS=${STEPS:-4000}      # Training steps
-EVAL_STEPS=${EVAL_STEPS:-1000} # Evaluation steps
-# NUM_PERT=5
+# TRAIN=${TRAIN:-1000}      # Training examples
+# DEV=${DEV:-500}           # Dev examples
+# EVAL=${EVAL:-1000}        # Evaluation examples
+# STEPS=${STEPS:-3000}      # Training steps
+# EVAL_STEPS=${EVAL_STEPS:-50} # Evaluation steps
+STEPS=${STEPS:-2000}      # Training steps
+EVAL_STEPS=${EVAL_STEPS:-25} # Evaluation steps
+
 
 MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"
 EPOCHS=${EPOCHS:-1}
-BATCH_SIZE=${BATCH_SIZE:-16}        # Smaller for stability
-MAX_LENGTH=${MAX_LENGTH:-512}      # Reduced
-# LR=5e-4             # SGD learning rate
-# ZOO_LR=5e-4         # ZOO learning rate (reduced)
-# EPS=1e-3            # Smaller perturbation scale
-SEED=${SEED:-42}
-# Task-specific sane defaults (CB is tiny)
+BATCH_SIZE=${BATCH_SIZE:-32}        # SST-2 uses 32 in prior run
+# Reduce eval batch and context length to avoid OOM on BoolQ LoRA
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-32}
+MAX_LENGTH=${MAX_LENGTH:-512}      # Reduced from 512 to cut KV/cache size
+SEED=${SEED:-365}
+# Task-specific sane defaults
 TASK="${TASK:-sst2}"
-TUNING="${TUNING:-prefix}"
-# If CB and sizes not provided, pick CB-appropriate sizes
-if [ "$TASK" = "cb" ]; then
-    TRAIN=${TRAIN:-250}
-    DEV=${DEV:-56}
-    EVAL=${EVAL:-56}
-fi
+TUNING="${TUNING:-lora}"
+OPT="ZOO_SGD"
 
-# Steps and eval cadence
-STEPS=${STEPS:-4000}
-EVAL_STEPS=${EVAL_STEPS:-500}
+# Create per-run log directory based on dataset and tuning, and redirect stdout/stderr
+LOG_DIR="${TASK}_${TUNING}_${OPT}"
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_DIR/${SLURM_JOB_NAME:-split_learning}_${SLURM_JOB_ID:-$$}.out") 2> >(tee -a "$LOG_DIR/${SLURM_JOB_NAME:-split_learning}_${SLURM_JOB_ID:-$$}.err" >&2)
 
 # ZOO/optimization knobs
-NUM_PERT=${NUM_PERT:-10}         # More perturbations for better ZOO signal
-NUM_PREFIX=${NUM_PREFIX:-10}
-LR=${LR:-1e-3}          # Client SGD lr (stability)
-ZOO_LR=${ZOO_LR:-5e-4}  # Server ZOO lr (apply FD grads)
-EPS=${EPS:-5e-4}        # ZOO perturbation scale (finite-diff mu base; RMS-scaled)
+# NUM_PERT=${NUM_PERT:-10}
+# NUM_PREFIX=${NUM_PREFIX:-20}
+# LR=${LR:-1e-3}
+# ZOO_LR=${ZOO_LR:-5e-4}
+# EPS=${EPS:-5e-4}
+# LORA_R=${LORA_R:-8}
+# ESTIMATOR=${ESTIMATOR:-central}
 
-# LR=${LR:-5.00E-06}
-# ZOO_LR=${ZOO_LR:-5.00E-06}
-# EPS=${EPS:-1.00E-03}
+NUM_PERT=${NUM_PERT:-5}
+NUM_PREFIX=${NUM_PREFIX:-20}
+LR=${LR:-1e-3}
+ZOO_LR=${ZOO_LR:-5e-6}
+# EPS=${EPS:-5e-6}
+EPS=${EPS:-1e-3}
 LORA_R=${LORA_R:-8}
-# MODEL_NAME="facebook/opt-125m"
-# EPOCHS=1
-# BATCH_SIZE=16  # Small for testing
-# MAX_LENGTH=512  # Short for speed
-# LR=1e-3
-# ZOO_LR=1e-1
-# EPS=1e-1        # ZOO epsilon (perturbation scale)
-# SEED=0          # Random seed
-# TRAIN=1000      # Training examples
-# DEV=500         # Dev examples
-# EVAL=1000       # Evaluation examples
-# STEPS=2000      # Training steps
-# EVAL_STEPS=2000 # Evaluation steps
-# NUM_PERT=5
+ESTIMATOR=${ESTIMATOR:-forward}
+
+# New optimizer/scheduler defaults (baseline-like for SST-2)
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
+# SCHEDULER=${SCHEDULER:-cosine}
+SCHEDULER=${SCHEDULER:-linear}
+WARMUP_STEPS=${WARMUP_STEPS:-0}
+WARMUP_RATIO=${WARMUP_RATIO:-0.06}
+SGD_ACCUM_STEPS=${SGD_ACCUM_STEPS:-1}
+CLIENT_SGD_WARMUP_STEPS=${CLIENT_SGD_WARMUP_STEPS:-800}
+CLIENT_SGD_EVERY=${CLIENT_SGD_EVERY:-1}
+# Additional ZOO/scheduler knobs
+# ZOO_MOMENTUM=${ZOO_MOMENTUM:-0.0}
+ZOO_MOMENTUM=${ZOO_MOMENTUM:-0.0}
+ZOO_ACCUM_STEPS=${ZOO_ACCUM_STEPS:-1}
+SCHED_FACTOR=${SCHED_FACTOR:-0.5}
+SCHED_PATIENCE=${SCHED_PATIENCE:-6}
+SCHED_THRESHOLD=${SCHED_THRESHOLD:-1e-3}
+SCHED_THRESHOLD_MODE=${SCHED_THRESHOLD_MODE:-rel}
+SCHED_COOLDOWN=${SCHED_COOLDOWN:-1}
+SCHED_MIN_LR=${SCHED_MIN_LR:-1e-6}
 
 
 echo "Configuration:"
 echo "   Model: $MODEL_NAME"
 echo "   Epochs: $EPOCHS"
 echo "   Batch Size: $BATCH_SIZE"
+echo "   Eval Batch Size: $EVAL_BATCH_SIZE"
 echo "   Max Length: $MAX_LENGTH"
 echo "   Learning Rate: $LR"
+echo "   ZOO LR: $ZOO_LR"
+echo "   ZOO mu (eps): $EPS"
 echo "   Task: $TASK"
 echo "   Tuning: $TUNING"
+echo "   LoRA r: $LORA_R"
+echo "   Num Perturbations: $NUM_PERT"
+echo "   Seed: $SEED"
 echo "   Train/Dev/Eval: $TRAIN/$DEV/$EVAL"
 echo "   Steps/EvalSteps: $STEPS/$EVAL_STEPS"
+echo "   Server Optimizer: $SERVER_OPT (wd=$WEIGHT_DECAY)"
+echo "   Client Optimizer: $CLIENT_OPT"
+echo "   Scheduler: $SCHEDULER (warmup_steps=$WARMUP_STEPS warmup_ratio=$WARMUP_RATIO)"
 echo ""
 
-# Start server in background
+
 echo "Starting coordinator (server app)..."
 python3 server.py \
     --model_name $MODEL_NAME \
@@ -158,24 +185,38 @@ python3 server.py \
     --host $HOST \
     --port $PORT \
     --train_batch_size $BATCH_SIZE \
-    --test_batch_size $BATCH_SIZE \
+    --test_batch_size $EVAL_BATCH_SIZE \
     --max_length $MAX_LENGTH \
     --lr $LR \
     --zoo_lr $ZOO_LR \
     --seed $SEED \
+    --estimator $ESTIMATOR \
     --use_zeroth_order \
     --mu $EPS \
-    --train_examples $TRAIN \
-    --dev_examples $DEV \
-    --eval_examples $EVAL \
     --max_steps $STEPS \
     --eval_steps $EVAL_STEPS \
-    --num_prefix $NUM_PREFIX \
     --task $TASK \
     --tuning $TUNING \
     --lora_r $LORA_R \
     --num_pert $NUM_PERT \
-    --wire_fp16 off &
+    --wire_fp16 off \
+    --weight_decay $WEIGHT_DECAY \
+    --scheduler $SCHEDULER \
+    --sched_factor $SCHED_FACTOR \
+    --sched_patience $SCHED_PATIENCE \
+    --sched_threshold $SCHED_THRESHOLD \
+    --sched_threshold_mode $SCHED_THRESHOLD_MODE \
+    --sched_cooldown $SCHED_COOLDOWN \
+    --sched_min_lr $SCHED_MIN_LR \
+    --warmup_steps $WARMUP_STEPS \
+    --warmup_ratio $WARMUP_RATIO \
+    --sched_step_on_eval \
+    --sgd_accum_steps $SGD_ACCUM_STEPS \
+    --zoo_momentum $ZOO_MOMENTUM \
+    --zoo_accum_steps $ZOO_ACCUM_STEPS \
+    --client_sgd_warmup_steps $CLIENT_SGD_WARMUP_STEPS \
+    --client_sgd_every $CLIENT_SGD_EVERY &
+    # --eval_on_cpu &
 
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -205,16 +246,25 @@ python3 client.py \
     --lr $LR \
     --zoo_lr $ZOO_LR \
     --seed $SEED \
+    --estimator $ESTIMATOR \
     --mu $EPS \
     --train_batch_size $BATCH_SIZE \
     --num_pert $NUM_PERT \
-    --test_batch_size $BATCH_SIZE \
+    --test_batch_size $EVAL_BATCH_SIZE \
     --task $TASK \
     --lora_r $LORA_R \
     --tuning $TUNING \
-    --max_steps $STEPS &
+    --max_steps $STEPS \
+    --weight_decay $WEIGHT_DECAY &
 
 CLIENT_EXIT_CODE=$?
+
+# Move log files into structured directory
+if ls mezo_splitlearning_* 1> /dev/null 2>&1; then
+    for f in mezo_splitlearning_*; do
+        mv "$f" "$LOG_DIR/" 2>/dev/null || true
+    done
+fi
 
 # Wait for server to complete
 echo "Waiting for server to finish..."
