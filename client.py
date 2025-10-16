@@ -78,7 +78,7 @@ class LoRAClientModel(nn.Module):
 
 
 @torch.no_grad()
-def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8):
+def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8, mode: str = 'central'):
     # h_cut on the right device/dtype already
     h0 = h_cut
     g_hat = torch.zeros_like(h0, dtype=torch.float32)
@@ -91,13 +91,22 @@ def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, nu
                 attention_mask=attention_mask, labels=labels, cut=cut,
                 compute_g_cut=False, return_loss_tensor=False
             )["loss"]
-            ln = _client_forward_from_cut(
-                kv_model, h_cut=h0 - mu*u,
-                attention_mask=attention_mask, labels=labels, cut=cut,
-                compute_g_cut=False, return_loss_tensor=False
-            )["loss"]
+            if str(mode).lower() == 'central':
+                ln = _client_forward_from_cut(
+                    kv_model, h_cut=h0 - mu*u,
+                    attention_mask=attention_mask, labels=labels, cut=cut,
+                    compute_g_cut=False, return_loss_tensor=False
+                )["loss"]
+                scale = (lp - ln) / (2.0*mu)
+            else:
+                ln = _client_forward_from_cut(
+                    kv_model, h_cut=h0,
+                    attention_mask=attention_mask, labels=labels, cut=cut,
+                    compute_g_cut=False, return_loss_tensor=False
+                )["loss"]
+                scale = (lp - ln) / (mu)
 
-        g_hat.add_(((lp - ln) / (2.0*mu)) * u)
+        g_hat.add_(scale * u)
 
     g_hat.div_(float(num_pert))
     return g_hat
@@ -570,6 +579,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
                     attn_mask, labels, cut,
                     mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-2)),
                     num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 16)),
+                    mode=str(getattr(args, 'estimator', 'central')),
                 )
             finally:
                 if was_training:
@@ -669,6 +679,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--zoo_lr', type=float, default=1e-4, help='ZOO learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
     parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')
@@ -676,6 +687,7 @@ def parse_args():
     # ZOO parameters
     parser.add_argument('--mu', type=float, default=1e-3, help='ZOO perturbation scale')
     parser.add_argument('--num_pert', type=int, default=64, help='Number of ZOO perturbations')
+    parser.add_argument('--estimator', type=str, choices=['central','forward'], default='central', help='Finite-diff estimator type for ZOO/g_cut')
     parser.add_argument('--use_zeroth_order_client', action='store_true', help='Use ZOO for client')
     parser.add_argument(
         '--task',
@@ -773,17 +785,24 @@ if __name__ == "__main__":
     print(f"Model loaded: {args.model_name}")
     print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with {args.num_prefix} prefix tokens each")
     
-    # Setup optimizer for client's prefix embeddings
     if args.use_zeroth_order_client:
         # Client ZOO: SGD as a simple applicator when estimator populates grads
-        optimizer = optim.SGD(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()),
-                      lr=args.zoo_lr, momentum=0.0)
-        print(f"Client using ZOO optimizer with lr={args.zoo_lr}")
+        optimizer = optim.SGD(
+            list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()),
+            lr=args.zoo_lr,
+            momentum=0.0,
+            weight_decay=args.weight_decay,
+        )
+        print(f"Client using ZOO optimizer with lr={args.zoo_lr}, weight_decay={args.weight_decay}")
     else:
-        # optimizer = optim.SGD(kv_model.client_kv.parameters(), lr=args.lr, momentum=args.momentum)
-        optimizer = optim.SGD(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()),
-                      lr=args.lr, momentum=args.momentum)
-        print(f"Client using SGD optimizer with lr={args.lr}, momentum={args.momentum}")
+        trainable = list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())())
+        optimizer = optim.SGD(
+            trainable,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+        print(f"Client using SGD optimizer with lr={args.lr}, momentum={args.momentum}, wd={args.weight_decay}")
     
     # Setup ZOO gradient estimator if needed
     grad_estimator = None
