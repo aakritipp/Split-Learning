@@ -76,6 +76,42 @@ class LoRAClientModel(nn.Module):
     def trainable_parameters(self):
         return iter_lora_parameters(self.base_model, layer_range=(self.cut_layer, self.total_layers-1))
 
+class FullClientModel(nn.Module):
+    """
+    Client-side when tuning=full. Keeps full base_model; trains layers [cut..L-1] + final_layer_norm + lm_head.
+    Presents no-prefix stubs so unified forward-from-cut path works without KV prefixes.
+    """
+    def __init__(self, model_name: str, total_layers: int, cut_layer: int):
+        super().__init__()
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        for p in self.base_model.parameters():
+            p.requires_grad = False
+        self.total_layers = total_layers
+        self.cut_layer = cut_layer
+
+        # Enable grads for client half: decoder layers [cut..L-1], final_layer_norm, lm_head
+        for name, p in self.base_model.named_parameters():
+            req = False
+            if name.startswith('model.decoder.final_layer_norm'):
+                req = True
+            elif name.startswith('lm_head'):
+                req = True
+            elif '.model.decoder.layers.' in ('.' + name):
+                try:
+                    after = name.split('model.decoder.layers.')[1]
+                    idx = int(after.split('.')[0])
+                    req = (idx >= cut_layer)
+                except Exception:
+                    req = False
+            p.requires_grad = req
+
+        # Prefix stubs to satisfy forward path
+        self.server_kv_mirror = _NoPrefixStub()
+        self.client_kv       = _NoPrefixStub()
+
+    def trainable_parameters(self):
+        return (p for p in self.base_model.parameters() if p.requires_grad)
+
 
 @torch.no_grad()
 def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8, mode: str = 'central'):
@@ -698,7 +734,7 @@ def parse_args():
         default='squad',
         help='Task/dataset to load'
     )
-    parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
+    parser.add_argument('--tuning', choices=['prefix','lora','full','none'], default='prefix')
     parser.add_argument('--lora_r', type=int, default=8)
     parser.add_argument('--lora_alpha', type=int, default=16)
     parser.add_argument('--lora_dropout', type=float, default=0.0)
@@ -729,6 +765,35 @@ def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=N
         elif mode == "lora":
             is_lora = ("lora_A" in n) or ("lora_B" in n)
             ok = (is_lora == p.requires_grad) and ("kv." not in n) and ("client_kv." not in n)
+
+        elif mode == "full":
+            # Client side full-FT should only train decoder layers [cut..L-1], final_layer_norm and lm_head
+            cut = int(getattr(module, "cut_layer", 0))
+            def _client_allowed(name: str) -> bool:
+                core = name.split("base_model.", 1)[1] if "base_model." in name else name
+                if core.startswith("model.decoder.final_layer_norm"):
+                    return True
+                if core.startswith("lm_head"):
+                    return True
+                if ".model.decoder.layers." in ("." + core):
+                    try:
+                        idx = int(core.split("model.decoder.layers.")[1].split(".")[0])
+                        return idx >= cut
+                    except Exception:
+                        return False
+                return False
+            def _forbidden(name: str) -> bool:
+                return (
+                    name.startswith("kv.") or name.startswith("client_kv.") or ("prefix" in name)
+                    or ("lora_A" in name) or ("lora_B" in name)
+                )
+            if side == "client":
+                if p.requires_grad:
+                    ok = (not _forbidden(n)) and _client_allowed(n)
+                else:
+                    ok = True
+            else:
+                ok = not (_forbidden(n) and p.requires_grad)
 
         else:  # none
             ok = (p.requires_grad is False)
@@ -767,6 +832,11 @@ if __name__ == "__main__":
         _assert_only_expected_trainables(kv_model, args.tuning, side="client")
 
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+    elif args.tuning == 'full':
+        kv_model = FullClientModel(args.model_name, total_layers, args.cut_layer).to(device)
+        trainable_params = list(kv_model.trainable_parameters())
+        _assert_only_expected_trainables(kv_model, args.tuning, side="client")
+        print(f"Client full-FT layers [{args.cut_layer}, {total_layers-1}] enabled; final_layer_norm/lm_head trainable")
     else:
         kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix).to(device)
         for p in getattr(kv_model, "base_model", kv_model).parameters():
@@ -907,6 +977,36 @@ if __name__ == "__main__":
                     client.send_data({"type": "client_lora_state", "ok": False, "error": str(e)})
                 continue
 
+            elif mtype == "get_client_full_state":
+                try:
+                    if args.tuning == 'full':
+                        base = getattr(kv_model, "base_model", kv_model)
+                        sd = base.state_dict()
+                        # Filter to client half: decoder layers [cut..L-1], final_layer_norm, lm_head
+                        filt = {}
+                        for k, v in sd.items():
+                            take = False
+                            if k.startswith('model.decoder.final_layer_norm'):
+                                take = True
+                            elif k.startswith('lm_head'):
+                                take = True
+                            elif '.model.decoder.layers.' in ('.' + k):
+                                try:
+                                    after = k.split('model.decoder.layers.')[1]
+                                    idx = int(after.split('.')[0])
+                                    if idx >= int(args.cut_layer):
+                                        take = True
+                                except Exception:
+                                    pass
+                            if take:
+                                filt[k] = v.detach().cpu()
+                        client.send_data({"type": "client_full_state", "ok": True, "state": filt})
+                    else:
+                        client.send_data({"type": "client_full_state", "ok": True, "state": {}})
+                except Exception as e:
+                    client.send_data({"type": "client_full_state", "ok": False, "error": str(e)})
+                continue
+
             if mtype == "forward_cut":
                 data = msg.get("data")
                 if data is None or not isinstance(data, dict):
@@ -951,3 +1051,4 @@ if __name__ == "__main__":
         except:
             pass
         print("CLIENT SHUTDOWN COMPLETE")
+        

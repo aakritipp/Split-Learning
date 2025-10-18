@@ -129,3 +129,4 @@ class StochasticGradientApproximator:
                 total_grad_norm += param.grad.norm().item() ** 2
         total_grad_norm = total_grad_norm ** 0.5
         print(f"ZOO: Gradient norm: {total_grad_norm:.6f}")
+        

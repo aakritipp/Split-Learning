@@ -1385,3 +1385,4 @@ def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, 
             print(f"Error processing example {i}: {e}")
     
     print("=== END SAMPLES ===\n")
+    

@@ -127,6 +127,11 @@ def _assert_only_expected_trainables(module: nn.Module, mode: str, layer_range=N
             is_lora = ("lora_A" in n) or ("lora_B" in n)
             ok = (is_lora == p.requires_grad) and ("kv." not in n) and ("client_kv." not in n)
 
+        elif mode == "full":
+            # Full fine-tuning: disallow LoRA/prefix params from being trainable; base params may be either
+            is_disallowed = (n.startswith("kv.") or n.startswith("client_kv.") or ("prefix" in n) or ("lora_A" in n) or ("lora_B" in n))
+            ok = not (is_disallowed and p.requires_grad)
+
         else:  # none
             ok = (p.requires_grad is False)
 
@@ -509,6 +514,54 @@ class LoRAServerModel(nn.Module):
     def trainable_parameters(self):
         return iter_lora_parameters(self.base_model, layer_range=(0, self.cut_layer-1))
 
+class ServerFullModel(nn.Module):
+    """
+    Server-side when tuning=full. Keeps full base_model; trains embeddings + layers [0..cut-1].
+    Presents empty KV stubs so shared forward-to-cut path can be reused.
+    """
+    def __init__(self, model_name: str, cut_layer: int):
+        super().__init__()
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float32, device_map=None
+        )
+        # Full fine-tuning: enable grads only for embeddings + layers [0..cut-1]
+        for p in self.base_model.parameters():
+            p.requires_grad = False
+        self.total_layers = self.base_model.config.num_hidden_layers
+        self.cut_layer = cut_layer
+
+        # keep interface consistent with prefix/LoRA paths
+        class _NoPrefixStub:
+            def get_local_past(self, bsz): return {}
+            def set_requires_grad(self, flag: bool): pass
+        self.server_kv = _NoPrefixStub()
+        self.client_kv_mirror = _NoPrefixStub()
+
+        class _EmptyKV:
+            def __init__(self):
+                self.k = torch.zeros((0, 0, 0, 0))
+                self.v = torch.zeros((0, 0, 0, 0))
+            def get_local_past(self, bsz):
+                return {}
+            def parameters(self):
+                return iter(())
+            def set_requires_grad(self, flag: bool):
+                return None
+            def state_dict(self):
+                return {"k": self.k, "v": self.v}
+
+        self.kv = _EmptyKV()
+
+    def state_dict_kv(self):
+        try:
+            return {"k": self.kv.k.detach().cpu(), "v": self.kv.v.detach().cpu()}
+        except Exception:
+            return {"k": torch.zeros(0), "v": torch.zeros(0)}
+
+    def trainable_parameters(self):
+        # Return only parameters that require grad
+        return (p for p in self.base_model.parameters() if p.requires_grad)
+
 class ServerKVOnly(nn.Module):
     """
     Minimal server-side holder for KV prefixes on the first `cut_layer` layers.
@@ -850,6 +903,9 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
             if getattr(args, 'tuning', 'prefix') == 'lora':
                 # Explicitly avoid split-eval path for LoRA to prevent mixing eval modes
                 split_eval = False
+            elif getattr(args, 'tuning', 'prefix') == 'full':
+                # For full FT, we'll assemble a combined model with server+client weights locally
+                split_eval = False
             else:
                 _refreshed = _refresh_eval_prefixes(model, server_model, trainer, args)
                 if not _refreshed:
@@ -862,8 +918,8 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                 input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
                 input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
 
-                # LoRA eval: always combine server+client LoRA on a fresh full model and evaluate locally
-                if getattr(args, 'tuning', 'prefix') == 'lora':
+                # LoRA/Full eval: assemble a combined full model and evaluate locally
+                if getattr(args, 'tuning', 'prefix') in ('lora','full'):
                     try:
                         # 1) Build a fresh full model
                         # Honor eval_on_cpu explicitly for combined LoRA eval to avoid GPU OOM
@@ -877,23 +933,56 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                             p.requires_grad = False
 
                         total_layers_local = full_eval.config.num_hidden_layers
+                        if getattr(args, 'tuning', 'prefix') == 'lora':
+                            # 2) Apply LoRA to both halves
+                            apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(0, args.cut_layer-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+                            apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(args.cut_layer, total_layers_local-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
 
-                        # 2) Apply LoRA to both halves
-                        apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(0, args.cut_layer-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-                        apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(args.cut_layer, total_layers_local-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+                            # 3) Load server LoRA into [0..cut-1]
+                            server_state = get_lora_state_dict(getattr(server_model, 'base_model', server_model), layer_range=(0, args.cut_layer-1))
+                            _ = load_lora_state_dict(full_eval, server_state)
 
-                        # 3) Load server LoRA into [0..cut-1]
-                        server_state = get_lora_state_dict(getattr(server_model, 'base_model', server_model), layer_range=(0, args.cut_layer-1))
-                        _ = load_lora_state_dict(full_eval, server_state)
-
-                        # 4) Request client LoRA for [cut..L-1] and load
-                        trainer.send_data({"type": "get_client_lora_state"})
-                        resp = trainer.receive_data()
-                        if isinstance(resp, dict) and resp.get("type") == "client_lora_state" and resp.get("ok", False):
-                            client_state = resp.get("state", {})
-                            _ = load_lora_state_dict(full_eval, client_state)
+                            # 4) Request client LoRA for [cut..L-1] and load
+                            trainer.send_data({"type": "get_client_lora_state"})
+                            resp = trainer.receive_data()
+                            if isinstance(resp, dict) and resp.get("type") == "client_lora_state" and resp.get("ok", False):
+                                client_state = resp.get("state", {})
+                                _ = load_lora_state_dict(full_eval, client_state)
+                            else:
+                                print("⚠️ Could not fetch client LoRA state; proceeding with server half only")
                         else:
-                            print("⚠️ Could not fetch client LoRA state; proceeding with server half only")
+                            # Full finetune: stitch server and client base weights
+                            fe_sd = full_eval.state_dict()
+                            srv_sd = getattr(server_model, 'base_model', server_model).state_dict()
+                            # Copy server half: embeddings + layers [0..cut-1]
+                            for k, v in srv_sd.items():
+                                take = False
+                                if k.startswith('model.decoder.embed_'):
+                                    take = True
+                                elif '.model.decoder.layers.' in ('.' + k):
+                                    try:
+                                        after = k.split('model.decoder.layers.')[1]
+                                        idx = int(after.split('.')[0])
+                                        if idx < int(args.cut_layer):
+                                            take = True
+                                    except Exception:
+                                        pass
+                                if take and k in fe_sd:
+                                    fe_sd[k] = v.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
+                            # Ask client for its half
+                            trainer.send_data({"type": "get_client_full_state"})
+                            resp = trainer.receive_data()
+                            if isinstance(resp, dict) and resp.get("type") == "client_full_state" and resp.get("ok", False):
+                                cl_state = resp.get("state", {})
+                                for k, v in cl_state.items():
+                                    if k in fe_sd:
+                                        tv = v
+                                        if not torch.is_tensor(tv):
+                                            tv = torch.as_tensor(tv)
+                                        fe_sd[k] = tv.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
+                            else:
+                                print("⚠️ Could not fetch client full state; proceeding with server half only")
+                            _ = full_eval.load_state_dict(fe_sd, strict=False)
 
                         # 5) Compute outputs and metrics locally on combined model (ensure tensors on same device)
                         ii = input_ids.to(dev_for_combined)
@@ -1033,6 +1122,26 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                     server_params = [p for p in getattr(server_model, 'base_model', server_model).parameters() if p.requires_grad]
             except Exception:
                 server_params = [p for p in getattr(server_model, 'base_model', server_model).parameters() if p.requires_grad]
+        elif getattr(args, 'tuning', 'prefix') == 'full':
+            # Full finetuning: train embeddings + server layers [0..cut-1]
+            base = getattr(server_model, 'base_model', server_model)
+            server_params = []
+            for n, p in base.named_parameters():
+                take = False
+                if n.startswith('model.decoder.embed_'):
+                    take = True
+                elif '.model.decoder.layers.' in ('.' + n):
+                    try:
+                        after = n.split('model.decoder.layers.')[1]
+                        idx = int(after.split('.')[0])
+                        if idx < int(getattr(args, 'cut_layer', 0)):
+                            take = True
+                    except Exception:
+                        pass
+                if take and p.requires_grad:
+                    server_params.append(p)
+            if not server_params:
+                server_params = [p for p in base.parameters() if p.requires_grad]
         else:
             # Prefix mode
             server_params = list(server_model.kv.parameters())
@@ -1674,7 +1783,7 @@ def parse_args():
         default='squad',
         help='Task/dataset to load'
     )
-    parser.add_argument('--tuning', choices=['prefix','lora','none'], default='prefix')
+    parser.add_argument('--tuning', choices=['prefix','lora','full','none'], default='prefix')
     parser.add_argument('--lora_r', type=int, default=8)
     parser.add_argument('--lora_alpha', type=int, default=16)
     parser.add_argument('--lora_dropout', type=float, default=0.0)
@@ -1743,6 +1852,28 @@ if __name__ == "__main__":
             ).to(device)
             trainable_params = list(server_model.trainable_parameters())
             print(f"Server owns layers [0, {args.cut_layer-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+            _assert_only_expected_trainables(server_model, args.tuning, side="server")
+
+        elif args.tuning == 'full':
+            server_model = ServerFullModel(args.model_name, cut_layer=args.cut_layer).to(device)
+            # Restrict requires_grad to embeddings + layers [0..cut-1]
+            # Ensure flags are correct
+            for n, p in server_model.base_model.named_parameters():
+                req = False
+                if n.startswith('model.decoder.embed_'):
+                    req = True
+                elif n.startswith('model.decoder.layernorm_embedding'):
+                    req = True
+                elif '.model.decoder.layers.' in ('.' + n):
+                    try:
+                        after = n.split('model.decoder.layers.')[1]
+                        idx = int(after.split('.')[0])
+                        req = (idx < args.cut_layer)
+                    except Exception:
+                        req = False
+                p.requires_grad = req
+            trainable_params = [p for p in server_model.base_model.parameters() if p.requires_grad]
+            print(f"Server full-FT layers [0, {args.cut_layer-1}] enabled; embeddings trainable: True")
             _assert_only_expected_trainables(server_model, args.tuning, side="server")
 
         else:
