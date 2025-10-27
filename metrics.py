@@ -616,8 +616,8 @@ def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
         return 0.0
 
 
-def calculate_client_answer_accuracy(predictions, labels, batch, tokenizer):
-    """Calculate accuracy only on answer portion tokens (client-side)"""
+def calculate_server_answer_accuracy(predictions, labels, batch, tokenizer):
+    """Calculate accuracy only on answer portion tokens (server-side)"""
     try:
         if 'formatted_text' not in batch or tokenizer is None:
             # Fallback to general accuracy on valid tokens
@@ -690,7 +690,7 @@ def calculate_client_answer_accuracy(predictions, labels, batch, tokenizer):
         return sum(accuracies) / len(accuracies) if accuracies else 0.0
         
     except Exception as e:
-        print(f"Client answer accuracy calculation failed: {e}")
+        print(f"Server answer accuracy calculation failed: {e}")
         return 0.0
 
 def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5):

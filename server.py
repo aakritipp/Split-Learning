@@ -38,6 +38,8 @@ from metrics import (
     squad_exact_match,
     calculate_metrics
 )
+# Compute/memory & communication tracker
+from compute_tracker import ComputeTracker
 # Ensure merge_past_key_values is available for prefix-aware eval
 try:
     from prefix_kv import (
@@ -461,10 +463,10 @@ class LoRAServerModel(nn.Module):
     """
     def __init__(self, model_name: str, cut_layer: int,
                  r: int = 8, alpha: int = 16, dropout: float = 0.0,
-                 targets=("q_proj","v_proj")):
+                 targets=("q_proj","v_proj"), torch_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.base_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32, device_map=None
+            model_name, torch_dtype=torch_dtype, device_map=None
         )
         for p in self.base_model.parameters():
             p.requires_grad = False
@@ -519,10 +521,10 @@ class ServerFullModel(nn.Module):
     Server-side when tuning=full. Keeps full base_model; trains embeddings + layers [0..cut-1].
     Presents empty KV stubs so shared forward-to-cut path can be reused.
     """
-    def __init__(self, model_name: str, cut_layer: int):
+    def __init__(self, model_name: str, cut_layer: int, torch_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.base_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32, device_map=None
+            model_name, torch_dtype=torch_dtype, device_map=None
         )
         # Full fine-tuning: enable grads only for embeddings + layers [0..cut-1]
         for p in self.base_model.parameters():
@@ -567,12 +569,12 @@ class ServerKVOnly(nn.Module):
     Minimal server-side holder for KV prefixes on the first `cut_layer` layers.
     (No forward compute here to keep changes minimal; client runs the full model and uses these prefixes.)
     """
-    def __init__(self, model_name, cut_layer, num_prefix=10):
+    def __init__(self, model_name, cut_layer, num_prefix=10, torch_dtype: torch.dtype = torch.float32):
         super().__init__()
         # load config to size params correctly
         tmp = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            torch_dtype=torch_dtype,
             device_map=None,
             **_hf_auth_kwargs(),
         )
@@ -594,7 +596,7 @@ class ServerKVOnly(nn.Module):
 
         base = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            torch_dtype=next(tmp.parameters()).dtype if hasattr(tmp, 'parameters') else torch_dtype,
             device_map=None,
             **_hf_auth_kwargs(),
         )
@@ -624,11 +626,11 @@ def safe_get_hf_tokenizer(model_name):
 
 class FullLLMModel(nn.Module):
     """Frozen full model used only for monitoring/evaluation."""
-    def __init__(self, model_name, cut_layer, num_prefix=5):
+    def __init__(self, model_name, cut_layer, num_prefix=5, torch_dtype: torch.dtype = torch.float32):
         super(FullLLMModel, self).__init__()
         self.base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float32,
+            torch_dtype=torch_dtype,
             device_map=None,
             **_hf_auth_kwargs(),
         )
@@ -853,11 +855,21 @@ class FullLLMModel(nn.Module):
 
 class Trainer:
     """Handles communication with the client"""
-    def __init__(self, conn):
+    def __init__(self, conn, tracker=None):
         self.conn = conn
+        self.tracker = tracker
     
     def send_data(self, data):
         try:
+            # If message carries an explicit mode, honor it for this send
+            if getattr(self, 'tracker', None) is not None:
+                try:
+                    if isinstance(data, dict) and ('mode' in data):
+                        self.tracker.set_phase('eval' if str(data.get('mode')).lower() == 'eval' else 'train')
+                    # Track logical payload size and a communication round
+                    self.tracker.track_send(data)
+                except Exception:
+                    pass
             serialized = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
             self.conn.sendall(len(serialized).to_bytes(4, 'big'))
             self.conn.sendall(serialized)
@@ -871,12 +883,18 @@ class Trainer:
             data = b''
             while len(data) < length:
                 data += self.conn.recv(length - len(data))
-            return pickle.loads(data)
+            obj = pickle.loads(data)
+            if getattr(self, 'tracker', None) is not None:
+                try:
+                    self.tracker.track_receive(obj)
+                except Exception:
+                    pass
+            return obj
         except Exception as e:
             print(f"❌ Failed to receive data: {e}")
             raise
             
-def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None):
+def evaluate_model(model, test_loader, device, tokenizer, args, server_model=None, trainer=None, tracker=None):
     """Task-aware evaluation; generation metrics for QA/summary, class acc for SST-2."""
     task_name = str(getattr(args, 'task', 'squad')).upper()
     print(f"  Starting {task_name} evaluation...")
@@ -896,15 +914,14 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
 
     with torch.no_grad():
         # Try to refresh prefix-aware eval when split context is available
-        # IMPORTANT: In LoRA mode, we unify evaluation by assembling a combined full model
-        # (server LoRA + client LoRA) locally and using that exclusively for metrics.
+        # IMPORTANT: In LoRA/Full, we will build a combined model ONCE per eval to avoid per-batch fetch.
         split_eval = False
         if server_model is not None and trainer is not None:
             if getattr(args, 'tuning', 'prefix') == 'lora':
-                # Explicitly avoid split-eval path for LoRA to prevent mixing eval modes
+                # Avoid split-eval; combined eval used instead
                 split_eval = False
             elif getattr(args, 'tuning', 'prefix') == 'full':
-                # For full FT, we'll assemble a combined model with server+client weights locally
+                # Combined eval for full finetune
                 split_eval = False
             else:
                 _refreshed = _refresh_eval_prefixes(model, server_model, trainer, args)
@@ -913,84 +930,102 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                 else:
                     split_eval = True
 
+        # Build a single combined eval model for LoRA/Full to reduce communication to once per eval
+        combined_eval = None
+        combined_dev = device
+        if (server_model is not None and trainer is not None) and (getattr(args, 'tuning', 'prefix') in ('lora', 'full')):
+            try:
+                # Honor eval_on_cpu for LoRA combined eval to reduce GPU memory
+                dev_for_combined = (torch.device('cpu') if (bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora') else device)
+                full_eval = AutoModelForCausalLM.from_pretrained(
+                    args.model_name,
+                    torch_dtype=torch.float32,
+                    device_map=None
+                ).to(dev_for_combined)
+                for p in full_eval.parameters():
+                    p.requires_grad = False
+
+                total_layers_local = full_eval.config.num_hidden_layers
+                if getattr(args, 'tuning', 'prefix') == 'lora':
+                    # Apply LoRA to both halves and load server+client once
+                    apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(0, args.cut_layer-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+                    apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(args.cut_layer, total_layers_local-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+
+                    server_state = get_lora_state_dict(getattr(server_model, 'base_model', server_model), layer_range=(0, args.cut_layer-1))
+                    _ = load_lora_state_dict(full_eval, server_state)
+
+                    trainer.send_data({"type": "get_client_lora_state", "mode": "eval"})
+                    resp = trainer.receive_data()
+                    if isinstance(resp, dict) and resp.get("type") == "client_lora_state" and resp.get("ok", False):
+                        client_state = resp.get("state", {})
+                        _ = load_lora_state_dict(full_eval, client_state)
+                    else:
+                        print("⚠️ Could not fetch client LoRA state; will fall back to split-eval if available")
+                        split_eval = True
+                        full_eval = None
+                else:
+                    # Full finetune: stitch server+client weights once
+                    fe_sd = full_eval.state_dict()
+                    srv_sd = getattr(server_model, 'base_model', server_model).state_dict()
+                    # Copy server half: embeddings + layers [0..cut-1]
+                    for k, v in srv_sd.items():
+                        take = False
+                        if k.startswith('model.decoder.embed_'):
+                            take = True
+                        elif '.model.decoder.layers.' in ('.' + k):
+                            try:
+                                after = k.split('model.decoder.layers.')[1]
+                                idx = int(after.split('.')[0])
+                                if idx < int(args.cut_layer):
+                                    take = True
+                            except Exception:
+                                pass
+                        if take and k in fe_sd:
+                            fe_sd[k] = v.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
+
+                    # Fetch client half ONCE
+                    trainer.send_data({"type": "get_client_full_state", "mode": "eval"})
+                    resp = trainer.receive_data()
+                    if isinstance(resp, dict) and resp.get("type") == "client_full_state" and resp.get("ok", False):
+                        cl_state = resp.get("state", {})
+                        for k, v in cl_state.items():
+                            if k in fe_sd:
+                                tv = v
+                                if not torch.is_tensor(tv):
+                                    tv = torch.as_tensor(tv)
+                                fe_sd[k] = tv.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
+                        _ = full_eval.load_state_dict(fe_sd, strict=False)
+                    else:
+                        print("⚠️ Could not fetch client full state; will fall back to split-eval if available")
+                        split_eval = True
+                        full_eval = None
+
+                combined_eval = full_eval
+                combined_dev = dev_for_combined
+            except Exception as e:
+                print(f"⚠️ Combined eval assembly failed: {e}")
+                combined_eval = None
+
         for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"{task_name} Evaluation")):
             try:
                 input_ids, attention_mask, labels, prompt_text, text_target, meta = adapt_batch(batch, device)
                 input_ids, attention_mask, labels = right_trim(input_ids, attention_mask, labels)
 
-                # LoRA/Full eval: assemble a combined full model and evaluate locally
-                if getattr(args, 'tuning', 'prefix') in ('lora','full'):
+                # If we assembled a combined eval model, reuse it across all batches (no per-batch comm)
+                if combined_eval is not None:
                     try:
-                        # 1) Build a fresh full model
-                        # Honor eval_on_cpu explicitly for combined LoRA eval to avoid GPU OOM
-                        dev_for_combined = (torch.device('cpu') if (bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora') else device)
-                        full_eval = AutoModelForCausalLM.from_pretrained(
-                            args.model_name,
-                            torch_dtype=torch.float32,
-                            device_map=None
-                        ).to(dev_for_combined)
-                        for p in full_eval.parameters():
-                            p.requires_grad = False
-
-                        total_layers_local = full_eval.config.num_hidden_layers
-                        if getattr(args, 'tuning', 'prefix') == 'lora':
-                            # 2) Apply LoRA to both halves
-                            apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(0, args.cut_layer-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-                            apply_lora_to_opt(full_eval, targets=tuple(args.lora_targets.split(',')), layer_range=(args.cut_layer, total_layers_local-1), r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-
-                            # 3) Load server LoRA into [0..cut-1]
-                            server_state = get_lora_state_dict(getattr(server_model, 'base_model', server_model), layer_range=(0, args.cut_layer-1))
-                            _ = load_lora_state_dict(full_eval, server_state)
-
-                            # 4) Request client LoRA for [cut..L-1] and load
-                            trainer.send_data({"type": "get_client_lora_state"})
-                            resp = trainer.receive_data()
-                            if isinstance(resp, dict) and resp.get("type") == "client_lora_state" and resp.get("ok", False):
-                                client_state = resp.get("state", {})
-                                _ = load_lora_state_dict(full_eval, client_state)
-                            else:
-                                print("⚠️ Could not fetch client LoRA state; proceeding with server half only")
-                        else:
-                            # Full finetune: stitch server and client base weights
-                            fe_sd = full_eval.state_dict()
-                            srv_sd = getattr(server_model, 'base_model', server_model).state_dict()
-                            # Copy server half: embeddings + layers [0..cut-1]
-                            for k, v in srv_sd.items():
-                                take = False
-                                if k.startswith('model.decoder.embed_'):
-                                    take = True
-                                elif '.model.decoder.layers.' in ('.' + k):
-                                    try:
-                                        after = k.split('model.decoder.layers.')[1]
-                                        idx = int(after.split('.')[0])
-                                        if idx < int(args.cut_layer):
-                                            take = True
-                                    except Exception:
-                                        pass
-                                if take and k in fe_sd:
-                                    fe_sd[k] = v.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
-                            # Ask client for its half
-                            trainer.send_data({"type": "get_client_full_state"})
-                            resp = trainer.receive_data()
-                            if isinstance(resp, dict) and resp.get("type") == "client_full_state" and resp.get("ok", False):
-                                cl_state = resp.get("state", {})
-                                for k, v in cl_state.items():
-                                    if k in fe_sd:
-                                        tv = v
-                                        if not torch.is_tensor(tv):
-                                            tv = torch.as_tensor(tv)
-                                        fe_sd[k] = tv.to(device=fe_sd[k].device, dtype=fe_sd[k].dtype)
-                            else:
-                                print("⚠️ Could not fetch client full state; proceeding with server half only")
-                            _ = full_eval.load_state_dict(fe_sd, strict=False)
-
-                        # 5) Compute outputs and metrics locally on combined model (ensure tensors on same device)
-                        ii = input_ids.to(dev_for_combined)
-                        am = attention_mask.to(dev_for_combined) if attention_mask is not None else None
-                        lb = labels.to(dev_for_combined) if labels is not None else None
-                        outputs = full_eval(input_ids=ii, attention_mask=am, labels=lb)
-                        loss, answer_acc, f1, em = calculate_squad_metrics(outputs, lb if lb is not None else labels, batch, tokenizer, full_eval, dev_for_combined)
-
+                        ii = input_ids.to(combined_dev)
+                        am = attention_mask.to(combined_dev) if attention_mask is not None else None
+                        lb = labels.to(combined_dev) if labels is not None else None
+                        outputs = combined_eval(input_ids=ii, attention_mask=am, labels=lb)
+                        # Update eval-phase memory snapshot
+                        try:
+                            if tracker is not None:
+                                tracker.set_phase('eval')
+                                tracker.update_memory()
+                        except Exception:
+                            pass
+                        loss, answer_acc, f1, em = calculate_squad_metrics(outputs, lb if lb is not None else labels, batch, tokenizer, combined_eval, combined_dev)
                         total_loss += loss
                         total_answer_accuracy += answer_acc
                         total_f1 += f1
@@ -998,14 +1033,19 @@ def evaluate_model(model, test_loader, device, tokenizer, args, server_model=Non
                         num_batches += 1
                         if batch_idx < 3:
                             print(f"\nBatch {batch_idx}: Loss={loss:.4f}, Acc={answer_acc:.6f}, F1={f1:.6f}, EM={em:.6f}")
-                        # Use combined-model outputs for metrics and continue to next batch
                         continue
                     except Exception as e:
-                        print(f"⚠️ Combined LoRA eval failed, falling back to client eval path: {e}")
-                        # Fall through to legacy path below if needed
+                        print(f"⚠️ Combined eval forward failed; falling back to legacy path: {e}")
 
                 # Default eval: compute local outputs for metrics
                 outputs = model(input_ids, attention_mask, labels)
+                # Update eval-phase memory snapshot
+                try:
+                    if tracker is not None:
+                        tracker.set_phase('eval')
+                        tracker.update_memory()
+                except Exception:
+                    pass
 
                 # Debug: Check data structure for first batch
                 if batch_idx == 0:
@@ -1160,6 +1200,12 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
     )
 
     server_model.train()
+    # Ensure tracker is in train phase and reset phase peak at start
+    try:
+        if _srv_tracker is not None:
+            _srv_tracker.set_phase('train')
+    except Exception:
+        pass
     losses, accs = [], []
     global_step = 0
 
@@ -1230,11 +1276,18 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         })
                         # Server is ZOO; the client should skip g_cut and return loss only
                         resp = trainer.receive_data()  # {'type': 'loss_report', 'loss': float}
+                        # Track memory after eval-like loss fetch (still training phase accounting)
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('train')
+                                _srv_tracker.update_memory()
+                        except Exception:
+                            pass
                         loss_val = float(resp.get("loss", 0.0))
                         if was_training:
                             server_model.train()
                         # Keep FD objective in full precision; no autograd path needed
-                        return torch.tensor(float(loss_val), dtype=torch.float32)
+                        return torch.tensor(float(loss_val), dtype=next(server_model.base_model.parameters()).dtype)
 
                     def objective_fn_c(*_args,**_kwargs):
                         return objective_fn()
@@ -1279,7 +1332,7 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                             )
                         if was_training:
                             server_model.train()
-                        v = (h_tmp.to(dtype=torch.float32) * g_cut_tensor).sum().item()
+                        v = (h_tmp.to(dtype=g_cut_tensor.dtype) * g_cut_tensor).sum().item()
                         return torch.tensor(float(v), dtype=torch.float32)
 
                     # Estimate gradients for server KV via ZOO with RMS-scaled μ and diversified seed
@@ -1304,6 +1357,14 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         )
                     finally:
                         grad_estimator.perturbation_scale = old_mu
+
+                    # Track memory after gradient estimation
+                    try:
+                        if _srv_tracker is not None:
+                            _srv_tracker.set_phase('train')
+                            _srv_tracker.update_memory()
+                    except Exception:
+                        pass
 
                     # Optional gradient smoothing (EMA) for stability
                     if ema_beta > 0.0:
@@ -1353,6 +1414,13 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                             except Exception:
                                 pass
                             optimizer.step()
+                            # Track memory after optimizer step
+                            try:
+                                if _srv_tracker is not None:
+                                    _srv_tracker.set_phase('train')
+                                    _srv_tracker.update_memory()
+                            except Exception:
+                                pass
                             # Reset accumulators
                             accum_buffers = [None] * len(server_params)
                             accum_counter = 0
@@ -1379,6 +1447,13 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                         except Exception:
                             pass
                         optimizer.step()
+                        # Track memory after optimizer step
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('train')
+                                _srv_tracker.update_memory()
+                        except Exception:
+                            pass
                         stepped_this_iter = True
                         if not is_plateau_sched:
                             try:
@@ -1453,6 +1528,12 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
 
                     # periodic eval (uses the safe FullLLMModel)
                     if global_step % args.eval_steps == 0:
+                        # Switch tracker to eval phase
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('eval')
+                        except Exception:
+                            pass
                         print(f"\nStep {global_step}: Running ZOO evaluation...")
                         _moved = False
                         _eval_device = device
@@ -1463,11 +1544,17 @@ def train_split_learning_zoo(server_model, full_model, train_loader, eval_loader
                                 _moved = True
                             eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
                                 full_model, eval_loader, _eval_device, tokenizer, args,
-                                server_model=server_model, trainer=trainer
+                                server_model=server_model, trainer=trainer, tracker=_srv_tracker
                             )
                         finally:
                             if _moved:
                                 full_model.to(device)
+                        # Switch back to train phase
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('train')
+                        except Exception:
+                            pass
                         print(f".  Step {global_step} ZOO Evaluation:")
                         print(f"   Loss: {eval_loss:.4f}")
                         print(f"   Answer Accuracy: {eval_acc:.6f}")
@@ -1524,6 +1611,12 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
     print(f"   Eval every: {args.eval_steps} steps")
     
     server_model.train()
+    # Ensure tracker is in train phase and reset phase peak at start
+    try:
+        if _srv_tracker is not None:
+            _srv_tracker.set_phase('train')
+    except Exception:
+        pass
     losses = []
     accs = []
     global_step = 0
@@ -1579,6 +1672,14 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     )
                     pkg["tgt_len"] = int(h_cut_live.shape[1])
 
+                    # Track train-phase memory after server forward to cut
+                    try:
+                        if _srv_tracker is not None:
+                            _srv_tracker.set_phase('train')
+                            _srv_tracker.update_memory()
+                    except Exception:
+                        pass
+
                     trainer.send_data({"type": "forward_cut", "mode": "train", "data": pkg, "meta": {"zoo_eval": False}})
 
                     # === Receive loss + g_cut; backprop on server ===
@@ -1595,6 +1696,13 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                     if (global_step % accum_steps) == 0:
                         optimizer.zero_grad(set_to_none=True)
                     h_cut_live.backward(g_cut)
+                    # Track memory after backward
+                    try:
+                        if _srv_tracker is not None:
+                            _srv_tracker.set_phase('train')
+                            _srv_tracker.update_memory()
+                    except Exception:
+                        pass
                     do_step = ((global_step + 1) % accum_steps) == 0
                     if do_step:
                         try:
@@ -1609,6 +1717,13 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         except Exception:
                             pass
                         optimizer.step()
+                        # Track memory after optimizer step
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('train')
+                                _srv_tracker.update_memory()
+                        except Exception:
+                            pass
                         if not is_plateau_sched:
                             try:
                                 scheduler.step()
@@ -1646,6 +1761,12 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                         print(f"\nStep {i+1}/{len(train_loader)} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.3f}")
 
                     if global_step % args.eval_steps == 0:
+                        # Switch tracker to eval phase
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('eval')
+                        except Exception:
+                            pass
                         print(f"\nStep {global_step}: Running evaluation...")
                         _moved = False
                         _eval_device = device
@@ -1656,12 +1777,18 @@ def train_split_learning_sgd(server_model, full_model, train_loader, eval_loader
                                 _moved = True
                             eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
                                 full_model, eval_loader, _eval_device, tokenizer, args,
-                                server_model=server_model, trainer=trainer
+                                server_model=server_model, trainer=trainer, tracker=_srv_tracker
                             )
                         finally:
                             if _moved:
                                 full_model.to(device)
 
+                        # Switch back to train phase
+                        try:
+                            if _srv_tracker is not None:
+                                _srv_tracker.set_phase('train')
+                        except Exception:
+                            pass
                         print(f"   Step {global_step} Evaluation:")
                         print(f"   Loss: {eval_loss:.4f}")
                         print(f"   Answer Accuracy: {eval_acc:.6f}")
@@ -1794,8 +1921,9 @@ def parse_args():
     parser.add_argument('--port', type=int, default=12345, help='Server port to bind')
     
     # Wire precision for h_cut payload (fp16 reduces bandwidth, fp32 improves ZOO stability)
-    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='auto',
+    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='off',
                         help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
+    parser.add_argument('--compute_dtype', choices=['fp16','fp32'], default='fp32', help='Compute/model dtype for server (fp16 or fp32)')
     # Control whether to step LR scheduler on eval loss for ZOO (default off)
     parser.add_argument('--sched_step_on_eval', action='store_true', help='Also step LR scheduler on eval loss (ZOO)')
     # Evaluation device control
@@ -1848,6 +1976,7 @@ if __name__ == "__main__":
             server_model = LoRAServerModel(
                 args.model_name, args.cut_layer,
                 r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
+                torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32),
                 targets=tuple(args.lora_targets.split(','))
             ).to(device)
             trainable_params = list(server_model.trainable_parameters())
@@ -1878,7 +2007,8 @@ if __name__ == "__main__":
 
         else:
             # existing PrefixKV server path (keep yours)
-            server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
+            server_model = ServerKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
+                                        torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
             trainable_params = list(server_model.kv.parameters())  # unchanged
             _assert_only_expected_trainables(server_model, args.tuning, side="server")
 
@@ -1887,7 +2017,8 @@ if __name__ == "__main__":
             assert all((not p.requires_grad) for n,p in server_model.named_parameters()
                     if ("lora_A" not in n and "lora_B" not in n)), "Only LoRA params must be trainable in LoRA mode!"
         
-        full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix).to(device)
+        full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
+                                  torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
         # Only attach server KV in prefix mode; in LoRA there is no live server KV to use
         if args.tuning != 'lora':
             full_model.attach_live_server_kv(server_model.kv)
@@ -1998,7 +2129,12 @@ if __name__ == "__main__":
         conn, addr = server_socket.accept()
         print(f"✅ Client connected from {addr}")
         
-        trainer = Trainer(conn)
+        # Initialize compute/comm tracker for the server process
+        try:
+            _srv_tracker = ComputeTracker(device=device, role="server")
+        except Exception:
+            _srv_tracker = None
+        trainer = Trainer(conn, tracker=_srv_tracker)
         client_config = trainer.receive_data()
         print(f"Received client config: {client_config}")
         
@@ -2036,6 +2172,12 @@ if __name__ == "__main__":
                 print(f"{'='*60}")
                 
         # Final evaluation
+        # Mark eval phase for final evaluation
+        try:
+            if _srv_tracker is not None:
+                _srv_tracker.set_phase('eval')
+        except Exception:
+            pass
         print("\nFinal model evaluation...")
         _moved = False
         _eval_device = device
@@ -2050,6 +2192,26 @@ if __name__ == "__main__":
         finally:
             if _moved:
                 full_model.to(device)
+        # Return to train phase (done)
+        try:
+            if _srv_tracker is not None:
+                _srv_tracker.set_phase('train')
+        except Exception:
+            pass
+
+        # Print and persist server compute/communication summary
+        try:
+            if _srv_tracker is not None:
+                _ = _srv_tracker.update_memory()
+                summary = _srv_tracker.print_summary()
+                # Save JSON summary next to logs
+                try:
+                    _srv_tracker.save_stats('server_stats_squad.json')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # now signal completion (non-fatal if client already closed)
         try:
             trainer.send_data({'type': 'training_complete'})

@@ -708,10 +708,10 @@ def squad_collate_fn(batch):
             input_ids.append(item['input_ids'])
             attention_masks.append(item['attention_mask'])
             labels.append(item['labels'])
-            # Optional fields (some codepaths expect server_kv_state even in LoRA mode)
+            # Optional fields (some codepaths expect client_kv_state even in LoRA mode)
             formatted_texts.append(item.get('formatted_text', ""))
             original_examples.append(item.get('original_example', {}))
-            if 'server_kv_state' in item:
+            if 'client_kv_state' in item:
                 pass
         
         # Stack tensors

@@ -29,6 +29,9 @@ from lora import (
     get_lora_state_dict
 )
 
+# Compute/memory & communication tracker
+from compute_tracker import ComputeTracker
+
 try:
     from transformers.cache_utils import DynamicCache, StaticCache
 except Exception:
@@ -56,9 +59,9 @@ class LoRAClientModel(nn.Module):
     """
     def __init__(self, model_name: str, total_layers: int, cut_layer: int,
                  r: int = 8, alpha: int = 16, dropout: float = 0.0,
-                 targets=("q_proj","v_proj")):
+                 targets=("q_proj","v_proj"), torch_dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype, device_map=None)
         for p in self.base_model.parameters():
             p.requires_grad = False
         self.total_layers = total_layers
@@ -81,9 +84,9 @@ class FullClientModel(nn.Module):
     Client-side when tuning=full. Keeps full base_model; trains layers [cut..L-1] + final_layer_norm + lm_head.
     Presents no-prefix stubs so unified forward-from-cut path works without KV prefixes.
     """
-    def __init__(self, model_name: str, total_layers: int, cut_layer: int):
+    def __init__(self, model_name: str, total_layers: int, cut_layer: int, torch_dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype, device_map=None)
         for p in self.base_model.parameters():
             p.requires_grad = False
         self.total_layers = total_layers
@@ -117,10 +120,10 @@ class FullClientModel(nn.Module):
 def _estimate_g_cut_fd(kv_model, h_cut, attention_mask, labels, cut, mu=1e-3, num_pert=8, mode: str = 'central'):
     # h_cut on the right device/dtype already
     h0 = h_cut
-    g_hat = torch.zeros_like(h0, dtype=torch.float32)
+    g_hat = torch.zeros_like(h0, dtype=h0.dtype)
 
     for _ in range(num_pert):
-        u = torch.randn_like(h0, dtype=torch.float32)
+        u = torch.randn_like(h0, dtype=h0.dtype)
         with torch.no_grad():
             lp = _client_forward_from_cut(
                 kv_model, h_cut=h0 + mu*u,
@@ -283,7 +286,7 @@ def _client_forward_from_cut(
     out = {"loss": float(loss.item())}
     if compute_g_cut:
         g_cut, = torch.autograd.grad(loss, h, retain_graph=return_loss_tensor)
-        out["g_cut"] = g_cut.detach().to(torch.float32).cpu()
+        out["g_cut"] = g_cut.detach().to(h.dtype).cpu()
     
     if return_loss_tensor:
         out["loss_tensor"] = loss  # Return the torch tensor for local update
@@ -308,9 +311,9 @@ class ClientKVModel(nn.Module):
       - client_kv: trainable prefixes for the client's layers
     We still run the full model on the client, but inject KV prefixes into all layers.
     """
-    def __init__(self, model_name, total_layers, cut_layer, num_prefix=10):
+    def __init__(self, model_name, total_layers, cut_layer, num_prefix=10, torch_dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map=None)
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype, device_map=None)
         for p in self.base_model.parameters():
             p.requires_grad = False
 
@@ -406,9 +409,17 @@ class Client:
     def __init__(self, host, port):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((host, port))
+        self.tracker = None
         
     def send_data(self, data):
         try:
+            if getattr(self, 'tracker', None) is not None:
+                try:
+                    if isinstance(data, dict) and ('mode' in data):
+                        self.tracker.set_phase('eval' if str(data.get('mode')).lower() == 'eval' else 'train')
+                    self.tracker.track_send(data)
+                except Exception:
+                    pass
             serialized = pickle.dumps(data)
             self.socket.sendall(len(serialized).to_bytes(4, 'big'))
             self.socket.sendall(serialized)
@@ -422,7 +433,16 @@ class Client:
             data = b''
             while len(data) < length:
                 data += self.socket.recv(length - len(data))
-            return pickle.loads(data)
+            obj = pickle.loads(data)
+            if getattr(self, 'tracker', None) is not None:
+                try:
+                    # If the message carries a mode, set phase accordingly before counting
+                    if isinstance(obj, dict) and ('mode' in obj):
+                        self.tracker.set_phase('eval' if str(obj.get('mode')).lower() == 'eval' else 'train')
+                    self.tracker.track_receive(obj)
+                except Exception:
+                    pass
+            return obj
         except Exception as e:
             print(f"⌠Failed to receive data: {e}")
             raise
@@ -474,11 +494,17 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
 
     # --- Pure evaluation mode OR strict ZOO probe: compute MEAN loss only, no updates or gradients ---
     if mode == "eval" or bool(meta.get("zoo_eval", False)):
+        # Ensure tracker reflects eval phase for accurate memory/round attribution
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('eval')
+        except Exception:
+            pass
         model_ref = getattr(kv_model, "base_model", kv_model)
         param0 = next(model_ref.parameters())
         target_device = param0.device
-        # Force fp32 for strict ZOO probes to preserve FD signal
-        target_dtype  = torch.float32
+        # Match model parameter dtype for eval to keep parity with training
+        target_dtype  = param0.dtype
 
         attn_mask = server_data.get("attention_mask", None)
         labels = server_data.get("labels", None)
@@ -494,7 +520,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         kv_model.eval()  # disable dropout for stability
         with torch.no_grad():
             with autocast(enabled=False):
-                h_cut = server_data["h_cut"].to(device=target_device, dtype=torch.float32)
+                h_cut = server_data["h_cut"].to(device=target_device, dtype=target_dtype)
                 out = _client_forward_from_cut(
                     kv_model,
                     h_cut=h_cut.detach(),
@@ -504,6 +530,14 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
                     compute_g_cut=False,
                     return_loss_tensor=False,
                 )
+
+        # Track eval-phase memory after forward
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('eval')
+                client.tracker.update_memory()
+        except Exception:
+            pass
 
         if bool(meta.get("zoo_eval", False)):
             # Strict ZOO probe: return scalar loss only
@@ -567,6 +601,13 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
             kv_model, h_cut=h_cut, attention_mask=attn_mask, labels=labels,
             cut=cut, compute_g_cut=False, return_loss_tensor=True
         )
+        # Sample memory after forward
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
     else:
         # STRICT ZOO: no graph, no boundary-grad inside this forward
         with torch.no_grad():
@@ -587,16 +628,35 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         # True first-order update of client prefixes
         optimizer.zero_grad(set_to_none=True)
         loss_tensor.backward()  # grads flow into client prefixes (and h_cut.grad if required)
+        # Sample memory after backward
         try:
-            torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
+        try:
+            torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=float(args.clip_grad_norm))
         except Exception:
             pass
         if need_g_cut:
             if h_cut.grad is None:
                 raise RuntimeError("need_g_cut=True but h_cut.grad is None. Ensure h_cut.requires_grad_(True).")
             g = h_cut.grad.detach()
-            g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
+            try:
+                gcut_choice = str(getattr(args, "gcut_dtype", "fp32")).lower()
+            except Exception:
+                gcut_choice = "fp32"
+            gcut_dtype = (torch.float16 if gcut_choice == "fp16" else torch.float32)
+            g_cut_to_send = g.to(dtype=gcut_dtype, device="cpu").contiguous().numpy()
         optimizer.step()
+        # Sample memory after optimizer step
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
 
         # clean leaf grad
         if h_cut.grad is not None:
@@ -611,7 +671,7 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
             try:
                 g = _estimate_g_cut_fd(
                     kv_model,
-                    h_cut.to(dtype=torch.float32, device=target_device),
+                    h_cut.to(dtype=target_dtype, device=target_device),
                     attn_mask, labels, cut,
                     mu=getattr(args, "mu_gcut", getattr(args, "mu", 1e-2)),
                     num_pert=getattr(args, "num_pert_gcut", getattr(args, "num_pert", 16)),
@@ -620,7 +680,20 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
             finally:
                 if was_training:
                     kv_model.train()
-            g_cut_to_send = g.to(dtype=torch.float32, device="cpu").contiguous().numpy()
+            try:
+                gcut_choice = str(getattr(args, "gcut_dtype", "fp32")).lower()
+            except Exception:
+                gcut_choice = "fp32"
+            gcut_dtype = (torch.float16 if gcut_choice == "fp16" else torch.float32)
+            g_cut_to_send = g.to(dtype=gcut_dtype, device="cpu").contiguous().numpy()
+
+        # Update train-phase memory after optional g_cut probe
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
 
     # else:
     #     # Zeroth order update of client prefixes (loss-only objective)
@@ -668,27 +741,34 @@ def handle_forward_cut_unified(client, kv_model, optimizer, grad_estimator, args
         _dummy_y = torch.zeros(1)
         # Run your estimator (MeZO-style), then step
         optimizer.zero_grad(set_to_none=True)
-        # grad_estimator.model_params = list(kv_model.client_kv.parameters())  # ensure current params
         grad_estimator.model_params = list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())())
-
         try:
             grad_estimator.estimate_gradients(_dummy_x, _dummy_y, client_objective,
-                                              random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+                                                random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
         except TypeError:
             # Fallback if your class has the old signature
             grad_estimator.estimate_gradients(torch.zeros(1), torch.zeros(1), client_objective,
-                                              random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
-        # torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
+                                                random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+        # Track memory after gradient estimation (train phase)
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
         optimizer.step()
-        # STRICT ZOO probe: return scalar loss only, no client updates here
-        # with torch.no_grad():
-        #     pass  # ensure no autograd graph kept
-        # Apply FD gradients to client params
         try:
             torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.client_kv.parameters())()), max_norm=1.0)
         except Exception:
             pass
         optimizer.step()
+        # Track memory after optimizer step (train phase)
+        try:
+            if client.tracker is not None:
+                client.tracker.set_phase('train')
+                client.tracker.update_memory()
+        except Exception:
+            pass
 
     # ---- Reply to server ----
     reply = {"loss": float(loss_tensor.item())}
@@ -744,7 +824,8 @@ def parse_args():
     
     # argparse setup
     parser.add_argument("--gcut-dtype", choices=["fp16", "fp32"], default="fp32", help="Wire precision for g_cut payloads.")
-    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='auto', help='Precision for wire activations (client will honor server)')
+    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='off', help='Precision for wire activations (client will honor server)')
+    parser.add_argument('--compute_dtype', choices=['fp16','fp32'], default='fp32', help='Compute/model dtype for client (fp16 or fp32)')
 
     args = parser.parse_args()
     return args
@@ -819,26 +900,29 @@ if __name__ == "__main__":
     print("Tokenizer loaded successfully")
     
     print("Creating client model...")
+    # Resolve compute dtype
+    _compute_dtype = (torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)
     # KV prefix model (new): always create so handlers can access
-    tmp_cfg = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32, device_map=None).config
+    tmp_cfg = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=_compute_dtype, device_map=None).config
     total_layers = tmp_cfg.num_hidden_layers
     if args.tuning == 'lora':
         kv_model = LoRAClientModel(
             args.model_name, total_layers, args.cut_layer,
             r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
-            targets=tuple(args.lora_targets.split(','))
+            targets=tuple(args.lora_targets.split(',')),
+            torch_dtype=_compute_dtype
         ).to(device)
         trainable_params = list(kv_model.trainable_parameters())
         _assert_only_expected_trainables(kv_model, args.tuning, side="client")
 
         print(f"Client owns layers [{args.cut_layer}, {total_layers-1}] with LoRA r={args.lora_r}, alpha={args.lora_alpha}")
     elif args.tuning == 'full':
-        kv_model = FullClientModel(args.model_name, total_layers, args.cut_layer).to(device)
+        kv_model = FullClientModel(args.model_name, total_layers, args.cut_layer, torch_dtype=_compute_dtype).to(device)
         trainable_params = list(kv_model.trainable_parameters())
         _assert_only_expected_trainables(kv_model, args.tuning, side="client")
         print(f"Client full-FT layers [{args.cut_layer}, {total_layers-1}] enabled; final_layer_norm/lm_head trainable")
     else:
-        kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix).to(device)
+        kv_model = ClientKVModel(args.model_name, total_layers, args.cut_layer, num_prefix=args.num_prefix, torch_dtype=_compute_dtype).to(device)
         for p in getattr(kv_model, "base_model", kv_model).parameters():
             p.requires_grad = False
         for p in kv_model.client_kv.parameters():
@@ -894,6 +978,12 @@ if __name__ == "__main__":
         print(f"Trying to connect to server at {args.host}:{args.port}...")
         
         client = Client(args.host, args.port)
+        # Attach compute tracker for client process
+        try:
+            _cli_tracker = ComputeTracker(device=device, role="client")
+        except Exception:
+            _cli_tracker = None
+        client.tracker = _cli_tracker
         
         print("=" * 60)
         print("CLIENT SUCCESSFULLY CONNECTED TO SERVER!")
@@ -937,6 +1027,11 @@ if __name__ == "__main__":
 
             mtype = msg.get("type", "")
             if mtype == "get_client_kv_state":
+                try:
+                    if _cli_tracker is not None:
+                        _cli_tracker.set_phase('eval')  # state fetch occurs during eval context
+                except Exception:
+                    pass
                 # In LoRA mode there are no client prefixes; return empty state
                 if args.tuning == 'lora' or not hasattr(kv_model, 'client_kv'):
                     client.send_data({"type": "client_kv_state", "state": {"k": None, "v": None}})
@@ -949,6 +1044,11 @@ if __name__ == "__main__":
                 continue
 
             elif mtype == "get_client_prefix_snapshot":
+                try:
+                    if _cli_tracker is not None:
+                        _cli_tracker.set_phase('eval')
+                except Exception:
+                    pass
                 with torch.no_grad():
                     if hasattr(kv_model, "client_kv") and getattr(kv_model.client_kv, "k", None) is not None:
                         kc = kv_model.client_kv.k.detach().cpu()
@@ -964,6 +1064,11 @@ if __name__ == "__main__":
 
             elif mtype == "get_client_lora_state":
                 try:
+                    if _cli_tracker is not None:
+                        _cli_tracker.set_phase('eval')
+                except Exception:
+                    pass
+                try:
                     # Return LoRA A/B only for client half [cut..L-1]
                     if args.tuning == 'lora':
                         state = get_lora_state_dict(
@@ -978,6 +1083,11 @@ if __name__ == "__main__":
                 continue
 
             elif mtype == "get_client_full_state":
+                try:
+                    if _cli_tracker is not None:
+                        _cli_tracker.set_phase('eval')
+                except Exception:
+                    pass
                 try:
                     if args.tuning == 'full':
                         base = getattr(kv_model, "base_model", kv_model)
@@ -1008,6 +1118,12 @@ if __name__ == "__main__":
                 continue
 
             if mtype == "forward_cut":
+                # Training path: mark train phase
+                try:
+                    if _cli_tracker is not None:
+                        _cli_tracker.set_phase('train')
+                except Exception:
+                    pass
                 data = msg.get("data")
                 if data is None or not isinstance(data, dict):
                     print("⌠CLIENT: malformed forward_cut (missing 'data'); ignoring this packet.")
@@ -1049,6 +1165,17 @@ if __name__ == "__main__":
         try:
             client.close()
         except:
+            pass
+        # Print and persist client compute/communication summary
+        try:
+            if '_cli_tracker' in locals() and _cli_tracker is not None:
+                _ = _cli_tracker.update_memory()
+                _ = _cli_tracker.print_summary()
+                try:
+                    _cli_tracker.save_stats('client_stats_squad.json')
+                except Exception:
+                    pass
+        except Exception:
             pass
         print("CLIENT SHUTDOWN COMPLETE")
         

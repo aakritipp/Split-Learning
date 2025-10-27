@@ -51,60 +51,81 @@ class StochasticGradientApproximator:
         loss_diffs = []  # monitor |f+ - f-|
         
         for sample_idx in range(self.sample_count):
-            # Generate random direction
-            torch.manual_seed(random_seed + sample_idx)
-            directions = []
-            for param in self.trainable_params:
-                direction = torch.randint_like(param, low=0, high=2, dtype=torch.float32) * 2.0 - 1.0
-                directions.append(direction)
-            
-            # Forward perturbation: θ + μ * z
-            for param, direction in zip(self.trainable_params, directions):
+            # Use deterministic per-parameter seeds to regenerate directions on-the-fly
+            base_seed = int(random_seed + sample_idx)
+
+            # Forward perturbation: θ <- θ + μ * z
+            for idx, param in enumerate(self.trainable_params):
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(base_seed * 1000003 + idx))
+                direction = (
+                    torch.randint(0, 2, param.shape, dtype=torch.float32, device=param.device, generator=gen) * 2.0 - 1.0
+                )
                 param.data.add_(direction, alpha=self.perturbation_scale)
             try:
                 loss_plus = objective_fn(input_batch, target_labels)
             except Exception as e:
                 print(f"Error in forward perturbation: {e}")
                 loss_plus = torch.tensor(0.0, device=self.compute_device)
-            
+
             if self.estimator_type == 'central':
-                # Backward perturbation: θ - μ * z
-                for param, direction in zip(self.trainable_params, directions):
+                # Move from θ+μz to θ-μz by applying −2μz, then evaluate
+                for idx, param in enumerate(self.trainable_params):
+                    gen = torch.Generator(device=param.device)
+                    gen.manual_seed(int(base_seed * 1000003 + idx))
+                    direction = (
+                        torch.randint(0, 2, param.shape, dtype=torch.float32, device=param.device, generator=gen) * 2.0 - 1.0
+                    )
                     param.data.add_(direction, alpha=-2.0 * self.perturbation_scale)
                 try:
                     loss_minus = objective_fn(input_batch, target_labels)
                 except Exception as e:
                     print(f"Error in backward perturbation: {e}")
                     loss_minus = torch.tensor(0.0, device=self.compute_device)
+
+                # Restore back to θ by applying +μz
+                for idx, param in enumerate(self.trainable_params):
+                    gen = torch.Generator(device=param.device)
+                    gen.manual_seed(int(base_seed * 1000003 + idx))
+                    direction = (
+                        torch.randint(0, 2, param.shape, dtype=torch.float32, device=param.device, generator=gen) * 2.0 - 1.0
+                    )
+                    param.data.add_(direction, alpha=self.perturbation_scale)
+                denom = (2.0 * self.perturbation_scale)
             else:
-                # Forward (one-sided) estimator: use f(θ+μz) - f(θ)
-                # Evaluate f(θ) approximately by restoring params then running objective once
-                for param, direction in zip(self.trainable_params, directions):
+                # One-sided estimator: restore to θ and evaluate f(θ)
+                for idx, param in enumerate(self.trainable_params):
+                    gen = torch.Generator(device=param.device)
+                    gen.manual_seed(int(base_seed * 1000003 + idx))
+                    direction = (
+                        torch.randint(0, 2, param.shape, dtype=torch.float32, device=param.device, generator=gen) * 2.0 - 1.0
+                    )
                     param.data.add_(direction, alpha=-1.0 * self.perturbation_scale)
                 try:
                     loss_minus = objective_fn(input_batch, target_labels)
                 except Exception as e:
                     print(f"Error in base evaluation: {e}")
                     loss_minus = torch.tensor(0.0, device=self.compute_device)
-            
-            # Restore original parameters
-            for param, direction in zip(self.trainable_params, directions):
-                param.data.add_(direction, alpha=self.perturbation_scale)
-            
+                denom = self.perturbation_scale
+
             # Calculate finite difference
             if isinstance(loss_plus, torch.Tensor):
                 loss_plus = loss_plus.item()
             if isinstance(loss_minus, torch.Tensor):
                 loss_minus = loss_minus.item()
-            
+
             fd_num = (loss_plus - loss_minus)
-            denom = (2.0 * self.perturbation_scale) if self.estimator_type == 'central' else (self.perturbation_scale)
             finite_diff = fd_num / denom
             total_loss_diff += finite_diff
             loss_diffs.append(abs(fd_num))
-            
-            # Accumulate gradients: g += (f(θ+μz) - f(θ-μz)) / (2μ) * z
-            for param, direction in zip(self.trainable_params, directions):
+
+            # Accumulate gradients: g += FD * z (re-generate z with the same seeds)
+            for idx, param in enumerate(self.trainable_params):
+                gen = torch.Generator(device=param.device)
+                gen.manual_seed(int(base_seed * 1000003 + idx))
+                direction = (
+                    torch.randint(0, 2, param.shape, dtype=torch.float32, device=param.device, generator=gen) * 2.0 - 1.0
+                )
                 param.grad.add_(direction, alpha=finite_diff)
         
         # Average gradients over samples
