@@ -84,6 +84,199 @@ def _hf_auth_kwargs():
     token = _get_hf_token_from_env()
     return {"token": token} if token else {}
 
+# === Verification and diagnostics utilities for ZOO ===
+def verify_parameter_restoration(model, stage="unknown"):
+    """
+    Verify that model parameters are restored after ZOO estimation.
+
+    This should be called BEFORE optimizer.step() to ensure we're not
+    accidentally updating from a perturbed state.
+    """
+    import hashlib
+
+    # Compute hash of current parameters
+    param_str = ""
+    for param in model.parameters():
+        if param.requires_grad:
+            param_str += str(param.data.cpu().numpy().tobytes())
+
+    current_hash = hashlib.md5(param_str.encode()).hexdigest()
+
+    # Store original hash at start of training
+    if not hasattr(verify_parameter_restoration, 'original_hashes'):
+        verify_parameter_restoration.original_hashes = {}
+        verify_parameter_restoration.original_hashes[id(model)] = current_hash
+        print(f"[{stage}] Stored original parameter hash: {current_hash[:8]}")
+        return True
+
+    # Check if parameters have been modified unintentionally
+    original_hash = verify_parameter_restoration.original_hashes.get(id(model))
+
+    if original_hash != current_hash:
+        print(f"[{stage}] WARNING: Parameters changed unexpectedly!")
+        print(f"  Original hash: {original_hash[:8]}")
+        print(f"  Current hash: {current_hash[:8]}")
+        return False
+
+    return True
+
+class ZOOLogger:
+    """
+    Comprehensive logging for ZOO training to diagnose issues.
+    """
+    def __init__(self, log_dir, model_name="client"):
+        self.log_dir = log_dir
+        self.model_name = model_name
+        self.history = {
+            'step': [],
+            'loss': [],
+            'grad_norm': [],
+            'param_norm': [],
+            'param_change': [],
+            'lr': [],
+            'max_grad': [],
+            'min_grad': [],
+            'grad_variance': [],
+            'predictions': [],
+        }
+
+    def log_step(self, step, loss, model, optimizer, predictions=None):
+        # Compute norms
+        params = [p for p in model.parameters() if p.requires_grad]
+        grads = [p.grad for p in params if getattr(p, 'grad', None) is not None]
+
+        param_norm = sum((p.norm().item() ** 2) for p in params) ** 0.5 if params else 0.0
+        grad_norm = sum((g.norm().item() ** 2) for g in grads) ** 0.5 if grads else 0.0
+
+        if len(self.history['param_norm']) > 0:
+            param_change = abs(param_norm - self.history['param_norm'][-1])
+        else:
+            param_change = 0.0
+
+        if grads:
+            all_grads = torch.cat([g.detach().flatten() for g in grads])
+            max_grad = all_grads.max().item()
+            min_grad = all_grads.min().item()
+            grad_var = all_grads.var().item()
+        else:
+            max_grad = min_grad = grad_var = 0.0
+
+        try:
+            lr = optimizer.param_groups[0]['lr']
+        except Exception:
+            lr = 0.0
+
+        self.history['step'].append(int(step))
+        self.history['loss'].append(float(loss))
+        self.history['grad_norm'].append(float(grad_norm))
+        self.history['param_norm'].append(float(param_norm))
+        self.history['param_change'].append(float(param_change))
+        self.history['lr'].append(float(lr))
+        self.history['max_grad'].append(float(max_grad))
+        self.history['min_grad'].append(float(min_grad))
+        self.history['grad_variance'].append(float(grad_var))
+        if predictions is not None:
+            try:
+                self.history['predictions'].append(predictions.detach().cpu().tolist())
+            except Exception:
+                pass
+
+        print(f"[{self.model_name}] Step {int(step)}:")
+        print(f"  Loss: {float(loss):.4f}")
+        print(f"  Grad norm: {float(grad_norm):.2f}")
+        print(f"  Param norm: {float(param_norm):.2f}")
+        print(f"  Param change: {float(param_change):.2e}")
+        print(f"  LR: {float(lr):.2e}")
+        print(f"  Grad range: [{float(min_grad):.2f}, {float(max_grad):.2f}]")
+
+        if grad_norm < 1e-3:
+            print(f"  ⚠️  WARNING: Gradient norm very small ({grad_norm:.2e})")
+        if grad_norm > 1e4:
+            print(f"  ⚠️  WARNING: Gradient norm very large ({grad_norm:.2e})")
+        if param_change < 1e-6 and int(step) > 10:
+            print(f"  ⚠️  WARNING: Parameters barely changing ({param_change:.2e})")
+
+    def save(self):
+        import json
+        os.makedirs(self.log_dir, exist_ok=True)
+        filepath = os.path.join(self.log_dir, f'{self.model_name}_history.json')
+        with open(filepath, 'w') as f:
+            json.dump(self.history, f, indent=2)
+        print(f"Saved {self.model_name} history to {filepath}")
+
+    def plot(self):
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            print("matplotlib not available; skipping plot")
+            return
+        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
+        fig.suptitle(f'{self.model_name} Training Diagnostics')
+        # Loss
+        axes[0, 0].plot(self.history['step'], self.history['loss'])
+        axes[0, 0].set_xlabel('Step')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Loss over time')
+        axes[0, 0].grid(True)
+        # Gradient norm
+        axes[0, 1].plot(self.history['step'], self.history['grad_norm'])
+        axes[0, 1].set_xlabel('Step')
+        axes[0, 1].set_ylabel('Gradient Norm')
+        axes[0, 1].set_title('Gradient Norm over time')
+        axes[0, 1].set_yscale('log')
+        axes[0, 1].grid(True)
+        # Parameter norm
+        axes[1, 0].plot(self.history['step'], self.history['param_norm'])
+        axes[1, 0].set_xlabel('Step')
+        axes[1, 0].set_ylabel('Parameter Norm')
+        axes[1, 0].set_title('Parameter Norm over time')
+        axes[1, 0].grid(True)
+        # Parameter change
+        axes[1, 1].plot(self.history['step'], self.history['param_change'])
+        axes[1, 1].set_xlabel('Step')
+        axes[1, 1].set_ylabel('Parameter Change')
+        axes[1, 1].set_title('Parameter Change over time')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(True)
+        # Learning rate
+        axes[2, 0].plot(self.history['step'], self.history['lr'])
+        axes[2, 0].set_xlabel('Step')
+        axes[2, 0].set_ylabel('Learning Rate')
+        axes[2, 0].set_title('Learning Rate schedule')
+        axes[2, 0].set_yscale('log')
+        axes[2, 0].grid(True)
+        # Gradient variance
+        axes[2, 1].plot(self.history['step'], self.history['grad_variance'])
+        axes[2, 1].set_xlabel('Step')
+        axes[2, 1].set_ylabel('Gradient Variance')
+        axes[2, 1].set_title('Gradient Variance over time')
+        axes[2, 1].set_yscale('log')
+        axes[2, 1].grid(True)
+        plt.tight_layout()
+        os.makedirs(self.log_dir, exist_ok=True)
+        filepath = os.path.join(self.log_dir, f'{self.model_name}_diagnostics.png')
+        plt.savefig(filepath, dpi=150)
+        print(f"Saved {self.model_name} diagnostics to {filepath}")
+
+def get_conservative_zoo_args():
+    """Return conservative ZOO hyperparameters that should work."""
+    return {
+        'zoo_lr': 1e-5,
+        'mu': 1e-3,
+        'num_pert': 1,
+        'train_batch_size': 16,
+        'lora_r': 8,
+        'lora_alpha': 16,
+        'weight_decay': 0.001,
+        'warmup_steps': 200,
+        'scheduler': 'constant_with_warmup',
+        'zoo_max_grad_value': 0.0,
+        'estimator': 'central',
+        'zoo_perturbation_type': 'gaussian',
+        'max_steps': 2000,
+        'eval_steps': 50,
+    }
+
 def try_hf_login():
     token = _get_hf_token_from_env()
     if not token:
@@ -201,43 +394,7 @@ class _SchedAdapter:
             except Exception:
                 pass
 
-def _use_fp16_for_hcut(args, mode: str) -> bool:
-    """Decide wire precision for h_cut payloads.
-
-    mode in {"train_zoo", "train_sgd", "eval"}.
-    - fp16 reduces bandwidth.
-    - fp32 preserves numeric fidelity (important for ZOO finite-difference probes).
-    """
-    pref = str(getattr(args, "hcut_dtype", "auto")).lower()
-    if pref == "fp16":
-        return True
-    if pref == "fp32":
-        return False
-    # auto
-    if mode == "train_zoo":
-        return False
-    # Prefer fp16 for SGD/eval to reduce bandwidth; server casts back to model dtype
-    return True
-
-def _choose_send_fp16(args, mode: str) -> bool:
-    """Decide wire precision for h_cut payloads.
-    policy 'auto': fp32 for ZOO training to avoid FD quantization; fp16 otherwise.
-    policy 'on'/'off': force fp16/fp32 respectively.
-    """
-    try:
-        policy = getattr(args, 'wire_fp16', 'auto')
-    except Exception:
-        policy = 'auto'
-    if policy == 'on':
-        return True
-    if policy == 'off':
-        return False
-    # auto
-    if mode in ('zoo_train', 'zoo_eval'):
-        return False
-    if getattr(args, 'use_zeroth_order', False):
-        return False
-    return True
+## Deprecated helpers removed in favor of unified --precision
 
 def _refresh_eval_prefixes(full_model, client_model, trainer, args):
     """
@@ -939,7 +1096,7 @@ def evaluate_model(model, test_loader, device, tokenizer, args, client_model=Non
                 dev_for_combined = (torch.device('cpu') if (bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora') else device)
                 full_eval = AutoModelForCausalLM.from_pretrained(
                     args.model_name,
-                    torch_dtype=torch.float32,
+                    torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32),
                     device_map=None
                 ).to(dev_for_combined)
                 for p in full_eval.parameters():
@@ -1059,14 +1216,8 @@ def evaluate_model(model, test_loader, device, tokenizer, args, client_model=Non
 
                 # If split eval context exists, ask server to compute loss on its half once
                 if split_eval:
-                    # Choose wire precision dynamically for eval
-                    if args.wire_fp16 == 'on':
-                        _use_fp16 = True
-                    elif args.wire_fp16 == 'off':
-                        _use_fp16 = False
-                    else:  # auto
-                        # Avoid fp16 if either side is doing ZOO (client or server).
-                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_server', False)))
+                    # Use unified precision flag
+                    _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
                     h_cut_live, pkg = _client_forward_to_cut_payload(
                         client_model,
                         input_ids, attention_mask, labels,
@@ -1148,6 +1299,13 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
     except Exception:
         pass
     print(f"   Eval every: {args.eval_steps} steps")
+    # Initialize diagnostics
+    try:
+        _log_dir = os.path.join(os.getcwd(), "ZOO_logs")
+        os.makedirs(_log_dir, exist_ok=True)
+        logger_client = ZOOLogger(_log_dir, "client")
+    except Exception:
+        logger_client = None
 
     # --- FIX 1: define params to perturb depending on tuning mode ---
     # In prefix mode, perturb client KV prefixes; in LoRA mode, perturb LoRA adapters.
@@ -1189,14 +1347,27 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
         # Ultimate fallback: any trainable parameter
         client_params = [p for p in client_model.parameters() if p.requires_grad]
 
-    # Create gradient estimator for client KV
+    # Create gradient estimator on the EXACT params optimized by 'optimizer'
+    # This guarantees grads land on the same Parameter objects that optimizer.step() updates.
+    try:
+        _opt_params = []
+        for _group in getattr(optimizer, 'param_groups', []):
+            for _p in _group.get('params', []):
+                if isinstance(_p, torch.nn.Parameter) and _p.requires_grad:
+                    _opt_params.append(_p)
+        if not _opt_params:
+            _opt_params = client_params
+    except Exception:
+        _opt_params = client_params
     grad_estimator = StochasticGradientApproximator(
-        model_params=client_params,
+        model_params=_opt_params,
         perturbation_scale=args.mu,
         sample_count=args.num_pert,
         compute_device=device,
-        data_type=torch.float32,
-        estimator_type=str(getattr(args, 'estimator', 'central'))
+        data_type=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32),
+        estimator_type=str(getattr(args, 'estimator', 'central')),
+        perturbation_type=str(getattr(args, 'zoo_perturbation_type', 'gaussian')),
+        max_grad_value=float(getattr(args, 'zoo_max_grad_value', 500.0))
     )
 
     client_model.train()
@@ -1206,16 +1377,19 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
             _srv_tracker.set_phase('train')
     except Exception:
         pass
+    # Diagnostic: snapshot initial trainable parameters to measure changes
+    _client_initial_params = {}
+    try:
+        _base_mod = getattr(client_model, 'base_model', client_model)
+        for _name, _param in _base_mod.named_parameters():
+            if _param.requires_grad:
+                _client_initial_params[_name] = _param.detach().clone()
+    except Exception:
+        _client_initial_params = None
     losses, accs = [], []
     global_step = 0
+    stop_training = False
 
-    # Smoothing and accumulation controls for incremental ZOO updates
-    ema_beta = float(getattr(args, 'zoo_grad_ema_beta', 0.0))
-    accum_steps = max(1, int(getattr(args, 'zoo_accum_steps', 1)))
-    # Buffers are aligned to client_params order
-    ema_buffers = [None] * len(client_params)
-    accum_buffers = [None] * len(client_params)
-    accum_counter = 0
 
     try:
         is_plateau_sched = (str(getattr(args, 'scheduler', 'plateau')).lower() == 'plateau')
@@ -1249,45 +1423,97 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
 
                     optimizer.zero_grad(set_to_none=True)
 
-                    def objective_fn():
-                        # Ensure deterministic probe: disable dropout temporarily
-                        was_training = client_model.training
-                        client_model.eval()
-                        with torch.no_grad():
-                            # ZOO probe wire precision
-                            if args.wire_fp16 == 'on':
-                                _use_fp16 = True
-                            elif args.wire_fp16 == 'off':
-                                _use_fp16 = False
-                            else:  # auto -> use fp32 for ZOO
-                                _use_fp16 = False
-                            h_cut_live, pkg = _client_forward_to_cut_payload(
-                                client_model,
-                                input_ids, attention_mask, labels,
-                                send_fp16=_use_fp16
-                            )
-                        pkg["tgt_len"] = int(h_cut_live.shape[1])
-                        # Request server to compute loss only (no local update, no g_cut)
-                        trainer.send_data({
-                            "type": "forward_cut",
-                            "mode": "train",
-                            "data": pkg,
-                            "meta": {"zoo_eval": True, "need_g_cut": False}
-                        })
-                        # client is ZOO; the server should skip g_cut and return loss only
-                        resp = trainer.receive_data()  # {'type': 'loss_report', 'loss': float}
-                        # Track memory after eval-like loss fetch (still training phase accounting)
+                    # SOLUTION 1: Generate synchronized seed for coordinated perturbations
+                    # This ensures client and server use the same random seed, eliminating cross-terms
+                    # that cause gradient explosion in split learning ZOO-ZOO
+                    sync_seed = global_step * 1000 + batch_idx + args.seed
+                    if global_step in (0, 10):
+                        print(f"Client sync_seed @step {global_step}: {sync_seed}")
+                        # Debug Phase-2 flags and cadence at key steps
                         try:
-                            if _srv_tracker is not None:
-                                _srv_tracker.set_phase('train')
-                                _srv_tracker.update_memory()
+                            warm_dbg = int(getattr(args, 'server_sgd_warmup_steps', 0))
+                            every_dbg = max(1, int(getattr(args, 'server_sgd_every', 1)))
+                            print(f"[phase2-debug] seq={bool(getattr(args,'sequential_zoo', False))}, "
+                                  f"srvZOO={bool(getattr(args,'use_zeroth_order_server', False))}, "
+                                  f"warm={warm_dbg}, every={every_dbg}")
                         except Exception:
                             pass
-                        loss_val = float(resp.get("loss", 0.0))
-                        if was_training:
-                            client_model.train()
-                        # Keep FD objective in full precision; no autograd path needed
-                        return torch.tensor(float(loss_val), dtype=next(client_model.base_model.parameters()).dtype)
+
+                    # EARLY PHASE-2 PROBE: run immediately for first N steps (diagnostic)
+                    try:
+                        _force_n = max(0, int(getattr(args, 'force_phase2_probe', 0)))
+                    except Exception:
+                        _force_n = 0
+                    if _force_n > 0 and global_step < _force_n and bool(getattr(args, 'sequential_zoo', False)) and bool(getattr(args, 'use_zeroth_order_server', False)):
+                        try:
+                            _phase2_id = int(global_step)
+                            print(f"\n[phase2-enter] gstep={global_step}, phase2_id={_phase2_id} [forced-early]", flush=True)
+                            print(f"PHASE 2: Updating SERVER parameters (client FIXED)...", flush=True)
+                            _was_training = client_model.training
+                            client_model.eval()
+                            with torch.no_grad():
+                                _use_fp16 = False
+                                _h_cut_fix, _pkg_fix = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                _pkg_fix["tgt_len"] = int(_h_cut_fix.shape[1])
+                            _base_seed_server = int(sync_seed) + int(getattr(args, 'num_pert', 10))
+                            trainer.send_data({
+                                "type": "zoo_server_update",
+                                "mode": "train",
+                                "data": _pkg_fix,
+                                "meta": {
+                                    "zoo_phase": "server_update",
+                                    "num_perturbations": int(getattr(args, 'num_pert', 10)),
+                                    "base_seed": int(_base_seed_server),
+                                    "mu": float(getattr(args, 'mu', 1e-3)),
+                                    "step": int(global_step),
+                                    "phase2_id": int(_phase2_id)
+                                }
+                            })
+                            _srv_resp = trainer.receive_data()
+                            print(f"[phase2-exit] gstep={global_step}, resp_type={_srv_resp.get('type') if isinstance(_srv_resp, dict) else type(_srv_resp)}, phase2_id={(isinstance(_srv_resp, dict) and _srv_resp.get('phase2_id'))}", flush=True)
+                            if _was_training:
+                                client_model.train()
+                        except Exception as _probe_e:
+                            print(f"⚠️ Phase2 forced-early probe failed: {_probe_e}", flush=True)
+
+                    def objective_fn():
+                        # Run ZOO evaluations with dropout disabled to remove extra stochasticity
+                        was_training = client_model.training
+                        try:
+                            client_model.eval()
+                            with torch.no_grad():
+                                _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
+                                h_cut_live, pkg = _client_forward_to_cut_payload(
+                                    client_model,
+                                    input_ids, attention_mask, labels,
+                                    send_fp16=_use_fp16
+                                )
+                            pkg["tgt_len"] = int(h_cut_live.shape[1])
+                            trainer.send_data({
+                                "type": "forward_cut",
+                                "mode": "train",
+                                "data": pkg,
+                                "meta": {"zoo_eval": True, "need_g_cut": False, "sync_seed": sync_seed, "step": int(global_step)}
+                            })
+                            resp = trainer.receive_data()
+                            try:
+                                if _srv_tracker is not None:
+                                    _srv_tracker.set_phase('train')
+                                    _srv_tracker.update_memory()
+                            except Exception:
+                                pass
+                            loss_val = float(resp.get("loss", 0.0))
+                            if loss_val > 20.0 or loss_val < 0.0 or not np.isfinite(loss_val):
+                                print(f"WARNING: Suspicious loss value detected: {loss_val:.6f}. This may indicate:")
+                                print(f"  - Loss computation error")
+                                print(f"  - Model divergence")
+                                print(f"  - Label/input mismatch")
+                            return torch.tensor(float(loss_val), dtype=next(client_model.base_model.parameters()).dtype)
+                        finally:
+                            if was_training:
+                                client_model.train()
 
                     def objective_fn_c(*_args,**_kwargs):
                         return objective_fn()
@@ -1298,9 +1524,9 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                     pkg_probe = None
                     if use_gcut:
                         try:
-                            client_model.eval()
+                            # CRITICAL FIX: Keep model in training mode (consistent with objective_fn fix)
                             with torch.no_grad():
-                                _use_fp16 = False  # force fp32 for ZOO
+                                _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
                                 h_probe, pkg_probe = _client_forward_to_cut_payload(
                                     client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
                                 )
@@ -1309,7 +1535,7 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                                 "type": "forward_cut",
                                 "mode": "train",
                                 "data": pkg_probe,
-                                "meta": {"zoo_eval": False, "need_g_cut": True, "local_sgd": False}
+                                "meta": {"zoo_eval": False, "need_g_cut": True, "local_sgd": False, "step": int(global_step)}
                             })
                             resp_gc = trainer.receive_data()
                             if isinstance(resp_gc, dict) and ("g_cut" in resp_gc):
@@ -1324,39 +1550,76 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                         if g_cut_tensor is None:
                             return objective_fn()
                         was_training = client_model.training
-                        client_model.eval()
-                        with torch.no_grad():
-                            _use_fp16 = False
-                            h_tmp, _ = _client_forward_to_cut_payload(
-                                client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
-                            )
-                        if was_training:
-                            client_model.train()
-                        v = (h_tmp.to(dtype=g_cut_tensor.dtype) * g_cut_tensor).sum().item()
-                        return torch.tensor(float(v), dtype=torch.float32)
+                        try:
+                            client_model.eval()
+                            with torch.no_grad():
+                                _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
+                                h_tmp, _ = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                            v = (h_tmp.to(dtype=g_cut_tensor.dtype) * g_cut_tensor).sum().item()
+                            return torch.tensor(float(v), dtype=torch.float32)
+                        finally:
+                            if was_training:
+                                client_model.train()
 
-                    # Estimate gradients for client KV via ZOO with RMS-scaled μ and diversified seed
+                    # Estimate gradients for client KV via ZOO with configurable μ scaling
                     pbar.set_description("Training (ZOO) | Computing ZOO gradients...")
-                    grad_estimator.model_params = client_params
-                    # RMS scale μ per step
-                    with torch.no_grad():
-                        squares, count = 0.0, 0
-                        for p in client_params:
-                            squares += (p.data.float()**2).sum().item()
-                            count   += int(p.numel())
-                        rms = (squares / max(1, count))**0.5
+                    # Always estimate grads on the EXACT Parameter objects the optimizer will step
+                    try:
+                        _opt_params_step = []
+                        for _grp in getattr(optimizer, 'param_groups', []):
+                            for _pp in _grp.get('params', []):
+                                if isinstance(_pp, torch.nn.Parameter) and _pp.requires_grad:
+                                    _opt_params_step.append(_pp)
+                        if _opt_params_step:
+                            grad_estimator.model_params = _opt_params_step
+                        else:
+                            grad_estimator.model_params = client_params
+                    except Exception:
+                        grad_estimator.model_params = client_params
+
+                    # Choose mu scaling method
+                    # CRITICAL FIX: Use 'fixed' by default (like server) - RMS scaling makes mu WAY too large
+                    # RMS scaling multiplies mu by parameter RMS (often 0.1-1.0), making perturbations 100-1000x larger!
                     base_mu = float(getattr(args, 'mu', 1e-3))
-                    scaled_mu = max(1e-5, base_mu) * (rms if rms > 0 else 1.0)
+                    mu_scaling = str(getattr(args, 'zoo_mu_scaling', 'fixed')).lower()
+
+                    if mu_scaling == 'fixed':
+                        # Fixed mu (like MeZO) - use base_mu directly
+                        scaled_mu = base_mu
+                    else:  # mu_scaling == 'rms'
+                        # RMS scale μ per step (current implementation)
+                        with torch.no_grad():
+                            squares, count = 0.0, 0
+                            for p in client_params:
+                                squares += (p.data.float()**2).sum().item()
+                                count   += int(p.numel())
+                            rms = (squares / max(1, count))**0.5
+                        scaled_mu = max(1e-5, base_mu) * (rms if rms > 0 else 1.0)
+
                     old_mu = getattr(grad_estimator, 'perturbation_scale', scaled_mu)
                     grad_estimator.perturbation_scale = scaled_mu
                     try:
+                        # Parameter restoration safety check (before ZOO)
+                        try:
+                            _ = verify_parameter_restoration(getattr(client_model, 'base_model', client_model), "before_ZOO")
+                        except Exception:
+                            pass
+                        # SOLUTION 1: Use synchronized seed for client perturbations
+                        # This ensures client and server perturbations are correlated, eliminating cross-terms
                         grad_estimator.estimate_gradients(
                             input_ids, labels,
                             (objective_fn_gcut if use_gcut else objective_fn_c),
-                            random_seed=global_step * 1000 + batch_idx + args.seed
+                            random_seed=sync_seed
                         )
                     finally:
                         grad_estimator.perturbation_scale = old_mu
+                    # Parameter restoration safety check (after ZOO, before step)
+                    try:
+                        _ = verify_parameter_restoration(getattr(client_model, 'base_model', client_model), "after_ZOO")
+                    except Exception:
+                        pass
 
                     # Track memory after gradient estimation
                     try:
@@ -1366,87 +1629,59 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                     except Exception:
                         pass
 
-                    # Optional gradient smoothing (EMA) for stability
-                    if ema_beta > 0.0:
-                        for idx, p in enumerate(client_params):
-                            if p.grad is None:
-                                continue
-                            buf = ema_buffers[idx]
-                            if buf is None:
-                                buf = p.grad.detach().clone()
-                            else:
-                                buf.mul_(ema_beta).add_(p.grad, alpha=(1.0 - ema_beta))
-                            ema_buffers[idx] = buf
-                            p.grad.copy_(buf)
-
-                    stepped_this_iter = False
-                    if accum_steps > 1:
-                        # Accumulate gradients for N steps before applying the update
-                        for idx, p in enumerate(client_params):
-                            if p.grad is None:
-                                continue
-                            if accum_buffers[idx] is None:
-                                accum_buffers[idx] = p.grad.detach().clone()
-                            else:
-                                accum_buffers[idx].add_(p.grad)
-                        accum_counter += 1
-
-                        if (accum_counter % accum_steps) == 0:
-                            # Load averaged gradients back into .grad and step
-                            for idx, p in enumerate(client_params):
-                                if accum_buffers[idx] is None:
-                                    continue
-                                avg = accum_buffers[idx].div(float(accum_steps))
-                                if p.grad is None:
-                                    p.grad = avg.detach().clone()
-                                else:
-                                    p.grad.copy_(avg)
-                            # Optional gradient clipping for stability
-                            try:
-                                if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
-                                    params_to_clip = []
-                                    for group in optimizer.param_groups:
-                                        for p in group.get('params', []):
-                                            if p.grad is not None:
-                                                params_to_clip.append(p)
-                                    if params_to_clip:
-                                        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
-                            except Exception:
-                                pass
-                            optimizer.step()
-                            # Track memory after optimizer step
-                            try:
-                                if _srv_tracker is not None:
-                                    _srv_tracker.set_phase('train')
-                                    _srv_tracker.update_memory()
-                            except Exception:
-                                pass
-                            # Reset accumulators
-                            accum_buffers = [None] * len(client_params)
-                            accum_counter = 0
-                            stepped_this_iter = True
-                            if not is_plateau_sched:
-                                try:
-                                    scheduler.step()
-                                except Exception:
-                                    pass
-                        else:
-                            # Skip optimizer step this iteration
-                            stepped_this_iter = False
-                    else:
-                        # No accumulation: step every iteration
+                    # Step every iteration (no ZOO-specific accumulation)
+                    # Apply clipping if explicitly requested (>0)
                         try:
-                            if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                            clip_value = getattr(args, 'clip_grad_norm', 0.0)
+                            if clip_value > 0.0:
                                 params_to_clip = []
                                 for group in optimizer.param_groups:
                                     for p in group.get('params', []):
                                         if p.grad is not None:
                                             params_to_clip.append(p)
                                 if params_to_clip:
-                                    torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
+                                    torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=clip_value)
+                        except Exception:
+                            pass
+                        # Debug: ensure grads exist on optimizer params
+                        try:
+                            _num_opt_grads = sum(1 for _g in optimizer.param_groups for _p in _g.get('params', []) if getattr(_p, 'grad', None) is not None)
+                            if (global_step < 3) or (global_step % 50 == 0):
+                                print(f"[zoo-debug] optimizer params with grads: {_num_opt_grads}")
                         except Exception:
                             pass
                         optimizer.step()
+                        # Per-step LoRA debug: report grad norm and max |Δ| for key adapters
+                        try:
+                            if str(getattr(args, 'tuning', 'prefix')) == 'lora':
+                                _base_mod_dbg = getattr(client_model, 'base_model', client_model)
+                                if not hasattr(train_split_learning_zoo, '_lora_prev'):
+                                    train_split_learning_zoo._lora_prev = {}
+                                _prev_map = train_split_learning_zoo._lora_prev
+                                _targets = (
+                                    'model.decoder.layers.0.self_attn.q_proj.lora_A',
+                                    'model.decoder.layers.0.self_attn.q_proj.lora_B',
+                                    'model.decoder.layers.0.self_attn.v_proj.lora_A',
+                                    'model.decoder.layers.0.self_attn.v_proj.lora_B',
+                                )
+                                for _name, _param in _base_mod_dbg.named_parameters():
+                                    if _param.requires_grad and _name in _targets:
+                                        try:
+                                            _g = _param.grad
+                                            _gn = float(_g.norm().item()) if (_g is not None) else 0.0
+                                        except Exception:
+                                            _gn = 0.0
+                                        _last = _prev_map.get(_name, _param.detach().clone())
+                                        _dmax = float((_param.detach() - _last).abs().max().item())
+                                        print(f"[lora-delta] {_name}: grad_norm={_gn:.3e} max|Δ|={_dmax:.3e}")
+                                        _prev_map[_name] = _param.detach().clone()
+                        except Exception:
+                            pass
+                        # Parameter restoration vs step check (after optimizer step)
+                        try:
+                            _ = verify_parameter_restoration(getattr(client_model, 'base_model', client_model), "after_step")
+                        except Exception:
+                            pass
                         # Track memory after optimizer step
                         try:
                             if _srv_tracker is not None:
@@ -1458,8 +1693,84 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                         if not is_plateau_sched:
                             try:
                                 scheduler.step()
+                                # Diagnostic: Log LR every 25 steps to verify scheduler is working
+                                if global_step % 25 == 0:
+                                    current_lr = _get_current_lr(optimizer)
+                                    print(f"[LR] Step {global_step}: LR = {current_lr:.6g}")
                             except Exception:
                                 pass
+
+                        # ================================================================
+                        # Phase 2: Trigger SERVER ZOO update with fixed client (sequential)
+                        # ================================================================
+                        try:
+                            if bool(getattr(args, 'use_zeroth_order_server', False)) and bool(getattr(args, 'sequential_zoo', False)):
+                                # Gate Phase 2 by warmup/cadence OR force-probe for first N steps
+                                warm = int(getattr(args, 'server_sgd_warmup_steps', 0))
+                                every = max(1, int(getattr(args, 'server_sgd_every', 1)))
+                                force_n = max(0, int(getattr(args, 'force_phase2_probe', 0)))
+                                try:
+                                    print(f"[phase2-check] gstep={global_step} seq={bool(getattr(args,'sequential_zoo', False))} srvZOO={bool(getattr(args,'use_zeroth_order_server', False))} warm={warm} every={every} force={force_n}", flush=True)
+                                except Exception:
+                                    pass
+                                should_run = ((global_step >= warm) and (global_step % every == 0)) or (global_step < force_n)
+                                try:
+                                    print(f"[phase2-should-run] gstep={global_step} -> {bool(should_run)}", flush=True)
+                                except Exception:
+                                    pass
+                                if should_run:
+                                    phase2_id = int(global_step)
+                                    if global_step < force_n:
+                                        print(f"\n[phase2-enter] gstep={global_step}, phase2_id={phase2_id} [forced]", flush=True)
+                                    else:
+                                        print(f"\n[phase2-enter] gstep={global_step}, phase2_id={phase2_id}", flush=True)
+                                    print(f"PHASE 2: Updating SERVER parameters (client FIXED)...", flush=True)
+                                    was_training = client_model.training
+                                    client_model.eval()
+                                    with torch.no_grad():
+                                        _use_fp16 = False  # send fixed activations in full precision for stability
+                                        h_cut_fixed, pkg_fixed = _client_forward_to_cut_payload(
+                                            client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                        )
+                                        pkg_fixed["tgt_len"] = int(h_cut_fixed.shape[1])
+                                    # distinct base seed range for server phase
+                                    base_seed_server = int(sync_seed) + int(getattr(args, 'num_pert', 10))
+                                    trainer.send_data({
+                                        "type": "zoo_server_update",
+                                        "mode": "train",
+                                        "data": pkg_fixed,
+                                        "meta": {
+                                            "zoo_phase": "server_update",
+                                            "num_perturbations": int(getattr(args, 'num_pert', 10)),
+                                            "base_seed": int(base_seed_server),
+                                            "mu": float(getattr(args, 'mu', 1e-3)),
+                                            "step": int(global_step),
+                                            "phase2_id": int(phase2_id)
+                                        }
+                                    })
+                                    server_response = trainer.receive_data()
+                                    if not isinstance(server_response, dict):
+                                        raise RuntimeError(f"Expected dict reply from server, got: {type(server_response)}")
+                                    print(f"[phase2-exit] gstep={global_step}, resp_type={server_response.get('type')}, phase2_id={server_response.get('phase2_id')}")
+                                    if server_response.get("type") != "zoo_phase_complete":
+                                        raise RuntimeError(f"Expected 'zoo_phase_complete', got: {server_response}")
+                                    if int(server_response.get("phase2_id", -1)) != int(phase2_id):
+                                        raise RuntimeError(f"Phase2 ACK mismatch (client={phase2_id}, server={server_response.get('phase2_id')})")
+                                    server_grad_norm = float(server_response.get("grad_norm", 0.0))
+                                    server_loss_diff_avg = float(server_response.get("loss_diff_avg", 0.0))
+                                    server_loss_diff_std = float(server_response.get("loss_diff_std", 0.0))
+                                    print(f"\nSERVER ZOO Results:")
+                                    print(f"  Gradient norm: {server_grad_norm:.6f}")
+                                    print(f"  Avg loss diff: {server_loss_diff_avg:.6f}")
+                                    print(f"  Loss diff std: {server_loss_diff_std:.6f}")
+                                    if was_training:
+                                        client_model.train()
+                                else:
+                                    # Occasional debug to verify cadence gating behavior
+                                    if (global_step < 5) or (global_step % 25 == 0):
+                                        print(f"Skipping server ZOO (gstep={global_step}, warm={warm}, every={every})")
+                        except Exception as _se:
+                            print(f"⚠️ Sequential server ZOO update failed or skipped: {_se}")
 
                     # Optional: trigger a small server-side SGD update with cadence
                     try:
@@ -1491,9 +1802,108 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                     except Exception:
                         cur_obj_loss = 0.0
                     losses.append(cur_obj_loss)
-                    accs.append(0.0)
+                    # Log diagnostics
+                    try:
+                        if logger_client is not None:
+                            logger_client.log_step(global_step, cur_obj_loss, getattr(client_model, 'base_model', client_model), optimizer)
+                            if (global_step % 100) == 0 and global_step > 0:
+                                logger_client.save()
+                                # plotting is optional and may be heavy
+                    except Exception:
+                        pass
+                    
+                    
+                    # FIX: Compute actual training accuracy instead of hardcoded 0.0
+                    # Use split learning communication path to get logits from server
+                    try:
+                        was_training = client_model.training
+                        client_model.eval()
+                        with torch.no_grad():
+                            # Use the same split learning forward pass mechanism
+                            _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
+                            h_cut_acc, pkg_acc = _client_forward_to_cut_payload(
+                                client_model,
+                                input_ids, attention_mask, labels,
+                                send_fp16=_use_fp16
+                            )
+                            pkg_acc["tgt_len"] = int(h_cut_acc.shape[1])
+                            # Request server to compute logits (for accuracy computation)
+                            trainer.send_data({
+                                "type": "forward_cut",
+                                "mode": "train",
+                                "data": pkg_acc,
+                                    "meta": {"zoo_eval": True, "need_g_cut": False, "return_logits": True, "step": int(global_step)}
+                            })
+                            resp_acc = trainer.receive_data()
+                            
+                            # Server should return logits if available
+                            if isinstance(resp_acc, dict) and "logits" in resp_acc:
+                                logits_tensor = torch.as_tensor(resp_acc["logits"], dtype=torch.float32, device=device)
+                                # Ensure labels match logits sequence length
+                                # Logits shape: [B, seq_len, vocab_size]
+                                # Labels shape: [B, original_seq_len]
+                                logits_seq_len = logits_tensor.shape[1]
+                                labels_seq_len = labels.shape[1]
+                                
+                                # Align labels to match logits sequence length
+                                if labels_seq_len > logits_seq_len:
+                                    # Truncate labels to match logits
+                                    labels_aligned = labels[:, :logits_seq_len]
+                                elif labels_seq_len < logits_seq_len:
+                                    # Pad labels to match logits (this shouldn't happen, but handle it)
+                                    padding = torch.full((labels.shape[0], logits_seq_len - labels_seq_len), 
+                                                        -100, device=device, dtype=labels.dtype)
+                                    labels_aligned = torch.cat([labels, padding], dim=1)
+                                else:
+                                    labels_aligned = labels
+                                
+                                # Shift for language modeling
+                                shift_logits = logits_tensor[..., :-1, :].contiguous()
+                                shift_labels = labels_aligned[..., 1:].contiguous()
+                                
+                                # Compute accuracy
+                                preds = torch.argmax(shift_logits, dim=-1)
+                                non_padding = (shift_labels != -100)
+                                if non_padding.sum() > 0:
+                                    correct = (preds == shift_labels) & non_padding
+                                    batch_acc = correct.sum().float() / non_padding.sum().float()
+                                    accs.append(batch_acc.item())
+                                    # Debug logging (first step only)
+                                    if global_step == 1:
+                                        print(f"✅ Training accuracy computation working: batch_acc={batch_acc.item():.4f}, logits_shape={logits_tensor.shape}, labels_shape={labels.shape}, aligned_labels_shape={labels_aligned.shape}")
+                                else:
+                                    accs.append(0.0)
+                            else:
+                                # Fallback: if server doesn't return logits, use a simple estimate
+                                # For SST-2, we can check if loss is decreasing as a proxy
+                                # But for now, just append 0.0 and log a warning
+                                if global_step % 100 == 0:  # Only log occasionally
+                                    print(f"⚠️ Server didn't return logits for accuracy computation at step {global_step}")
+                                    print(f"   Response keys: {list(resp_acc.keys()) if isinstance(resp_acc, dict) else 'not a dict'}")
+                                accs.append(0.0)
+                        
+                        # Restore training mode
+                        if was_training:
+                            client_model.train()
+                    except Exception as acc_error:
+                        # Only print error occasionally to avoid spam
+                        if global_step % 100 == 0:
+                            print(f"⚠️ Training accuracy computation failed at step {global_step}: {acc_error}")
+                        accs.append(0.0)
+                        # Ensure training mode is restored
+                        client_model.train()
 
                     global_step += 1
+                    if global_step == 10 and _client_initial_params:
+                        try:
+                            _base_mod = getattr(client_model, 'base_model', client_model)
+                            print("Parameter max changes after 10 steps (client):")
+                            for _name, _param in _base_mod.named_parameters():
+                                if _param.requires_grad and _name in _client_initial_params:
+                                    _delta = (_param - _client_initial_params[_name]).abs().max().item()
+                                    print(f"{_name}: max param change = {_delta:.6e}")
+                        except Exception:
+                            pass
                     cur_loss = sum(losses[-10:]) / min(len(losses), 10)
                     cur_acc  = sum(accs[-10:]) / min(len(accs), 10)
                     pbar.set_description(f"Training (ZOO) | Loss: {cur_loss:.4f} | Acc: {cur_acc:.6f}")
@@ -1570,10 +1980,16 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                                 pass
                         client_model.train()
 
+                except StopIteration:
+                    stop_training = True
+                    break
                 except Exception as e:
                     print(f"\n✖ Error in ZOO step {global_step}: {e}")
                     traceback.print_exc()
                     continue
+
+            if stop_training:
+                break
 
         pbar.close()
         # Final scheduler step behavior
@@ -1591,7 +2007,33 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
 
         avg_loss = sum(losses) / len(losses) if losses else 0.0
         avg_acc  = sum(accs) / len(accs) if accs else 0.0
-        print(f"\n✅ ZOO Training Complete - Final Loss: {avg_loss:.4f}, Final Acc: {avg_acc:.6f}")
+        print(f"\n✅ ZOO Training Complete - Final Train Loss: {avg_loss:.4f}, Final Train Acc: {avg_acc:.6f}")
+        # Final evaluation and memory update
+        try:
+            # Mark eval phase and update memory one last time
+            if _srv_tracker is not None:
+                _srv_tracker.set_phase('eval')
+                _srv_tracker.update_memory()
+        except Exception:
+            pass
+        try:
+            _moved = False
+            _eval_device = device
+            try:
+                if bool(getattr(args, 'eval_on_cpu', False)) and str(getattr(args, 'tuning', 'prefix')) == 'lora':
+                    full_model.to(torch.device('cpu'))
+                    _eval_device = torch.device('cpu')
+                    _moved = True
+                final_eval_loss, final_eval_acc, final_eval_f1, final_eval_em = evaluate_model(
+                    full_model, eval_loader, _eval_device, tokenizer, args,
+                    client_model=client_model, trainer=trainer, tracker=_srv_tracker
+                )
+            finally:
+                if _moved:
+                    full_model.to(device)
+            print(f"🔍 Final Evaluation - Loss: {final_eval_loss:.4f}, Acc: {final_eval_acc:.6f}, F1: {final_eval_f1:.6f}, EM: {final_eval_em:.6f}")
+        except Exception:
+            pass
         return avg_loss, avg_acc
 
     except Exception as e:
@@ -1617,6 +2059,15 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
             _srv_tracker.set_phase('train')
     except Exception:
         pass
+    # Diagnostic: snapshot initial trainable parameters to measure changes (SGD)
+    _client_initial_params_sgd = {}
+    try:
+        _base_mod_sgd = getattr(client_model, 'base_model', client_model)
+        for _name, _param in _base_mod_sgd.named_parameters():
+            if _param.requires_grad:
+                _client_initial_params_sgd[_name] = _param.detach().clone()
+    except Exception:
+        _client_initial_params_sgd = None
     losses = []
     accs = []
     global_step = 0
@@ -1655,15 +2106,8 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
                         labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
-                    # Choose wire precision dynamically.
-                    # IMPORTANT: If the server uses ZOO, force fp32 to preserve FD signal fidelity.
-                    if args.wire_fp16 == 'on':
-                        _use_fp16 = True
-                    elif args.wire_fp16 == 'off':
-                        _use_fp16 = False
-                    else:  # auto
-                        # Prefer fp16 unless either side is doing ZOO
-                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_server', False)))
+                    # Use unified precision flag
+                    _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
 
                     h_cut_live, pkg = _client_forward_to_cut_payload(
                         client_model,                 # clientKVOnly instance
@@ -1706,7 +2150,7 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
                     do_step = ((global_step + 1) % accum_steps) == 0
                     if do_step:
                         try:
-                            if getattr(args, 'clip_grad_norm', 0.0) and args.clip_grad_norm > 0.0:
+                            if getattr(args, 'clip_grad_norm', 0.0) > 0.0:
                                 params_to_clip = []
                                 for group in optimizer.param_groups:
                                     for p in group.get('params', []):
@@ -1739,6 +2183,16 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
                     
                     # Update progress bar with current loss, accuracy, and F1
                     global_step += 1
+                    if global_step == 10 and _client_initial_params_sgd:
+                        try:
+                            _base_mod_sgd = getattr(client_model, 'base_model', client_model)
+                            print("Parameter max changes after 10 steps (client, SGD):")
+                            for _name, _param in _base_mod_sgd.named_parameters():
+                                if _param.requires_grad and _name in _client_initial_params_sgd:
+                                    _delta = (_param - _client_initial_params_sgd[_name]).abs().max().item()
+                                    print(f"{_name}: max param change = {_delta:.6e}")
+                        except Exception:
+                            pass
                     current_loss = sum(losses[-10:]) / min(len(losses), 10)  # Moving average of last 10
                     current_acc = sum(accs[-10:]) / min(len(accs), 10)
                     
@@ -1852,14 +2306,14 @@ def parse_args():
     
     # Training parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--zoo_lr', type=float, default=5e-4, help='ZOO learning rate')
+    parser.add_argument('--zoo_lr', type=float, default=1e-5, help='ZOO learning rate')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate') 
     parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
+    parser.add_argument('--weight_decay', type=float, default=0.001, help='Weight decay for optimizer')
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
-    parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
-    parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
-    parser.add_argument('--clip_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
+    parser.add_argument('--train_batch_size', type=int, default=16, help='Training batch size')
+    parser.add_argument('--test_batch_size', type=int, default=16, help='Test batch size')
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max gradient norm for clipping (0 disables clipping).')
 
     # Dataset sizes - NEW ARGUMENTS
     parser.add_argument('--train_examples', type=int, default=None, help='Number of training examples (None => full dataset)')
@@ -1867,10 +2321,10 @@ def parse_args():
     parser.add_argument('--eval_examples', type=int, default=None, help='Number of eval examples (None => full dataset)')
     
     # Training steps - NEW ARGUMENTS
-    parser.add_argument('--max_steps', type=int, default=4000, help='Maximum training steps')  # STEPS=4000
-    parser.add_argument('--eval_steps', type=int, default=4000, help='Evaluate every N steps')  # EVAL_STEPS=4000
-    parser.add_argument('--scheduler', type=str, choices=['plateau','linear','cosine'], default='plateau', help='LR scheduler type')
-    parser.add_argument('--warmup_steps', type=int, default=0, help='Number of warmup steps (overrides ratio if > 0)')
+    parser.add_argument('--max_steps', type=int, default=2000, help='Maximum training steps')
+    parser.add_argument('--eval_steps', type=int, default=50, help='Evaluate every N steps')
+    parser.add_argument('--scheduler', type=str, choices=['plateau','linear','cosine','constant','constant_with_warmup'], default='constant_with_warmup', help='LR scheduler type')
+    parser.add_argument('--warmup_steps', type=int, default=200, help='Number of warmup steps (overrides ratio if > 0)')
     parser.add_argument('--warmup_ratio', type=float, default=0.0, help='Warmup steps as a fraction of max_steps (used if warmup_steps==0)')
     parser.add_argument('--sgd_accum_steps', type=int, default=1, help='Gradient accumulation steps for SGD client path')
     parser.add_argument('--sched_factor', type=float, default=0.5, help='LR scheduler reduce factor')
@@ -1881,17 +2335,27 @@ def parse_args():
     parser.add_argument('--sched_min_lr', type=float, default=1e-5, help='LR scheduler minimum learning rate')
     
     # ZOO parameters
-    parser.add_argument('--mu', type=float, default=5e-4, help='ZOO perturbation scale (base, will be RMS-scaled)')
-    parser.add_argument('--num_pert', type=int, default=64, help='ZOO perturbations (antithetic pairs internally)')
+    parser.add_argument('--mu', type=float, default=1e-3, help='ZOO perturbation scale (base, will be RMS-scaled)')
+    parser.add_argument('--num_pert', type=int, default=1, help='ZOO perturbations (antithetic pairs internally)')
     parser.add_argument('--estimator', type=str, choices=['central','forward'], default='central', help='Finite-diff estimator type for ZOO/g_cut')
+    parser.add_argument('--zoo_perturbation_type', type=str, choices=['rademacher','bernoulli','gaussian'], default='gaussian', help='Perturbation distribution for ZOO (default gaussian=N(0,1))')
+    parser.add_argument('--zoo_mu_scaling', type=str, choices=['fixed','rms'], default='fixed', help='Mu scaling method for ZOO (fixed=use mu directly like MeZO, rms=scale by parameter RMS)')
     parser.add_argument('--use_zeroth_order', action='store_true', help='Use ZOO for client')
     parser.add_argument('--use_zeroth_order_server', action='store_true', help='Use ZOO for server')
-    parser.add_argument('--zoo_momentum', type=float, default=0.5, help='Momentum for ZOO optimizer updates (0 disables)')
-    parser.add_argument('--zoo_accum_steps', type=int, default=1, help='Accumulate ZOO gradients for N steps before optimizer.step()')
-    parser.add_argument('--zoo_grad_ema_beta', type=float, default=0.0, help='EMA beta for ZOO grad smoothing (0 disables)')
-    # Make g_cut variance-reduced objective enabled by default; allow disabling via --no_zoo_use_gcut
-    parser.add_argument('--no_zoo_use_gcut', dest='zoo_use_gcut', action='store_false', help='Disable variance-reduced ZOO g_cut objective')
-    parser.set_defaults(zoo_use_gcut=True)
+    
+    
+    
+    parser.add_argument('--zoo_max_grad_value', type=float, default=0.0, help='Maximum gradient norm threshold for adaptive clipping in ZOO estimator (0.0 disables clipping)')
+    # Enable sequential two-phase ZOO updates (client then server)
+    parser.add_argument('--sequential_zoo', action='store_true',
+                        help='Use sequential ZOO updates (Phase 1: client update with server fixed; Phase 2: server update with client fixed)')
+    # Make g_cut variance-reduced objective DISABLED by default
+    parser.add_argument('--force_phase2_probe', type=int, default=0, help='Force Phase 2 to run for first N steps (diagnostic)')
+    # Using parameter perturbations (like standard MeZO) is more stable than activation perturbations
+    # Activation perturbations cause exponential amplification through layers (see GRADIENT_EXPLOSION_ANALYSIS.md)
+    # Set zoo_use_gcut=True only if you need variance reduction and understand the trade-offs
+    parser.add_argument('--zoo_use_gcut', action='store_true', help='Enable variance-reduced ZOO g_cut objective (uses activation perturbations, may cause instability)')
+    parser.set_defaults(zoo_use_gcut=False)  # Changed default: use parameter perturbations only
     parser.add_argument('--server_sgd_warmup_steps', type=int, default=800, help='Delay server local SGD for N steps in client-ZOO mode')
     parser.add_argument('--server_sgd_every', type=int, default=1, help='Perform server local SGD every K steps after warmup')
     
@@ -1920,19 +2384,15 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='client host to bind')
     parser.add_argument('--port', type=int, default=12345, help='client port to bind')
     
-    # Wire precision for h_cut payload (fp16 reduces bandwidth, fp32 improves ZOO stability)
-    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='off',
-                        help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
-    parser.add_argument('--compute_dtype', choices=['fp16','fp32'], default='fp32', help='Compute/model dtype for client (fp16 or fp32)')
+    # Unified precision flag governing compute dtype and wire payloads
+    parser.add_argument('--precision', choices=['fp16','fp32'], default='fp32',
+                        help='Global precision for compute and wire payloads (fp16 or fp32)')
     # Control whether to step LR scheduler on eval loss for ZOO (default off)
     parser.add_argument('--sched_step_on_eval', action='store_true', help='Also step LR scheduler on eval loss (ZOO)')
     # Evaluation device control
     parser.add_argument('--eval_on_cpu', action='store_true', help='Run evaluation on CPU to reduce GPU memory usage')
     
     args = parser.parse_args()
-    # Safety: forbid forcing fp16 on wire when using any ZOO (client or server)
-    if args.wire_fp16 == 'on' and (args.use_zeroth_order or args.use_zeroth_order_server):
-        raise SystemExit("wire_fp16='on' is incompatible with ZOO. Use 'auto' or 'off'.")
     return args
 
 if __name__ == "__main__":
@@ -1953,12 +2413,17 @@ if __name__ == "__main__":
         print(f"   Max length: {args.max_length}")
         print(f"   ZOO client: {args.use_zeroth_order}")
         print(f"   ZOO server: {args.use_zeroth_order_server}")
+        print(f"   Sequential ZOO: {getattr(args, 'sequential_zoo', False)}")
+        try:
+            print(f"   Force Phase2 probe: {int(getattr(args, 'force_phase2_probe', 0))}")
+        except Exception:
+            pass
         print(f"   F1 method: {args.f1_method}")
         if args.use_zeroth_order:
             print(f"   ZOO mu: {args.mu}")
             print(f"   ZOO perturbations: {args.num_pert}")
             print(f"   ZOO use g_cut objective: {getattr(args, 'zoo_use_gcut', False)}")
-        print(f"   Wire dtype policy: {getattr(args, 'wire_fp16', 'auto')}")
+        print(f"   Precision: {getattr(args, 'precision', 'fp32')}")
         
         # Device configuration
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1976,7 +2441,7 @@ if __name__ == "__main__":
             client_model = LoRAclientModel(
                 args.model_name, args.cut_layer,
                 r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
-                torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32),
+                torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32),
                 targets=tuple(args.lora_targets.split(','))
             ).to(device)
             trainable_params = list(client_model.trainable_parameters())
@@ -2008,7 +2473,7 @@ if __name__ == "__main__":
         else:
             # existing PrefixKV client path (keep yours)
             client_model = clientKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
-                                        torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
+                                        torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
             trainable_params = list(client_model.kv.parameters())  # unchanged
             _assert_only_expected_trainables(client_model, args.tuning, side="client")
 
@@ -2018,7 +2483,7 @@ if __name__ == "__main__":
                     if ("lora_A" not in n and "lora_B" not in n)), "Only LoRA params must be trainable in LoRA mode!"
         
         full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
-                                  torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
+                                  torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
         # Only attach client KV in prefix mode; in LoRA there is no live client KV to use
         if args.tuning != 'lora':
             full_model.attach_live_client_kv(client_model.kv)
@@ -2040,13 +2505,50 @@ if __name__ == "__main__":
                 num_train_examples=args.train_examples,
                 num_eval_examples=args.eval_examples,
             )
+        
+        # Check dataset class balance for classification tasks (especially SST-2)
+        if args.task == 'sst2':
+            print("  Checking SST-2 dataset class balance...")
+            try:
+                # Sample a few batches to check class distribution
+                class_counts = {'great': 0, 'terrible': 0, 'unknown': 0}
+                total_samples = 0
+                for i, batch in enumerate(train_loader):
+                    if i >= 10:  # Check first 10 batches
+                        break
+                    if 'formatted_text' in batch:
+                        for text in batch['formatted_text']:
+                            total_samples += 1
+                            if 'Answer: great' in text or 'Answer:great' in text:
+                                class_counts['great'] += 1
+                            elif 'Answer: terrible' in text or 'Answer:terrible' in text:
+                                class_counts['terrible'] += 1
+                            else:
+                                class_counts['unknown'] += 1
+                
+                print(f"  Class distribution in first {total_samples} samples:")
+                print(f"    'great' (positive): {class_counts['great']} ({class_counts['great']/max(total_samples,1)*100:.1f}%)")
+                print(f"    'terrible' (negative): {class_counts['terrible']} ({class_counts['terrible']/max(total_samples,1)*100:.1f}%)")
+                if class_counts['unknown'] > 0:
+                    print(f"    'unknown': {class_counts['unknown']} ({class_counts['unknown']/max(total_samples,1)*100:.1f}%)")
+                
+                # Check for severe imbalance
+                if total_samples > 0:
+                    ratio = max(class_counts['great'], class_counts['terrible']) / max(min(class_counts['great'], class_counts['terrible']), 1)
+                    if ratio > 2.0:
+                        print(f"  ⚠️ WARNING: Class imbalance detected (ratio={ratio:.2f})")
+                        print(f"    This may cause the model to bias towards the majority class.")
+                    else:
+                        print(f"  ✅ Dataset appears balanced (ratio={ratio:.2f})")
+            except Exception as balance_error:
+                print(f"  ⚠️ Could not check class balance: {balance_error}")
+        
         print("  Dataloaders created successfully")
         # Setup optimizer
         print("  Setting up optimizer...")
         if args.use_zeroth_order:
-            # ZOO: allow small momentum for incremental updates
-            zoo_mom = float(getattr(args, 'zoo_momentum', 0.0))
-            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=zoo_mom, weight_decay=args.weight_decay)
+            # ZOO: use vanilla SGD (no momentum)
+            optimizer = optim.SGD(trainable_params, lr=args.zoo_lr, momentum=0.0, weight_decay=args.weight_decay)
         else:
             # Regular optimizer path: SGD only
             optimizer = optim.SGD(
@@ -2097,8 +2599,10 @@ if __name__ == "__main__":
                         return float(current_step) / float(max(1, warmup_steps))
                     progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
                     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
-            else:
+            else:  # constant with warmup
                 def lr_lambda(current_step: int):
+                    if warmup_steps > 0 and current_step < warmup_steps:
+                        return float(current_step) / float(max(1, warmup_steps))
                     return 1.0
 
             scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -2137,6 +2641,12 @@ if __name__ == "__main__":
         trainer = Trainer(conn, tracker=_srv_tracker)
         server_config = trainer.receive_data()
         print(f"Received server config: {server_config}")
+        # Handshake fix: respect server-declared optimization mode
+        try:
+            args.use_zeroth_order_server = (not bool(server_config.get('server_sgd', True)))
+            print(f"   ZOO server (from handshake): {args.use_zeroth_order_server}")
+        except Exception:
+            pass
         
         print("Starting training...")
         
