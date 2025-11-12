@@ -806,7 +806,7 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
         except Exception:
             pass
         # NOTE [Phase 0]: Duplicate optimizer.step() intentionally commented to avoid double stepping.
-        optimizer.step()
+        # optimizer.step()  # FIXED: Commented out duplicate step
         # Track memory after optimizer step (train phase)
         try:
             if server.tracker is not None:
