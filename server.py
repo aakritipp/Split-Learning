@@ -13,6 +13,11 @@ import numpy as np
 import argparse
 import traceback
 from SGDGradientEst import StochasticGradientApproximator
+from coordinated_zoo import (
+    CoordinatedZOOTrainer,
+    coordinated_zoo_step_server,
+    CLIENT_OFFSET_DEFAULT,
+)
 import types
 from prefix_kv import (
     PrefixKV, 
@@ -21,6 +26,7 @@ from prefix_kv import (
 )
 # Global KV model holder (set in main)
 kv_model = None
+coordinated_trainer = None
 
 from lora import (
     apply_lora_to_opt, 
@@ -493,6 +499,7 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
 
     # --- Pure evaluation mode OR strict ZOO probe: compute MEAN loss only, no updates or gradients ---
     if mode == "eval" or bool(meta.get("zoo_eval", False)):
+        global coordinated_trainer
         # Ensure tracker reflects eval phase for accurate memory/round attribution
         try:
             if server.tracker is not None:
@@ -517,18 +524,46 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
 
         from torch.cuda.amp import autocast
         kv_model.eval()  # disable dropout for stability
-        with torch.no_grad():
-            with autocast(enabled=False):
-                h_cut = client_data["h_cut"].to(device=target_device, dtype=target_dtype)
-                out = _server_forward_from_cut(
-                    kv_model,
-                    h_cut=h_cut.detach(),
-                    attention_mask=attn_mask,
-                    labels=labels,
-                    cut=cut,
-                    compute_g_cut=False,
-                    return_loss_tensor=False,
+        coord_enabled = bool(meta.get("coordinated_zoo", False)) and coordinated_trainer is not None
+        coord_seed = int(meta.get("coord_seed", 0)) if coord_enabled else 0
+        coord_sign = int(meta.get("coord_sign", 0)) if coord_enabled else 0
+        coord_mu = None
+        coord_estimator = None
+        if coord_enabled:
+            coord_mu = float(meta.get("coord_mu", getattr(coordinated_trainer, "mu", getattr(args, "mu", 1e-3))))
+            coord_estimator = meta.get("coord_estimator", getattr(args, "estimator", "central"))
+            if coord_sign != 0:
+                coordinated_trainer.apply_perturbation(seed=coord_seed, sign=coord_sign, mu=coord_mu)
+
+        out = {"loss": 0.0}
+        try:
+            with torch.no_grad():
+                with autocast(enabled=False):
+                    h_cut = client_data["h_cut"].to(device=target_device, dtype=target_dtype)
+                    out = _server_forward_from_cut(
+                        kv_model,
+                        h_cut=h_cut.detach(),
+                        attention_mask=attn_mask,
+                        labels=labels,
+                        cut=cut,
+                        compute_g_cut=False,
+                        return_loss_tensor=False,
+                    )
+        finally:
+            if coord_enabled and coord_sign != 0:
+                coordinated_trainer.apply_perturbation(seed=coord_seed, sign=-coord_sign, mu=coord_mu)
+
+        if coord_enabled:
+            try:
+                coordinated_trainer.record_result(
+                    seed=coord_seed,
+                    sign=coord_sign,
+                    loss=float(out.get("loss", 0.0)),
+                    mu=coord_mu,
+                    estimator=coord_estimator,
                 )
+            except Exception as _ce:
+                print(f"⚠️ Coordinated ZOO recorder failure: {_ce}")
 
         # Track eval-phase memory after forward
         try:
@@ -642,11 +677,8 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
             if h_cut.grad is None:
                 raise RuntimeError("need_g_cut=True but h_cut.grad is None. Ensure h_cut.requires_grad_(True).")
             g = h_cut.grad.detach()
-            try:
-                gcut_choice = str(getattr(args, "gcut_dtype", "fp32")).lower()
-            except Exception:
-                gcut_choice = "fp32"
-            gcut_dtype = (torch.float16 if gcut_choice == "fp16" else torch.float32)
+            precision_choice = str(getattr(args, "precision", "fp32")).lower()
+            gcut_dtype = (torch.float16 if precision_choice == "fp16" else torch.float32)
             g_cut_to_send = g.to(dtype=gcut_dtype, device="cpu").contiguous().numpy()
         optimizer.step()
         # Sample memory after optimizer step
@@ -679,11 +711,9 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
             finally:
                 if was_training:
                     kv_model.train()
-            try:
-                gcut_choice = str(getattr(args, "gcut_dtype", "fp32")).lower()
-            except Exception:
-                gcut_choice = "fp32"
-            gcut_dtype = (torch.float16 if gcut_choice == "fp16" else torch.float32)
+            
+            precision_choice = str(getattr(args, "precision", "fp32")).lower()
+            gcut_dtype = (torch.float16 if precision_choice == "fp16" else torch.float32)
             g_cut_to_send = g.to(dtype=gcut_dtype, device="cpu").contiguous().numpy()
 
         # Update train-phase memory after optional g_cut probe
@@ -693,6 +723,19 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
                 server.tracker.update_memory()
         except Exception:
             pass
+        # ============ SEQUENTIAL ZOO-ZOO FIX (server) ============
+        server_turn = bool(pkt.get("meta", {}).get("server_turn", True))
+        if not server_turn:
+            print(f"[SEQ-ZOO] Batch {batch_idx}: Server frozen (client's turn)")
+            # Reply with loss (and g_cut if requested), but DO NOT update server params
+            reply = {"loss": float(loss_tensor.item())}
+            if g_cut_to_send is not None:
+                reply["g_cut"] = g_cut_to_send
+            server.send_data(reply)
+            return
+        else:
+            print(f"[SEQ-ZOO] Batch {batch_idx}: Server updating")
+        # ============ SEQUENTIAL ZOO-ZOO FIX (server) ============
 
     # else:
     #     # Zeroth order update of server prefixes (loss-only objective)
@@ -740,14 +783,15 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
         _dummy_y = torch.zeros(1)
         # Run your estimator (MeZO-style), then step
         optimizer.zero_grad(set_to_none=True)
-        grad_estimator.model_params = list(getattr(kv_model, "trainable_parameters", lambda: kv_model.server_kv.parameters())())
-        try:
-            grad_estimator.estimate_gradients(_dummy_x, _dummy_y, server_objective,
-                                                random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
-        except TypeError:
-            # Fallback if your class has the old signature
-            grad_estimator.estimate_gradients(torch.zeros(1), torch.zeros(1), server_objective,
-                                                random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+        if grad_estimator is not None:
+            grad_estimator.model_params = list(getattr(kv_model, "trainable_parameters", lambda: kv_model.server_kv.parameters())())
+            try:
+                grad_estimator.estimate_gradients(_dummy_x, _dummy_y, server_objective,
+                                                    random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
+            except TypeError:
+                # Fallback if your class has the old signature
+                grad_estimator.estimate_gradients(torch.zeros(1), torch.zeros(1), server_objective,
+                                                    random_seed=batch_idx * 2029 + getattr(args, "seed", 0))
         # Track memory after gradient estimation (train phase)
         try:
             if server.tracker is not None:
@@ -757,9 +801,11 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
             pass
         optimizer.step()
         try:
-            torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.server_kv.parameters())()), max_norm=1.0)
+            if float(getattr(args, "clip_grad_norm", 0.0)) > 0.0:
+                torch.nn.utils.clip_grad_norm_(list(getattr(kv_model, "trainable_parameters", lambda: kv_model.server_kv.parameters())()), max_norm=float(args.clip_grad_norm))
         except Exception:
             pass
+        # NOTE [Phase 0]: Duplicate optimizer.step() intentionally commented to avoid double stepping.
         optimizer.step()
         # Track memory after optimizer step (train phase)
         try:
@@ -774,14 +820,7 @@ def handle_forward_cut_unified(server, kv_model, optimizer, grad_estimator, args
     if g_cut_to_send is not None:
         # sanity: shape must match h_cut
         # (can't use tensors in dict over pickle reliably -> send numpy)
-        # reply["g_cut"] = g_cut_to_send
-        # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
-        # reply["g_cut"] = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
-        if isinstance(g_cut_to_send, torch.Tensor):
-            gc = g_cut_to_send.detach().to(torch.float32, device="cpu").contiguous().numpy()
-        else:
-            gc=np.asarray(g_cut_to_send, dtype=np.float32)
-        reply["g_cut"] = gc
+        reply["g_cut"] = g_cut_to_send
     server.send_data(reply)
 
 def parse_args():
@@ -793,7 +832,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--zoo_lr', type=float, default=1e-4, help='ZOO learning rate')
-    parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
+    parser.add_argument('--momentum', type=float, default=0.0, help='SGD momentum (0 disables)')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
@@ -804,6 +843,13 @@ def parse_args():
     parser.add_argument('--num_pert', type=int, default=64, help='Number of ZOO perturbations')
     parser.add_argument('--estimator', type=str, choices=['central','forward'], default='central', help='Finite-diff estimator type for ZOO/g_cut')
     parser.add_argument('--use_zeroth_order_server', action='store_true', help='Use ZOO for server')
+    parser.add_argument('--coordinated_zoo', action='store_true', help='Enable coordinated client/server ZOO with shared seeds')
+    # ZOO perturbation distribution for server
+    parser.add_argument('--perturbation_dist', type=str, choices=['rademacher','gaussian','bernoulli'], default='rademacher', help='Distribution for ZOO perturbations on server')
+    parser.add_argument('--bernoulli_p', type=float, default=0.5, help='Bernoulli(p) parameter (used when perturbation_dist=bernoulli)')
+    parser.add_argument('--no_center_bernoulli', dest='center_bernoulli', action='store_false', help='Disable centering/scaling Bernoulli to zero mean and unit variance')
+    parser.set_defaults(center_bernoulli=True)
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max gradient norm for clipping server params (0 disables)')
     parser.add_argument(
         '--task',
         choices=[
@@ -821,10 +867,8 @@ def parse_args():
     parser.add_argument('--host', type=str, default='127.0.0.1', help='client host to connect')
     parser.add_argument('--port', type=int, default=12345, help='client port to connect')
     
-    # argparse setup
-    parser.add_argument("--gcut-dtype", choices=["fp16", "fp32"], default="fp32", help="Wire precision for g_cut payloads.")
-    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='off', help='Precision for wire activations (server will honor client)')
-    parser.add_argument('--compute_dtype', choices=['fp16','fp32'], default='fp32', help='Compute/model dtype for server (fp16 or fp32)')
+    # Global precision (replaces compute_dtype, wire_fp16, gcut-dtype)
+    parser.add_argument('--precision', choices=['fp16','fp32'], default='fp32', help='Global precision for compute and wire payloads')
 
     args = parser.parse_args()
     return args
@@ -900,7 +944,8 @@ if __name__ == "__main__":
     
     print("Creating server model...")
     # Resolve compute dtype
-    _compute_dtype = (torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)
+    _precision_choice = str(getattr(args, 'precision', getattr(args, 'compute_dtype', 'fp32'))).lower()
+    _compute_dtype = (torch.float16 if _precision_choice == 'fp16' else torch.float32)
     # KV prefix model (new): always create so handlers can access
     tmp_cfg = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=_compute_dtype, device_map=None).config
     total_layers = tmp_cfg.num_hidden_layers
@@ -959,16 +1004,35 @@ if __name__ == "__main__":
     
     # Setup ZOO gradient estimator if needed
     grad_estimator = None
-    if args.use_zeroth_order_server:
+    coordinated_trainer = None
+    if args.use_zeroth_order_server and bool(getattr(args, 'coordinated_zoo', False)):
+        coordinated_trainer = CoordinatedZOOTrainer(
+            params=trainable_params,
+            num_pert=args.num_pert,
+            mu=args.mu,
+            seed=args.seed,
+            estimator=str(getattr(args, 'estimator', 'central')),
+            perturbation_dist=str(getattr(args, 'perturbation_dist', 'rademacher')),
+            bernoulli_p=float(getattr(args, 'bernoulli_p', 0.5)),
+            center_bernoulli=bool(getattr(args, 'center_bernoulli', True)),
+            device=device,
+        )
+        print("✅ Coordinated ZOO trainer initialized (server).")
+        coordinated_trainer.register_params(trainable_params)
+
+    if args.use_zeroth_order_server and not bool(getattr(args, 'coordinated_zoo', False)):
         print("Setting up ZOO gradient estimator...")
         grad_estimator = StochasticGradientApproximator(
             model_params=trainable_params,
             perturbation_scale=args.mu,
             sample_count=args.num_pert,
             compute_device=device,
-            data_type=torch.float32
+            data_type=torch.float32,
+            perturbation_distribution=str(getattr(args, 'perturbation_dist', 'rademacher')).lower(),
+            bernoulli_p=float(getattr(args, 'bernoulli_p', 0.5)),
+            center_bernoulli=bool(getattr(args, 'center_bernoulli', True)),
         )
-        print(f"ZOO gradient estimator created with mu={args.mu}, num_pert={args.num_pert}")
+        print(f"ZOO gradient estimator created with mu={args.mu}, num_pert={args.num_pert}, dist={getattr(args, 'perturbation_dist', 'rademacher')}")
     
     try:
         print("=" * 60)
@@ -1114,6 +1178,57 @@ if __name__ == "__main__":
                         server.send_data({"type": "server_full_state", "ok": True, "state": {}})
                 except Exception as e:
                     server.send_data({"type": "server_full_state", "ok": False, "error": str(e)})
+                continue
+
+            elif mtype == "coordinated_init":
+                if not (args.use_zeroth_order_server and bool(getattr(args, "coordinated_zoo", False))):
+                    server.send_data({"type": "error", "reason": "coordinated_zoo_disabled"})
+                    continue
+                if coordinated_trainer is None:
+                    server.send_data({"type": "error", "reason": "coordinated trainer not initialized"})
+                    continue
+
+                def _coord_loss_fn(h_cut, attention_mask, labels, cut_layer: int):
+                    out = _server_forward_from_cut(
+                        kv_model,
+                        h_cut=h_cut,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        cut=cut_layer,
+                        compute_g_cut=False,
+                        return_loss_tensor=False,
+                    )
+                    return float(out.get("loss", 0.0))
+
+                try:
+                    stats = coordinated_zoo_step_server(
+                        server_model=kv_model,
+                        optimizer=optimizer,
+                        server_comm=server,
+                        batch_data=msg,
+                        trainer=coordinated_trainer,
+                        device=device,
+                        args=args,
+                        loss_fn=_coord_loss_fn,
+                        client_offset=CLIENT_OFFSET_DEFAULT,
+                    )
+                    avg_loss = stats.get("avg_loss", 0.0)
+                    grad_norm = stats.get("grad_norm", 0.0)
+                    print(f"[coordinated-zoo] step complete: avg_loss={avg_loss:.4f}, grad_norm={grad_norm:.4f}")
+                except Exception as _e:
+                    print(f"⚠️ Coordinated ZOO server step failed: {_e}")
+                    traceback.print_exc()
+                    try:
+                        server.send_data(
+                            {
+                                "type": "losses",
+                                "losses_plus": [],
+                                "losses_minus": [],
+                                "error": str(_e),
+                            }
+                        )
+                    except Exception:
+                        pass
                 continue
 
             if mtype == "forward_cut":

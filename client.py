@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
+from typing import List
 try:
     from transformers.cache_utils import DynamicCache, StaticCache
 except Exception:
@@ -24,6 +25,11 @@ from lora import (
     iter_lora_parameters, 
     get_lora_state_dict, 
     load_lora_state_dict
+)
+from coordinated_zoo import (
+    CoordinatedZOOTrainer,
+    coordinated_zoo_step_client,
+    CLIENT_OFFSET_DEFAULT,
 )
 from dataset import (
     get_enhanced_dataloaders as get_task_dataloaders,
@@ -220,24 +226,8 @@ def _use_fp16_for_hcut(args, mode: str) -> bool:
     return True
 
 def _choose_send_fp16(args, mode: str) -> bool:
-    """Decide wire precision for h_cut payloads.
-    policy 'auto': fp32 for ZOO training to avoid FD quantization; fp16 otherwise.
-    policy 'on'/'off': force fp16/fp32 respectively.
-    """
-    try:
-        policy = getattr(args, 'wire_fp16', 'auto')
-    except Exception:
-        policy = 'auto'
-    if policy == 'on':
-        return True
-    if policy == 'off':
-        return False
-    # auto
-    if mode in ('zoo_train', 'zoo_eval'):
-        return False
-    if getattr(args, 'use_zeroth_order', False):
-        return False
-    return True
+    """Decide wire precision for h_cut payloads from global precision."""
+    return str(getattr(args, 'precision', 'fp32')).lower() == 'fp16'
 
 def _refresh_eval_prefixes(full_model, client_model, trainer, args):
     """
@@ -1059,14 +1049,8 @@ def evaluate_model(model, test_loader, device, tokenizer, args, client_model=Non
 
                 # If split eval context exists, ask server to compute loss on its half once
                 if split_eval:
-                    # Choose wire precision dynamically for eval
-                    if args.wire_fp16 == 'on':
-                        _use_fp16 = True
-                    elif args.wire_fp16 == 'off':
-                        _use_fp16 = False
-                    else:  # auto
-                        # Avoid fp16 if either side is doing ZOO (client or server).
-                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_server', False)))
+                    # Choose wire precision from global precision
+                    _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
                     h_cut_live, pkg = _client_forward_to_cut_payload(
                         client_model,
                         input_ids, attention_mask, labels,
@@ -1133,6 +1117,44 @@ def evaluate_model(model, test_loader, device, tokenizer, args, client_model=Non
     
     return avg_loss, avg_answer_accuracy, avg_f1, avg_em
     
+def _collect_client_trainable_params(client_model, args) -> List[torch.nn.Parameter]:
+    try:
+        tuning_mode = str(getattr(args, "tuning", "prefix")).lower()
+        if tuning_mode == "lora":
+            base = getattr(client_model, "base_model", client_model)
+            try:
+                from lora import iter_lora_parameters  # avoid top-level circular import issues
+                params = list(iter_lora_parameters(base, layer_range=(0, getattr(args, "cut_layer", 0) - 1)))
+            except Exception:
+                params = [p for p in base.parameters() if p.requires_grad]
+        elif tuning_mode == "full":
+            base = getattr(client_model, "base_model", client_model)
+            params: List[torch.nn.Parameter] = []
+            for name, param in base.named_parameters():
+                include = False
+                if name.startswith("model.decoder.embed_"):
+                    include = True
+                elif ".model.decoder.layers." in ("." + name):
+                    try:
+                        layer_idx = int(name.split("model.decoder.layers.")[1].split(".")[0])
+                        include = (layer_idx < int(getattr(args, "cut_layer", 0)))
+                    except Exception:
+                        include = False
+                if include and param.requires_grad:
+                    params.append(param)
+            if not params:
+                params = [p for p in base.parameters() if p.requires_grad]
+        else:
+            kv_module = getattr(client_model, "kv", None)
+            if kv_module is not None:
+                params = list(kv_module.parameters())
+            else:
+                params = [p for p in client_model.parameters() if p.requires_grad]
+    except Exception:
+        params = [p for p in client_model.parameters() if getattr(p, "requires_grad", False)]
+    return params
+
+
 def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader,
                              optimizer, scheduler, trainer, device, tokenizer, args):
     """Train using split learning with Zeroth-Order Optimization (client-side ZOO)."""
@@ -1151,43 +1173,7 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
 
     # --- FIX 1: define params to perturb depending on tuning mode ---
     # In prefix mode, perturb client KV prefixes; in LoRA mode, perturb LoRA adapters.
-    try:
-        if getattr(args, 'tuning', 'prefix') == 'lora':
-            # LoRA client wraps base model; only LoRA params are trainable
-            try:
-                from lora import iter_lora_parameters
-                client_params = list(iter_lora_parameters(getattr(client_model, 'base_model', client_model), layer_range=(0, getattr(args, 'cut_layer', 0)-1)))
-                if not client_params:
-                    # Fallback: collect any requires_grad params (LoRA A/B)
-                    client_params = [p for p in getattr(client_model, 'base_model', client_model).parameters() if p.requires_grad]
-            except Exception:
-                client_params = [p for p in getattr(client_model, 'base_model', client_model).parameters() if p.requires_grad]
-        elif getattr(args, 'tuning', 'prefix') == 'full':
-            # Full finetuning: train embeddings + client layers [0..cut-1]
-            base = getattr(client_model, 'base_model', client_model)
-            client_params = []
-            for n, p in base.named_parameters():
-                take = False
-                if n.startswith('model.decoder.embed_'):
-                    take = True
-                elif '.model.decoder.layers.' in ('.' + n):
-                    try:
-                        after = n.split('model.decoder.layers.')[1]
-                        idx = int(after.split('.')[0])
-                        if idx < int(getattr(args, 'cut_layer', 0)):
-                            take = True
-                    except Exception:
-                        pass
-                if take and p.requires_grad:
-                    client_params.append(p)
-            if not client_params:
-                client_params = [p for p in base.parameters() if p.requires_grad]
-        else:
-            # Prefix mode
-            client_params = list(client_model.kv.parameters())
-    except Exception:
-        # Ultimate fallback: any trainable parameter
-        client_params = [p for p in client_model.parameters() if p.requires_grad]
+    client_params = _collect_client_trainable_params(client_model, args)
 
     # Create gradient estimator for client KV
     grad_estimator = StochasticGradientApproximator(
@@ -1196,7 +1182,10 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
         sample_count=args.num_pert,
         compute_device=device,
         data_type=torch.float32,
-        estimator_type=str(getattr(args, 'estimator', 'central'))
+        estimator_type=str(getattr(args, 'estimator', 'central')),
+        perturbation_distribution=str(getattr(args, 'perturbation_dist', 'rademacher')).lower(),
+        bernoulli_p=float(getattr(args, 'bernoulli_p', 0.5)),
+        center_bernoulli=bool(getattr(args, 'center_bernoulli', True)),
     )
 
     client_model.train()
@@ -1249,18 +1238,50 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
 
                     optimizer.zero_grad(set_to_none=True)
 
+                    # ============ SEQUENTIAL ZOO-ZOO FIX (client) ============
+                    use_sequential = (
+                        bool(getattr(args, 'sequential_zoo', False))
+                        and bool(getattr(args, 'use_zeroth_order', False))
+                        and bool(getattr(args, 'use_zeroth_order_server', False))
+                        and not bool(getattr(args, 'coordinated_zoo', False))
+                    )
+                    if use_sequential and (global_step % 2 == 0):
+                        print(f"[SEQ-ZOO] Step {global_step}: Server turn, client frozen")
+                        client_model.eval()
+                        with torch.no_grad():
+                            _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
+                            h_cut_live, pkg = _client_forward_to_cut_payload(
+                                client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                            )
+                        pkg["tgt_len"] = int(h_cut_live.shape[1])
+                        meta = {"zoo_eval": False, "need_g_cut": False, "server_turn": True}
+                        trainer.send_data({
+                            "type": "forward_cut",
+                            "mode": "train",
+                            "data": pkg,
+                            "meta": meta
+                        })
+                        resp = trainer.receive_data()
+                        loss_val = float(resp.get("loss", 0.0))
+                        # Lightweight monitoring
+                        with torch.no_grad():
+                            outputs = full_model(input_ids, attention_mask, labels)
+                            _, accuracy, f1, _ = calculate_metrics(outputs, labels, batch, tokenizer, full_model, device)
+                        losses.append(loss_val)
+                        accs.append(float(accuracy))
+                        pbar.set_postfix({'Loss': f'{loss_val:.4f}', 'Acc': f'{accuracy:.4f}', 'F1': f'{f1:.4f}'})
+                        pbar.update(1)
+                        global_step += 1
+                        continue  # Skip client ZOO update on server turn
+                    # ============ SEQUENTIAL ZOO-ZOO FIX (client) ============
+
                     def objective_fn():
                         # Ensure deterministic probe: disable dropout temporarily
                         was_training = client_model.training
                         client_model.eval()
                         with torch.no_grad():
-                            # ZOO probe wire precision
-                            if args.wire_fp16 == 'on':
-                                _use_fp16 = True
-                            elif args.wire_fp16 == 'off':
-                                _use_fp16 = False
-                            else:  # auto -> use fp32 for ZOO
-                                _use_fp16 = False
+                            # ZOO probe wire precision from global precision
+                            _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
                             h_cut_live, pkg = _client_forward_to_cut_payload(
                                 client_model,
                                 input_ids, attention_mask, labels,
@@ -1268,11 +1289,27 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                             )
                         pkg["tgt_len"] = int(h_cut_live.shape[1])
                         # Request server to compute loss only (no local update, no g_cut)
+                        meta = {"zoo_eval": True, "need_g_cut": False}
+                        coord_ctx = getattr(grad_estimator, "current_context", None)
+                        if (
+                            coord_ctx is not None
+                            and bool(getattr(args, 'coordinated_zoo', False))
+                            and bool(getattr(args, 'use_zeroth_order_server', False))
+                        ):
+                            meta.update({
+                                "coordinated_zoo": True,
+                                "coord_seed": int(coord_ctx.get("base_seed", 0)),
+                                "coord_sign": int(coord_ctx.get("sign", 0)),
+                                "coord_mu": float(coord_ctx.get("mu", getattr(args, 'mu', 1e-3))),
+                                "coord_estimator": coord_ctx.get("estimator", getattr(args, 'estimator', 'central')),
+                            })
+                        if use_sequential:
+                            meta["server_turn"] = False  # freeze server on client turn
                         trainer.send_data({
                             "type": "forward_cut",
                             "mode": "train",
                             "data": pkg,
-                            "meta": {"zoo_eval": True, "need_g_cut": False}
+                            "meta": meta
                         })
                         # client is ZOO; the server should skip g_cut and return loss only
                         resp = trainer.receive_data()  # {'type': 'loss_report', 'loss': float}
@@ -1305,11 +1342,14 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                                     client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
                                 )
                                 pkg_probe["tgt_len"] = int(h_probe.shape[1])
+                            meta_gc = {"zoo_eval": False, "need_g_cut": True, "local_sgd": False}
+                            if use_sequential:
+                                meta_gc["server_turn"] = False  # freeze server on client turn
                             trainer.send_data({
                                 "type": "forward_cut",
                                 "mode": "train",
                                 "data": pkg_probe,
-                                "meta": {"zoo_eval": False, "need_g_cut": True, "local_sgd": False}
+                                "meta": meta_gc
                             })
                             resp_gc = trainer.receive_data()
                             if isinstance(resp_gc, dict) and ("g_cut" in resp_gc):
@@ -1335,20 +1375,23 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                         v = (h_tmp.to(dtype=g_cut_tensor.dtype) * g_cut_tensor).sum().item()
                         return torch.tensor(float(v), dtype=torch.float32)
 
-                    # Estimate gradients for client KV via ZOO with RMS-scaled μ and diversified seed
+                    # Estimate gradients for client KV via ZOO with optional RMS-scaled μ and diversified seed
                     pbar.set_description("Training (ZOO) | Computing ZOO gradients...")
                     grad_estimator.model_params = client_params
-                    # RMS scale μ per step
-                    with torch.no_grad():
-                        squares, count = 0.0, 0
-                        for p in client_params:
-                            squares += (p.data.float()**2).sum().item()
-                            count   += int(p.numel())
-                        rms = (squares / max(1, count))**0.5
+                    # Decide μ: base or RMS-scaled
                     base_mu = float(getattr(args, 'mu', 1e-3))
-                    scaled_mu = max(1e-5, base_mu) * (rms if rms > 0 else 1.0)
-                    old_mu = getattr(grad_estimator, 'perturbation_scale', scaled_mu)
-                    grad_estimator.perturbation_scale = scaled_mu
+                    if bool(getattr(args, 'use_scaled_mu', False)):
+                        with torch.no_grad():
+                            squares, count = 0.0, 0
+                            for p in client_params:
+                                squares += (p.data.float()**2).sum().item()
+                                count   += int(p.numel())
+                            rms = (squares / max(1, count))**0.5
+                        eff_mu = max(1e-5, base_mu) * (rms if rms > 0 else 1.0)
+                    else:
+                        eff_mu = base_mu
+                    old_mu = getattr(grad_estimator, 'perturbation_scale', eff_mu)
+                    grad_estimator.perturbation_scale = eff_mu
                     try:
                         grad_estimator.estimate_gradients(
                             input_ids, labels,
@@ -1413,7 +1456,39 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                                         torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
                             except Exception:
                                 pass
+                            # Phase 0: optional h_cut staleness probe (compute BEFORE step)
+                            if bool(getattr(args, 'log_hcut_staleness', False)):
+                                with torch.no_grad():
+                                    _was_train = client_model.training
+                                    client_model.eval()
+                                    _use_fp16 = False  # force fp32 for probe
+                                    _h_pre, _ = _client_forward_to_cut_payload(
+                                        client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                    )
+                                    if _was_train:
+                                        client_model.train()
                             optimizer.step()
+                            # Phase 0: optional h_cut staleness probe (compute AFTER step)
+                            if bool(getattr(args, 'log_hcut_staleness', False)):
+                                with torch.no_grad():
+                                    _was_train = client_model.training
+                                    client_model.eval()
+                                    _use_fp16 = False
+                                    _h_post, _ = _client_forward_to_cut_payload(
+                                        client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                    )
+                                    if _was_train:
+                                        client_model.train()
+                                try:
+                                    _num = (_h_post - _h_pre).float().norm().item()
+                                    _den = _h_pre.float().norm().item()
+                                    _rel = (_num / (max(_den, 1e-8)))
+                                    _thr = float(getattr(args, 'hcut_stale_warn', 0.05))
+                                    print(f"[h_cut] staleness after client step @ step {global_step}: {_rel*100:.2f}%")
+                                    if _rel > _thr:
+                                        print(f"[h_cut] WARNING: staleness {_rel*100:.2f}% > {_thr*100:.1f}%")
+                                except Exception as _e:
+                                    print(f"[h_cut] staleness computation failed: {_e}")
                             # Track memory after optimizer step
                             try:
                                 if _srv_tracker is not None:
@@ -1446,7 +1521,40 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                                     torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
                         except Exception:
                             pass
+                        # Phase 0: optional h_cut staleness probe (compute BEFORE step)
+                        if bool(getattr(args, 'log_hcut_staleness', False)):
+                            with torch.no_grad():
+                                _was_train = client_model.training
+                                client_model.eval()
+                                _use_fp16 = False  # force fp32 for probe
+                                _h_pre, _ = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                if _was_train:
+                                    client_model.train()
                         optimizer.step()
+                        # Phase 0: optional h_cut staleness probe (compute AFTER step)
+                        if bool(getattr(args, 'log_hcut_staleness', False)):
+                            with torch.no_grad():
+                                _was_train = client_model.training
+                                client_model.eval()
+                                _use_fp16 = False
+                                _h_post, _ = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                if _was_train:
+                                    client_model.train()
+                            try:
+                                _num = (_h_post - _h_pre).float().norm().item()
+                                _den = _h_pre.float().norm().item()
+                                _rel = (_num / (max(_den, 1e-8)))
+                                _thr = float(getattr(args, 'hcut_stale_warn', 0.05))
+                                print(f"[h_cut] staleness after client step @ step {global_step}: {_rel*100:.2f}%")
+                                if _rel > _thr:
+                                    print(f"[h_cut] WARNING: staleness {_rel*100:.2f}% > {_thr*100:.1f}%")
+                            except Exception as _e:
+                                print(f"[h_cut] staleness computation failed: {_e}")
+                        # Coordinated ZOO handled by dedicated training loop
                         # Track memory after optimizer step
                         try:
                             if _srv_tracker is not None:
@@ -1491,7 +1599,16 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
                     except Exception:
                         cur_obj_loss = 0.0
                     losses.append(cur_obj_loss)
-                    accs.append(0.0)
+                    # Compute a lightweight accuracy metric for display (uses full model; no grad)
+                    try:
+                        with torch.no_grad():
+                            outputs = full_model(input_ids, attention_mask, labels)
+                            _, accuracy, _, _ = calculate_metrics(
+                                outputs, labels, batch, tokenizer, full_model, device
+                            )
+                        accs.append(float(accuracy))
+                    except Exception:
+                        accs.append(0.0)
 
                     global_step += 1
                     cur_loss = sum(losses[-10:]) / min(len(losses), 10)
@@ -1600,6 +1717,212 @@ def train_split_learning_zoo(client_model, full_model, train_loader, eval_loader
         return 0.0, 0.0
 
 
+def train_split_learning_coordinated_zoo(
+    client_model,
+    full_model,
+    train_loader,
+    eval_loader,
+    optimizer,
+    scheduler,
+    trainer,
+    device,
+    tokenizer,
+    args,
+):
+    """Train using the coordinated ZOO-ZOO protocol."""
+    print("  Starting coordinated split learning training (ZOO-ZOO)...")
+    print(f"   Perturbations: {args.num_pert} | μ: {args.mu}")
+    print(f"   Scheduler: {args.scheduler} | Eval every {args.eval_steps} steps")
+
+    client_params = _collect_client_trainable_params(client_model, args)
+    zoo_trainer = CoordinatedZOOTrainer(
+        params=client_params,
+        num_pert=args.num_pert,
+        mu=args.mu,
+        seed=args.seed,
+        estimator=str(getattr(args, "estimator", "central")),
+        perturbation_dist=str(getattr(args, "perturbation_dist", "rademacher")),
+        bernoulli_p=float(getattr(args, "bernoulli_p", 0.5)),
+        center_bernoulli=bool(getattr(args, "center_bernoulli", True)),
+        device=device,
+    )
+
+    client_model.train()
+    try:
+        if _srv_tracker is not None:
+            _srv_tracker.set_phase("train")
+    except Exception:
+        pass
+
+    losses: List[float] = []
+    accs: List[float] = []
+    global_step = 0
+    epoch = 0
+    is_plateau_sched = str(getattr(args, "scheduler", "plateau")).lower() == "plateau"
+
+    progress = tqdm(
+        total=args.max_steps,
+        desc="Training (Coord. ZOO)",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] Loss: {postfix}",
+    )
+
+    def _make_payload(input_ids, attention_mask, labels, send_fp16):
+        return _client_forward_to_cut_payload(
+            client_model,
+            input_ids,
+            attention_mask,
+            labels,
+            send_fp16=send_fp16,
+        )
+
+    try:
+        while global_step < args.max_steps:
+            epoch += 1
+            print(f"\nEpoch {epoch} (Steps {global_step}/{args.max_steps})")
+
+            for batch_idx, batch in enumerate(train_loader):
+                if global_step >= args.max_steps:
+                    break
+
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch.get("labels")
+                if isinstance(labels, torch.Tensor):
+                    labels = labels.to(device)
+                else:
+                    labels = input_ids.clone()
+                    labels[attention_mask == 0] = -100
+                    pad_id = getattr(tokenizer, "pad_token_id", None)
+                    if pad_id is not None:
+                        labels[input_ids == pad_id] = -100
+                    labels = labels.long()
+
+                batch_payload = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels,
+                }
+
+                try:
+                    result = coordinated_zoo_step_client(
+                        client_model=client_model,
+                        optimizer=optimizer,
+                        client_comm=trainer,
+                        batch=batch_payload,
+                        trainer=zoo_trainer,
+                        device=device,
+                        args=args,
+                        make_payload_fn=_make_payload,
+                        trainable_params=client_params,
+                        send_fp16=False,
+                        offset=CLIENT_OFFSET_DEFAULT,
+                    )
+                except Exception as step_err:
+                    print(f"✖ Coordinated step failed at global step {global_step}: {step_err}")
+                    traceback.print_exc()
+                    continue
+
+                avg_loss = float(result.get("avg_loss", 0.0))
+                losses.append(avg_loss)
+
+                try:
+                    if _srv_tracker is not None:
+                        _srv_tracker.set_phase("train")
+                        _srv_tracker.update_memory()
+                except Exception:
+                    pass
+
+                try:
+                    with torch.no_grad():
+                        outputs = full_model(input_ids, attention_mask, labels)
+                        _, accuracy, _, _ = calculate_metrics(
+                            outputs,
+                            labels,
+                            batch,
+                            tokenizer,
+                            full_model,
+                            device,
+                        )
+                    accs.append(float(accuracy))
+                except Exception:
+                    accs.append(0.0)
+
+                if not is_plateau_sched:
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+
+                global_step += 1
+                cur_loss = sum(losses[-10:]) / min(len(losses), 10)
+                cur_acc = sum(accs[-10:]) / min(len(accs), 10)
+                progress.set_description(
+                    f"Training (Coord. ZOO) | Loss: {cur_loss:.4f} | Acc: {cur_acc:.6f}"
+                )
+                progress.update(1)
+
+                if global_step % getattr(args, "eval_steps", 1) == 0:
+                    try:
+                        if _srv_tracker is not None:
+                            _srv_tracker.set_phase("eval")
+                    except Exception:
+                        pass
+
+                    print(f"\nStep {global_step}: Coordinated ZOO evaluation...")
+                    eval_device = device
+                    moved = False
+                    try:
+                        if bool(getattr(args, "eval_on_cpu", False)) and str(getattr(args, "tuning", "prefix")) == "lora":
+                            full_model.to(torch.device("cpu"))
+                            eval_device = torch.device("cpu")
+                            moved = True
+                        eval_loss, eval_acc, eval_f1, eval_em = evaluate_model(
+                            full_model,
+                            eval_loader,
+                            eval_device,
+                            tokenizer,
+                            args,
+                            client_model=client_model,
+                            trainer=trainer,
+                            tracker=_srv_tracker,
+                        )
+                    finally:
+                        if moved:
+                            full_model.to(device)
+
+                    try:
+                        if _srv_tracker is not None:
+                            _srv_tracker.set_phase("train")
+                    except Exception:
+                        pass
+
+                    print(f".  Step {global_step} Coordinated ZOO Evaluation:")
+                    print(f"   Loss: {eval_loss:.4f}")
+                    print(f"   Accuracy: {eval_acc:.6f}")
+                    print(f"   F1 Score: {eval_f1:.6f}")
+                    print(f"   Exact Match: {eval_em:.6f}")
+
+                    if is_plateau_sched:
+                        try:
+                            if bool(getattr(args, "sched_step_on_eval", False)):
+                                scheduler.step(float(eval_loss))
+                        except Exception:
+                            pass
+
+        progress.close()
+
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+        avg_acc = sum(accs) / len(accs) if accs else 0.0
+        print(f"\n✅ Coordinated ZOO Training Complete - Final Loss: {avg_loss:.4f}, Final Acc: {avg_acc:.6f}")
+        return avg_loss, avg_acc
+
+    except Exception as e:
+        progress.close()
+        print(f"✖ Coordinated ZOO training failed: {e}")
+        traceback.print_exc()
+        return 0.0, 0.0
+
+
 def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader, optimizer, 
                            scheduler, trainer, device, tokenizer, args):
     """Train using split learning with SGD - FIXED VERSION"""
@@ -1655,15 +1978,8 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
                         labels = labels.long()
 
                     # === True-split: compute and send h_cut ===
-                    # Choose wire precision dynamically.
-                    # IMPORTANT: If the server uses ZOO, force fp32 to preserve FD signal fidelity.
-                    if args.wire_fp16 == 'on':
-                        _use_fp16 = True
-                    elif args.wire_fp16 == 'off':
-                        _use_fp16 = False
-                    else:  # auto
-                        # Prefer fp16 unless either side is doing ZOO
-                        _use_fp16 = not (bool(getattr(args, 'use_zeroth_order', False)) or bool(getattr(args, 'use_zeroth_order_server', False)))
+                    # Choose wire precision from global precision
+                    _use_fp16 = (str(getattr(args, 'precision', 'fp32')).lower() == 'fp16')
 
                     h_cut_live, pkg = _client_forward_to_cut_payload(
                         client_model,                 # clientKVOnly instance
@@ -1716,7 +2032,39 @@ def train_split_learning_sgd(client_model, full_model, train_loader, eval_loader
                                     torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=args.clip_grad_norm)
                         except Exception:
                             pass
+                        # Phase 0: optional h_cut staleness probe (compute BEFORE step)
+                        if bool(getattr(args, 'log_hcut_staleness', False)):
+                            with torch.no_grad():
+                                _was_train = client_model.training
+                                client_model.eval()
+                                _use_fp16 = False  # force fp32 for probe
+                                _h_pre, _ = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                if _was_train:
+                                    client_model.train()
                         optimizer.step()
+                        # Phase 0: optional h_cut staleness probe (compute AFTER step)
+                        if bool(getattr(args, 'log_hcut_staleness', False)):
+                            with torch.no_grad():
+                                _was_train = client_model.training
+                                client_model.eval()
+                                _use_fp16 = False
+                                _h_post, _ = _client_forward_to_cut_payload(
+                                    client_model, input_ids, attention_mask, labels, send_fp16=_use_fp16
+                                )
+                                if _was_train:
+                                    client_model.train()
+                            try:
+                                _num = (_h_post - _h_pre).float().norm().item()
+                                _den = _h_pre.float().norm().item()
+                                _rel = (_num / (max(_den, 1e-8)))
+                                _thr = float(getattr(args, 'hcut_stale_warn', 0.05))
+                                print(f"[h_cut] staleness after client step @ step {global_step}: {_rel*100:.2f}%")
+                                if _rel > _thr:
+                                    print(f"[h_cut] WARNING: staleness {_rel*100:.2f}% > {_thr*100:.1f}%")
+                            except Exception as _e:
+                                print(f"[h_cut] staleness computation failed: {_e}")
                         # Track memory after optimizer step
                         try:
                             if _srv_tracker is not None:
@@ -1854,12 +2202,12 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--zoo_lr', type=float, default=5e-4, help='ZOO learning rate')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate') 
-    parser.add_argument('--momentum', type=float, default=0.9, help='SGD momentum')
+    parser.add_argument('--momentum', type=float, default=0.0, help='SGD momentum (0 disables)')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
     parser.add_argument('--train_batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--test_batch_size', type=int, default=4, help='Test batch size')
-    parser.add_argument('--clip_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max gradient norm for clipping (0 disables)')
 
     # Dataset sizes - NEW ARGUMENTS
     parser.add_argument('--train_examples', type=int, default=None, help='Number of training examples (None => full dataset)')
@@ -1881,19 +2229,32 @@ def parse_args():
     parser.add_argument('--sched_min_lr', type=float, default=1e-5, help='LR scheduler minimum learning rate')
     
     # ZOO parameters
-    parser.add_argument('--mu', type=float, default=5e-4, help='ZOO perturbation scale (base, will be RMS-scaled)')
+    parser.add_argument('--mu', type=float, default=5e-4, help='ZOO perturbation scale (base μ)')
+    parser.add_argument('--use_scaled_mu', action='store_true', help='Scale μ by parameter RMS each step')
     parser.add_argument('--num_pert', type=int, default=64, help='ZOO perturbations (antithetic pairs internally)')
     parser.add_argument('--estimator', type=str, choices=['central','forward'], default='central', help='Finite-diff estimator type for ZOO/g_cut')
     parser.add_argument('--use_zeroth_order', action='store_true', help='Use ZOO for client')
     parser.add_argument('--use_zeroth_order_server', action='store_true', help='Use ZOO for server')
-    parser.add_argument('--zoo_momentum', type=float, default=0.5, help='Momentum for ZOO optimizer updates (0 disables)')
+    parser.add_argument('--sequential_zoo', action='store_true',
+                    help='Alternate server/client updates in ZOO-ZOO to avoid perturbation compounding')
+    parser.add_argument('--coordinated_zoo', action='store_true',
+                    help='Enable coordinated ZOO-ZOO with shared perturbation seeds between client and server')
+                    
+    parser.add_argument('--zoo_momentum', type=float, default=0.0, help='Momentum for ZOO optimizer updates (0 disables)')
     parser.add_argument('--zoo_accum_steps', type=int, default=1, help='Accumulate ZOO gradients for N steps before optimizer.step()')
     parser.add_argument('--zoo_grad_ema_beta', type=float, default=0.0, help='EMA beta for ZOO grad smoothing (0 disables)')
-    # Make g_cut variance-reduced objective enabled by default; allow disabling via --no_zoo_use_gcut
-    parser.add_argument('--no_zoo_use_gcut', dest='zoo_use_gcut', action='store_false', help='Disable variance-reduced ZOO g_cut objective')
-    parser.set_defaults(zoo_use_gcut=True)
-    parser.add_argument('--server_sgd_warmup_steps', type=int, default=800, help='Delay server local SGD for N steps in client-ZOO mode')
+    # g_cut objective: default OFF; enable explicitly with --zoo_use_gcut
+    parser.add_argument('--zoo_use_gcut', action='store_true', help='Enable variance-reduced ZOO g_cut objective')
+    # ZOO perturbation distribution
+    parser.add_argument('--perturbation_dist', type=str, choices=['rademacher','gaussian','bernoulli'], default='rademacher', help='Distribution for ZOO perturbations')
+    parser.add_argument('--bernoulli_p', type=float, default=0.5, help='Bernoulli(p) parameter (used when perturbation_dist=bernoulli)')
+    parser.add_argument('--no_center_bernoulli', dest='center_bernoulli', action='store_false', help='Disable centering/scaling Bernoulli to zero mean and unit variance')
+    parser.set_defaults(center_bernoulli=True)
+    parser.add_argument('--server_sgd_warmup_steps', type=int, default=0, help='Delay server local SGD for N steps in client-ZOO mode (0 disables)')
     parser.add_argument('--server_sgd_every', type=int, default=1, help='Perform server local SGD every K steps after warmup')
+    # Phase 0 diagnostics
+    parser.add_argument('--log_hcut_staleness', action='store_true', help='Log relative change in h_cut before/after client optimizer.step()')
+    parser.add_argument('--hcut_stale_warn', type=float, default=0.05, help='Warn if relative change in h_cut exceeds this fraction')
     
     # Evaluation
     parser.add_argument('--evaluate_every', type=int, default=1, help='Evaluate every N epochs')
@@ -1920,19 +2281,14 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost', help='client host to bind')
     parser.add_argument('--port', type=int, default=12345, help='client port to bind')
     
-    # Wire precision for h_cut payload (fp16 reduces bandwidth, fp32 improves ZOO stability)
-    parser.add_argument('--wire_fp16', choices=['auto','on','off'], default='off',
-                        help='Precision for wire activations h_cut: auto => SGD:true, ZOO:false; on => always fp16; off => always fp32')
-    parser.add_argument('--compute_dtype', choices=['fp16','fp32'], default='fp32', help='Compute/model dtype for client (fp16 or fp32)')
+    # Global precision (replaces wire_fp16 and compute_dtype)
+    parser.add_argument('--precision', choices=['fp16','fp32'], default='fp32', help='Global precision for compute and wire payloads')
     # Control whether to step LR scheduler on eval loss for ZOO (default off)
     parser.add_argument('--sched_step_on_eval', action='store_true', help='Also step LR scheduler on eval loss (ZOO)')
     # Evaluation device control
     parser.add_argument('--eval_on_cpu', action='store_true', help='Run evaluation on CPU to reduce GPU memory usage')
     
     args = parser.parse_args()
-    # Safety: forbid forcing fp16 on wire when using any ZOO (client or server)
-    if args.wire_fp16 == 'on' and (args.use_zeroth_order or args.use_zeroth_order_server):
-        raise SystemExit("wire_fp16='on' is incompatible with ZOO. Use 'auto' or 'off'.")
     return args
 
 if __name__ == "__main__":
@@ -1953,12 +2309,15 @@ if __name__ == "__main__":
         print(f"   Max length: {args.max_length}")
         print(f"   ZOO client: {args.use_zeroth_order}")
         print(f"   ZOO server: {args.use_zeroth_order_server}")
+        if bool(getattr(args, 'coordinated_zoo', False)):
+            print("   Coordinated ZOO: enabled")
         print(f"   F1 method: {args.f1_method}")
         if args.use_zeroth_order:
-            print(f"   ZOO mu: {args.mu}")
+            print(f"   ZOO mu: {args.mu} (scaled_mu={getattr(args, 'use_scaled_mu', False)})")
             print(f"   ZOO perturbations: {args.num_pert}")
             print(f"   ZOO use g_cut objective: {getattr(args, 'zoo_use_gcut', False)}")
-        print(f"   Wire dtype policy: {getattr(args, 'wire_fp16', 'auto')}")
+        print(f"   ZOO perturbation dist: {getattr(args, 'perturbation_dist', 'rademacher')}")
+        print(f"   Precision: {getattr(args, 'precision', 'fp32')}")
         
         # Device configuration
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1976,7 +2335,7 @@ if __name__ == "__main__":
             client_model = LoRAclientModel(
                 args.model_name, args.cut_layer,
                 r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
-                torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32),
+                torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32),
                 targets=tuple(args.lora_targets.split(','))
             ).to(device)
             trainable_params = list(client_model.trainable_parameters())
@@ -2008,7 +2367,7 @@ if __name__ == "__main__":
         else:
             # existing PrefixKV client path (keep yours)
             client_model = clientKVOnly(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
-                                        torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
+                                        torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
             trainable_params = list(client_model.kv.parameters())  # unchanged
             _assert_only_expected_trainables(client_model, args.tuning, side="client")
 
@@ -2018,7 +2377,7 @@ if __name__ == "__main__":
                     if ("lora_A" not in n and "lora_B" not in n)), "Only LoRA params must be trainable in LoRA mode!"
         
         full_model = FullLLMModel(args.model_name, cut_layer=args.cut_layer, num_prefix=args.num_prefix,
-                                  torch_dtype=(torch.float16 if str(getattr(args, 'compute_dtype', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
+                                  torch_dtype=(torch.float16 if str(getattr(args, 'precision', 'fp32')).lower() == 'fp16' else torch.float32)).to(device)
         # Only attach client KV in prefix mode; in LoRA there is no live client KV to use
         if args.tuning != 'lora':
             full_model.attach_live_client_kv(client_model.kv)
@@ -2147,8 +2506,16 @@ if __name__ == "__main__":
             # Choose training method based on client configuration only
             if args.use_zeroth_order:
                 train_loss, train_acc = train_split_learning_zoo(
-                    client_model, full_model, train_loader, eval_loader, optimizer, 
-                    scheduler, trainer, device, tokenizer, args
+                    client_model,
+                    full_model,
+                    train_loader,
+                    eval_loader,
+                    optimizer,
+                    scheduler,
+                    trainer,
+                    device,
+                    tokenizer,
+                    args,
                 )
             else:
                 train_loss, train_acc = train_split_learning_sgd(

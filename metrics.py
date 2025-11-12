@@ -134,8 +134,9 @@ def _classification_metrics(outputs, labels, batch, tokenizer, model=None, devic
         no_ids  = _first_ids([' no', 'No', ' no,',  'No,',  ' no.',  'No.'])
         ent_ids = _first_ids([' Entailment', 'Entailment', ' entailment'])
         not_ent_ids = _first_ids([' Not Entailment', 'Not Entailment', ' not entailment'])
-        pos_ids = _first_ids([' great', 'great', ' positive', 'positive', ' good', 'good'])
-        neg_ids = _first_ids([' terrible', 'terrible', ' negative', 'negative', ' bad', 'bad'])
+        # IMPORTANT: For SST-2, restrict to dataset verbalizer exactly to avoid prior bias
+        pos_ids = _first_ids([' great', 'great'])
+        neg_ids = _first_ids([' terrible', 'terrible'])
 
         for i, text in enumerate(batch.get('formatted_text', [])):
             if 'Answer:' not in text:
@@ -314,10 +315,62 @@ def _classification_metrics(outputs, labels, batch, tokenizer, model=None, devic
                     score_no  = _lse(no_ids)
                     pred = 1 if score_yes >= score_no else 0
             else:
-                # SST-2 mapping fallback
-                score_pos = _lse(pos_ids)
-                score_neg = _lse(neg_ids)
-                pred = 1 if score_pos >= score_neg else 0
+                # SST-2 mapping: prefer full-string conditional probability on dataset verbalizer
+                if (model is not None) and (device is not None):
+                    try:
+                        prompt = text[: text.find('Answer:') + len('Answer:')] + ' '
+                        def _conditional_logprob(candidate: str) -> float:
+                            _old_side = getattr(tokenizer, 'truncation_side', 'right')
+                            try:
+                                tokenizer.truncation_side = 'left'
+                            except Exception:
+                                pass
+                            try:
+                                prompt_inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                                full_inputs = tokenizer(prompt + candidate, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                            finally:
+                                try:
+                                    tokenizer.truncation_side = _old_side
+                                except Exception:
+                                    pass
+                            with torch.no_grad():
+                                out = model(**full_inputs)
+                                logits_tf = out.logits[0]
+                                log_probs = F.log_softmax(logits_tf, dim=-1)
+                            full_ids = full_inputs['input_ids'][0]
+                            p_len = int(prompt_inputs['input_ids'].shape[1])
+                            f_len = int(full_ids.shape[0])
+                            if f_len <= p_len:
+                                return float('-inf')
+                            total = 0.0
+                            for pos_tf in range(p_len, f_len):
+                                prev_index = pos_tf - 1
+                                tok_id = int(full_ids[pos_tf].item())
+                                total += float(log_probs[prev_index, tok_id].item())
+                            return total
+                        pos_variants = ['great', ' great']
+                        neg_variants = ['terrible', ' terrible']
+                        # compute LSE across variants
+                        def _lse_vals(vals: list) -> float:
+                            if not vals:
+                                return float('-inf')
+                            t = torch.tensor(vals, dtype=torch.float32)
+                            return float(torch.logsumexp(t, dim=0).item())
+                        p_scores = [s for s in (_conditional_logprob(v) for v in pos_variants) if np.isfinite(s)]
+                        n_scores = [s for s in (_conditional_logprob(v) for v in neg_variants) if np.isfinite(s)]
+                        score_pos = _lse_vals(p_scores)
+                        score_neg = _lse_vals(n_scores)
+                        pred = 1 if score_pos >= score_neg else 0
+                    except Exception:
+                        # Fallback to first-token LSE restricted to dataset verbalizer
+                        score_pos = _lse(pos_ids)
+                        score_neg = _lse(neg_ids)
+                        pred = 1 if score_pos >= score_neg else 0
+                else:
+                    # Model/device unavailable: fallback to first-token LSE
+                    score_pos = _lse(pos_ids)
+                    score_neg = _lse(neg_ids)
+                    pred = 1 if score_pos >= score_neg else 0
 
             preds.append(int(pred))
             if target_label is not None:
@@ -786,13 +839,59 @@ def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5
                         score_no  = _lse(no_ids)
                         predicted = 'Yes' if score_yes >= score_no else 'No'
                     else:
-                        # Fall back to SST-2 style only if that makes sense
-                        if pos_ids or neg_ids:
-                            score_pos = _lse(pos_ids)
-                            score_neg = _lse(neg_ids)
+                        # SST-2 style: prefer full-string conditional log-prob on dataset verbalizer
+                        try:
+                            pos_variants = ['great', ' great']
+                            neg_variants = ['terrible', ' terrible']
+                            def _conditional_logprob(candidate: str) -> float:
+                                _old_side = getattr(tokenizer, 'truncation_side', 'right')
+                                try:
+                                    tokenizer.truncation_side = 'left'
+                                except Exception:
+                                    pass
+                                try:
+                                    prompt_inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                                    full_inputs = tokenizer(prompt + candidate, return_tensors='pt', truncation=True, max_length=350, padding=False).to(device)
+                                finally:
+                                    try:
+                                        tokenizer.truncation_side = _old_side
+                                    except Exception:
+                                        pass
+                                with torch.no_grad():
+                                    out = model(**full_inputs)
+                                    logits_tf = out.logits[0]
+                                    log_probs = F.log_softmax(logits_tf, dim=-1)
+                                full_ids = full_inputs['input_ids'][0]
+                                p_len = int(prompt_inputs['input_ids'].shape[1])
+                                f_len = int(full_ids.shape[0])
+                                if f_len <= p_len:
+                                    return float('-inf')
+                                total = 0.0
+                                for pos_tf in range(p_len, f_len):
+                                    prev_index = pos_tf - 1
+                                    tok_id = int(full_ids[pos_tf].item())
+                                    total += float(log_probs[prev_index, tok_id].item())
+                                return total
+                            def _lse_vals(vals: list) -> float:
+                                if not vals:
+                                    return float('-inf')
+                                t = torch.tensor(vals, dtype=torch.float32)
+                                return float(torch.logsumexp(t, dim=0).item())
+                            p_scores = [s for s in (_conditional_logprob(v) for v in pos_variants) if np.isfinite(s)]
+                            n_scores = [s for s in (_conditional_logprob(v) for v in neg_variants) if np.isfinite(s)]
+                            score_pos = _lse_vals(p_scores)
+                            score_neg = _lse_vals(n_scores)
                             predicted = 'great' if score_pos >= score_neg else 'terrible'
-                        else:
-                            continue
+                        except Exception:
+                            # Fallback to first-token LSE restricted to dataset verbalizer
+                            pos_ids = _first_ids([' great', 'great'])
+                            neg_ids = _first_ids([' terrible', 'terrible'])
+                            if pos_ids or neg_ids:
+                                score_pos = _lse(pos_ids)
+                                score_neg = _lse(neg_ids)
+                                predicted = 'great' if score_pos >= score_neg else 'terrible'
+                            else:
+                                continue
 
                     if not gold:
                         continue
