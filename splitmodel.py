@@ -727,8 +727,19 @@ class SplitGPT2(nn.Module):
         self.client_output = None  # Activation at the cut on the client side
         self.server_input = None   # Detached clone that server sees
         
+        # Peak memory tracking for client and server
+        self.client_peak_memory_mb = 0.0
+        self.server_peak_memory_mb = 0.0
+        self._track_memory = False
+        
         # Weight tying (only needed during initialization, then they're independent)
         self._initialize_weights()
+
+    def enable_memory_tracking(self, enable=True):
+        """Enable/disable memory tracking during forward passes."""
+        self._track_memory = enable
+        if enable and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
     def _initialize_weights(self):
         """Initialize weights for client and server (they start the same, then diverge during training)"""
@@ -759,9 +770,19 @@ class SplitGPT2(nn.Module):
         Returns:
             CausalLMOutput with loss (if labels provided) and logits
         """
+        # Track memory before client forward
+        if self._track_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        
         # ============ CLIENT SIDE ============
         # Client forward - this would be on client machine
         hidden_states, presents = self.client(input_ids)
+        
+        # Track peak memory after client forward
+        if self._track_memory and torch.cuda.is_available():
+            client_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            self.client_peak_memory_mb = max(self.client_peak_memory_mb, client_peak)
+            torch.cuda.reset_peak_memory_stats()
         
         # ============ COMMUNICATION ============
         # In true split learning, only these tensors cross the network:
@@ -794,6 +815,11 @@ class SplitGPT2(nn.Module):
             lm_mask=attention_mask,
             label_smooth=0.0
         )
+        
+        # Track peak memory after server forward
+        if self._track_memory and torch.cuda.is_available():
+            server_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            self.server_peak_memory_mb = max(self.server_peak_memory_mb, server_peak)
         
         if labels is not None:
             logits, loss = server_outputs
@@ -1176,6 +1202,17 @@ class SplitOPT(nn.Module):
         # Storage for split-learning tensors
         self.client_output = None
         self.server_input = None
+        
+        # Peak memory tracking for client and server
+        self.client_peak_memory_mb = 0.0
+        self.server_peak_memory_mb = 0.0
+        self._track_memory = False
+
+    def enable_memory_tracking(self, enable=True):
+        """Enable/disable memory tracking during forward passes."""
+        self._track_memory = enable
+        if enable and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
     def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
         """
@@ -1187,8 +1224,18 @@ class SplitOPT(nn.Module):
         3. Server computes logits and loss
         4. For backward: Server sends gradients back to client
         """
+        # Track memory before client forward
+        if self._track_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        
         # ============ CLIENT SIDE ============
         hidden_states, presents = self.client(input_ids)
+        
+        # Track peak memory after client forward
+        if self._track_memory and torch.cuda.is_available():
+            client_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            self.client_peak_memory_mb = max(self.client_peak_memory_mb, client_peak)
+            torch.cuda.reset_peak_memory_stats()
 
         # ============ COMMUNICATION ============
         if self.training and labels is not None:
@@ -1209,6 +1256,11 @@ class SplitOPT(nn.Module):
             lm_mask=attention_mask,
             label_smooth=0.0,
         )
+        
+        # Track peak memory after server forward
+        if self._track_memory and torch.cuda.is_available():
+            server_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            self.server_peak_memory_mb = max(self.server_peak_memory_mb, server_peak)
 
         if labels is not None:
             logits, loss = server_outputs

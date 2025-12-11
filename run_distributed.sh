@@ -1,0 +1,375 @@
+#!/bin/bash -l
+#SBATCH --job-name=split_distributed
+#SBATCH --account=fl-het
+#SBATCH --partition=tier3
+#SBATCH --gres=gpu:a100:1
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+#SBATCH --time=0-10:00:00
+#SBATCH --nodes=2                    # 2 nodes: server + client
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=40g
+
+# =============================================================================
+# Distributed Split Learning - Using run_distributed.py (DeComFL-style)
+# 
+# This script runs split learning across two nodes using a SINGLE entry point:
+#   - Node 0: python run_distributed.py --role server
+#   - Node 1: python run_distributed.py --role client
+#
+# Benefits of single entry point (like DeComFL):
+#   - Same script for both roles
+#   - Consistent argument handling
+#   - Easier maintenance
+#
+# The script:
+#   1. Starts the server on node 0 with --role server
+#   2. Waits for server to be ready (checks port availability)
+#   3. Starts the client on node 1 with --role client
+#   4. Client drives training, server responds
+#   5. Cleans up when training completes
+#
+# Usage:
+#   sbatch run_distributed.sh
+#   
+#   # With custom parameters:
+#   MODEL=facebook/opt-1.3b TASK=SST2 BS=32 sbatch run_distributed.sh
+#   
+#   # Different optimizer modes:
+#   CLIENT_OPTIMIZER=zo SERVER_OPTIMIZER=zo sbatch run_distributed.sh  # ZO/ZO (default)
+#   CLIENT_OPTIMIZER=fo SERVER_OPTIMIZER=fo sbatch run_distributed.sh  # FO/FO
+#   CLIENT_OPTIMIZER=zo SERVER_OPTIMIZER=fo sbatch run_distributed.sh  # Hybrid
+# =============================================================================
+
+set -e  # Exit on error
+
+echo "=========================================="
+echo "  Distributed Split Learning"
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Nodes: $SLURM_JOB_NODELIST"
+echo "Time: $(date)"
+echo "Working Directory: $(pwd)"
+echo "=========================================="
+
+# =============================================================================
+# Configuration Parameters (same as run_script_gpu.sh)
+# =============================================================================
+
+MODEL=${MODEL:-facebook/opt-1.3b}
+MODEL_NAME=(${MODEL//\// })
+MODEL_NAME="${MODEL_NAME[-1]}"
+
+TASK=${TASK:-SST2}
+BS=${BS:-64}
+SEED=${SEED:-0}
+TRAIN=${TRAIN:-32000}
+DEV=${DEV:-500}
+EVAL=${EVAL:-1000}
+STEPS=${STEPS:-3000}
+EVAL_STEPS=${EVAL_STEPS:-25}
+
+MODE=${MODE:-lora}
+MOMENTUM=${MOMENTUM:-0.9}
+
+# ZO Configuration
+ZO_VARIANT=${ZO_VARIANT:-central}
+ZO_PERTURBATION=${ZO_PERTURBATION:-coordinate}
+NUM_PERT=${NUM_PERT:-1}
+
+# Optimizer configuration (default: ZO/ZO for dimension-free like DeComFL)
+CLIENT_OPTIMIZER=${CLIENT_OPTIMIZER:-fo}
+SERVER_OPTIMIZER=${SERVER_OPTIMIZER:-fo}
+OPTIMIZER=${OPTIMIZER:-sgd}
+
+# Set trainer based on optimizer (zo if either is zo, else regular)
+if [ "$CLIENT_OPTIMIZER" == "zo" ] || [ "$SERVER_OPTIMIZER" == "zo" ]; then
+    TRAINER=zo
+else
+    TRAINER=regular
+fi
+
+# Learning rates
+if [ "$MODE" == "lora" ]; then
+    LR=${LR:-1e-4}
+    ZOO_LR=${ZOO_LR:-5e-5}
+    EPS=${EPS:-5e-3}
+else
+    LR=${LR:-1e-3}
+    ZOO_LR=${ZOO_LR:-1e-6}
+    EPS=${EPS:-1e-3}
+fi
+
+# Set learning rates based on optimizer type
+if [ "$CLIENT_OPTIMIZER" == "zo" ]; then
+    CLIENT_LR=${CLIENT_LR:-$ZOO_LR}
+else
+    CLIENT_LR=${CLIENT_LR:-$LR}
+fi
+
+if [ "$SERVER_OPTIMIZER" == "zo" ]; then
+    SERVER_LR=${SERVER_LR:-$ZOO_LR}
+else
+    SERVER_LR=${SERVER_LR:-$LR}
+fi
+
+# Network configuration
+PORT=${PORT:-50051}
+
+# LoRA/Prefix configuration
+EXTRA_ARGS=""
+if [ "$MODE" == "prefix" ]; then
+    EXTRA_ARGS="--prefix_tuning --num_prefix 5 --no_reparam --prefix_init_by_real_act"
+elif [ "$MODE" == "lora" ]; then
+    EXTRA_ARGS="--lora --lora_r 8 --lora_alpha 16"
+fi
+
+TASK_ARGS=""
+case $TASK in
+    CB) # It has <1000 training examples. Only use 100 for dev
+        DEV=100
+        ;;
+esac
+
+MAX_WAIT=${MAX_WAIT:-300}  # Max seconds to wait for server
+# =============================================================================
+# Get Node Information
+# =============================================================================
+
+NODELIST=($(scontrol show hostnames $SLURM_JOB_NODELIST))
+SERVER_NODE=${NODELIST[0]}
+CLIENT_NODE=${NODELIST[1]}
+
+# Get server IP (run hostname on server node)
+SERVER_IP=$(srun --nodes=1 --ntasks=1 -w $SERVER_NODE hostname -i 2>/dev/null | head -1 | awk '{print $1}')
+
+echo ""
+echo "=========================================="
+echo "  Configuration Summary"
+echo "=========================================="
+echo "SERVER NODE: $SERVER_NODE"
+echo "SERVER IP:   $SERVER_IP:$PORT"
+echo "CLIENT NODE: $CLIENT_NODE"
+echo ""
+echo "Model:       $MODEL_NAME"
+echo "Task:        $TASK"
+echo "Mode:        $MODE"
+echo "Batch Size:  $BS"
+echo "Max Steps:   $STEPS"
+echo "Eval Steps:  $EVAL_STEPS"
+echo "Trainer:     $TRAINER"
+echo ""
+echo "Client:      $CLIENT_OPTIMIZER (LR=$CLIENT_LR)"
+echo "Server:      $SERVER_OPTIMIZER (LR=$SERVER_LR)"
+echo "ZO Variant:  $ZO_VARIANT"
+echo "ZO Pert:     $ZO_PERTURBATION"
+echo "ZO Epsilon:  $EPS"
+echo "Num Pert:    $NUM_PERT"
+echo "Extra args:  $EXTRA_ARGS $TASK_ARGS"
+echo "=========================================="
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+cleanup() {
+    echo ""
+    echo "[$(date)] Cleaning up..."
+    # Kill any remaining processes
+    pkill -f "run_distributed.py" 2>/dev/null || true
+    echo "[$(date)] Cleanup complete"
+}
+
+trap cleanup EXIT
+
+wait_for_server() {
+    local host=$1
+    local port=$2
+    local max_wait=3000
+    local waited=0
+    
+    echo "[$(date)] Waiting for server at $host:$port..."
+    
+    while [ $waited -lt $max_wait ]; do
+        # Try to connect using Python (more reliable than nc/netcat)
+        if srun --nodes=1 --ntasks=1 -w $CLIENT_NODE \
+            python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('$host', $port)); s.close()" 2>/dev/null; then
+            echo "[$(date)] Server is ready! (waited ${waited}s)"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        echo "[$(date)] Still waiting... (${waited}s / ${max_wait}s)"
+    done
+    
+    echo "[$(date)] ERROR: Server did not start within ${max_wait}s"
+    return 1
+}
+
+# =============================================================================
+# Step 1: Start Server on Node 0
+# =============================================================================
+
+echo ""
+echo "=========================================="
+echo "  Step 1: Starting Server"
+echo "=========================================="
+echo "[$(date)] Launching server on $SERVER_NODE..."
+
+# Start server in background using run_distributed.py --role server
+srun --nodes=1 --ntasks=1 -w $SERVER_NODE \
+    bash -c "
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate mezo
+        export CUDA_VISIBLE_DEVICES=0
+        export WANDB_MODE=disabled
+        spack unload cuda 2>/dev/null || true
+        spack load /jmc4bek
+        export CUDA_HOME=\$(spack location -i /jmc4bek)
+        
+        echo '[SERVER] Loading model on '\$(hostname)' at '\$(date)'...'
+        echo '[SERVER] Will listen on 0.0.0.0:$PORT once model loaded'
+        
+        # Force unbuffered Python output and redirect stderr to stdout
+        export PYTHONUNBUFFERED=1
+        
+        python -u run_distributed.py \
+            --role server \
+            --host 0.0.0.0 \
+            --port $PORT \
+            --device cuda \
+            --backend tcp \
+            --model_name $MODEL \
+            --task_name $TASK \
+            --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+            --max_steps $STEPS \
+            --trainer $TRAINER --client_optimizer $CLIENT_OPTIMIZER --server_optimizer $SERVER_OPTIMIZER \
+            --learning_rate $LR --client_learning_rate $CLIENT_LR --server_learning_rate $SERVER_LR \
+            --zo_variant $ZO_VARIANT --zo_perturbation $ZO_PERTURBATION --num_pert $NUM_PERT \
+            --zo_eps $EPS --per_device_train_batch_size $BS --per_device_eval_batch_size $BS --lr_scheduler_type \"constant\" \
+            --eval_steps $EVAL_STEPS \
+            --eval_strategy steps \
+            --optimizer $OPTIMIZER \
+            $EXTRA_ARGS \
+            $TASK_ARGS
+    " &
+
+SERVER_PID=$!
+echo "[$(date)] Server process started (PID: $SERVER_PID)"
+
+# =============================================================================
+# Step 2: Wait for Server to be Ready
+# =============================================================================
+
+echo ""
+echo "=========================================="
+echo "  Step 2: Waiting for Server"
+echo "=========================================="
+
+# Give server a few seconds to start loading model
+sleep 5
+
+# Wait for server to be ready to accept connections
+if ! wait_for_server $SERVER_IP $PORT $MAX_WAIT; then
+    echo "[$(date)] FATAL: Server failed to start"
+    exit 1
+fi
+
+# =============================================================================
+# Step 3: Start Client on Node 1
+# =============================================================================
+
+echo ""
+echo "=========================================="
+echo "  Step 3: Starting Client"
+echo "=========================================="
+echo "[$(date)] Launching client on $CLIENT_NODE..."
+echo "[$(date)] Connecting to $SERVER_IP:$PORT"
+
+# Start client using run_distributed.py --role client
+srun --nodes=1 --ntasks=1 -w $CLIENT_NODE \
+    bash -c "
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate mezo
+        export CUDA_VISIBLE_DEVICES=0
+        export WANDB_MODE=disabled
+        spack unload cuda 2>/dev/null || true
+        spack load /jmc4bek
+        export CUDA_HOME=\$(spack location -i /jmc4bek)
+        
+        echo '[CLIENT] Starting on '\$(hostname)' at '\$(date)
+        echo '[CLIENT] Connecting to $SERVER_IP:$PORT'
+        
+        # Force unbuffered Python output
+        export PYTHONUNBUFFERED=1
+        
+        python -u run_distributed.py \
+            --role client \
+            --server_host $SERVER_IP \
+            --port $PORT \
+            --device cuda \
+            --backend tcp \
+            --model_name $MODEL \
+            --task_name $TASK \
+            --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+            --max_steps $STEPS \
+            --trainer $TRAINER --client_optimizer $CLIENT_OPTIMIZER --server_optimizer $SERVER_OPTIMIZER \
+            --learning_rate $LR --client_learning_rate $CLIENT_LR --server_learning_rate $SERVER_LR \
+            --zo_variant $ZO_VARIANT --zo_perturbation $ZO_PERTURBATION --num_pert $NUM_PERT \
+            --zo_eps $EPS --per_device_train_batch_size $BS --per_device_eval_batch_size $BS --lr_scheduler_type \"constant\" \
+            --eval_steps $EVAL_STEPS \
+            --eval_strategy steps \
+            --optimizer $OPTIMIZER \
+            $EXTRA_ARGS \
+            $TASK_ARGS
+    " &
+
+CLIENT_PID=$!
+echo "[$(date)] Client process started (PID: $CLIENT_PID)"
+
+# =============================================================================
+# Step 4: Wait for Training to Complete
+# =============================================================================
+
+echo ""
+echo "=========================================="
+echo "  Step 4: Training in Progress"
+echo "=========================================="
+echo "[$(date)] Waiting for training to complete..."
+echo "Server PID: $SERVER_PID"
+echo "Client PID: $CLIENT_PID"
+echo ""
+echo "Monitor progress with: tail -f ${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out"
+
+# Wait for client to finish (client drives the training loop)
+wait $CLIENT_PID
+CLIENT_EXIT=$?
+
+echo ""
+echo "[$(date)] Client finished with exit code: $CLIENT_EXIT"
+
+# Give server a moment to finish any pending operations
+sleep 2
+
+# Server will be cleaned up by the trap
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+echo ""
+echo "=========================================="
+echo "  Training Complete"
+echo "=========================================="
+echo "End Time:    $(date)"
+echo "Exit Code:   $CLIENT_EXIT"
+echo "Job ID:      $SLURM_JOB_ID"
+echo ""
+echo "Logs:"
+echo "  Output: ${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out"
+echo "  Error:  ${SLURM_JOB_NAME}_${SLURM_JOB_ID}.err"
+echo "=========================================="
+
+exit $CLIENT_EXIT

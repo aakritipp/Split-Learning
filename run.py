@@ -26,6 +26,247 @@ from trainer import OurTrainer
 from dataset import get_task
 from splitmodel import GPT2Config, GPT2LMModel_Server, GPT2LMModel_Client, SplitGPT2, SplitOPT
 from lora import *
+from split_communication import format_payload_size
+
+
+class NondiffCollator:
+    """
+    Collator for non-differentiable objective training.
+    Handles padding and preserves 'gold' labels for F1/acc computation.
+    """
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+    
+    def __call__(self, features):
+        # Extract gold labels for non-diff training
+        golds = [f.pop("gold") if "gold" in f else None for f in features]
+        
+        # Get max length
+        max_length = max(len(f["input_ids"]) for f in features)
+        if self.pad_to_multiple_of:
+            max_length = ((max_length + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of) * self.pad_to_multiple_of
+        
+        # Pad input_ids and labels
+        padded_input_ids = []
+        padded_labels = []
+        option_lens = []
+        
+        padding_side = getattr(self.tokenizer, 'padding_side', 'left')
+        pad_token_id = self.tokenizer.pad_token_id or 0
+        
+        for f in features:
+            input_ids = f["input_ids"]
+            labels = f.get("labels", input_ids)
+            option_len = f.get("option_len", 0)
+            
+            if padding_side == "left":
+                padded = [pad_token_id] * (max_length - len(input_ids)) + list(input_ids)
+                padded_lab = [-100] * (max_length - len(labels)) + list(labels)
+            else:
+                padded = list(input_ids) + [pad_token_id] * (max_length - len(input_ids))
+                padded_lab = list(labels) + [-100] * (max_length - len(labels))
+            
+            padded_input_ids.append(padded)
+            padded_labels.append(padded_lab)
+            option_lens.append(option_len)
+        
+        batch = {
+            "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
+            "option_len": option_lens,
+        }
+        
+        if any(g is not None for g in golds):
+            batch["gold"] = golds
+        
+        return batch
+
+
+def get_gpu_memory_mb():
+    """Get current GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / (1024 ** 2)
+    return 0.0
+
+
+def get_gpu_max_memory_mb():
+    """Get peak GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return 0.0
+
+
+def reset_gpu_memory_stats():
+    """Reset GPU memory statistics."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+
+def get_model_memory_mb(model):
+    """Estimate model memory usage in MB based on parameter sizes."""
+    total_bytes = 0
+    for param in model.parameters():
+        total_bytes += param.nelement() * param.element_size()
+    for buffer in model.buffers():
+        total_bytes += buffer.nelement() * buffer.element_size()
+    return total_bytes / (1024 ** 2)
+
+
+def get_trainable_memory_mb(model):
+    """Estimate memory needed for trainable parameters only (in MB)."""
+    total_bytes = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            total_bytes += param.nelement() * param.element_size()
+    return total_bytes / (1024 ** 2)
+
+
+def get_gradient_memory_estimate_mb(model, optimizer_type="sgd", momentum=0.0):
+    """
+    Estimate memory needed for gradients and optimizer states (in MB).
+    
+    For each trainable parameter:
+    - Gradients: same size as parameter (for FO only)
+    - SGD with momentum: one buffer per parameter
+    - Adam: two buffers per parameter (m and v)
+    """
+    trainable_bytes = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            trainable_bytes += param.nelement() * param.element_size()
+    
+    gradient_memory = trainable_bytes  # Same size as trainable params
+    
+    if optimizer_type == "sgd":
+        if momentum > 0:
+            optimizer_memory = trainable_bytes  # Momentum buffer
+        else:
+            optimizer_memory = 0
+    elif optimizer_type == "adam":
+        optimizer_memory = 2 * trainable_bytes  # m and v buffers
+    else:
+        optimizer_memory = 0
+    
+    return (gradient_memory + optimizer_memory) / (1024 ** 2)
+
+
+def estimate_activation_memory_mb(batch_size, seq_len, hidden_dim, num_layers, 
+                                   bytes_per_element=4, store_for_backward=True):
+    """
+    Estimate activation memory for transformer forward pass.
+    
+    For each layer, we store:
+    - Input activations: batch × seq × hidden
+    - Attention scores: batch × heads × seq × seq (approx)
+    - FFN intermediate: batch × seq × 4*hidden
+    
+    Args:
+        batch_size: Batch size
+        seq_len: Sequence length
+        hidden_dim: Hidden dimension
+        num_layers: Number of transformer layers
+        bytes_per_element: Bytes per tensor element (4 for fp32, 2 for fp16)
+        store_for_backward: If True, store activations for backprop (FO mode)
+    """
+    if not store_for_backward:
+        # ZO mode: only need current layer's activations
+        # Just input + output of current computation
+        per_layer = batch_size * seq_len * hidden_dim * bytes_per_element * 2
+        return per_layer / (1024 ** 2)
+    
+    # FO mode: store all activations for backward pass
+    # Per layer: input, attention, FFN intermediate
+    per_layer = batch_size * seq_len * hidden_dim * bytes_per_element  # input
+    per_layer += batch_size * seq_len * hidden_dim * 4 * bytes_per_element  # FFN
+    per_layer += batch_size * 12 * seq_len * seq_len * bytes_per_element  # attention (approx)
+    
+    total = per_layer * num_layers
+    return total / (1024 ** 2)
+
+
+def get_split_model_memory_info(model, client_optimizer_mode="fo", server_optimizer_mode="fo", 
+                                   optimizer_type="sgd", momentum=0.0,
+                                   batch_size=64, seq_len=512):
+    """
+    Get detailed memory information for a split model (client/server).
+    
+    Returns dict with:
+    - client_model_mb: Total model memory for client
+    - client_trainable_mb: Trainable parameter memory for client
+    - client_gradient_mb: Gradient + optimizer memory for client (0 if ZO)
+    - server_model_mb: Total model memory for server  
+    - server_trainable_mb: Trainable parameter memory for server
+    - server_gradient_mb: Gradient + optimizer memory for server (0 if ZO)
+    - total_model_mb: Total model memory
+    - total_training_mb: Total memory needed during training
+    - client_standalone_estimate_mb: Estimated GPU for client alone
+    - server_standalone_estimate_mb: Estimated GPU for server alone
+    """
+    info = {
+        "client_model_mb": 0.0,
+        "client_trainable_mb": 0.0,
+        "client_gradient_mb": 0.0,
+        "server_model_mb": 0.0,
+        "server_trainable_mb": 0.0,
+        "server_gradient_mb": 0.0,
+        "total_model_mb": 0.0,
+        "total_training_mb": 0.0,
+        "client_standalone_estimate_mb": 0.0,
+        "server_standalone_estimate_mb": 0.0,
+    }
+    
+    # Get model config for activation estimation
+    hidden_dim = getattr(model.config, 'hidden_size', getattr(model.config, 'n_embd', 768))
+    
+    if hasattr(model, 'client'):
+        info["client_model_mb"] = get_model_memory_mb(model.client)
+        info["client_trainable_mb"] = get_trainable_memory_mb(model.client)
+        if client_optimizer_mode == "fo":
+            info["client_gradient_mb"] = get_gradient_memory_estimate_mb(
+                model.client, optimizer_type, momentum)
+        
+        # Client standalone: model + output activation (embedding output)
+        # Client only does embedding, so activation is batch × seq × hidden
+        client_activation = batch_size * seq_len * hidden_dim * 4 / (1024 ** 2)
+        info["client_standalone_estimate_mb"] = (
+            info["client_model_mb"] + 
+            info["client_gradient_mb"] + 
+            client_activation
+        )
+        
+    if hasattr(model, 'server'):
+        info["server_model_mb"] = get_model_memory_mb(model.server)
+        info["server_trainable_mb"] = get_trainable_memory_mb(model.server)
+        if server_optimizer_mode == "fo":
+            info["server_gradient_mb"] = get_gradient_memory_estimate_mb(
+                model.server, optimizer_type, momentum)
+        
+        # Server standalone: model + gradients + activations
+        # Estimate number of layers on server
+        if hasattr(model.config, 'num_hidden_layers'):
+            server_layers = model.config.num_hidden_layers  # All layers on server for OPT
+        elif hasattr(model.config, 'n_layer'):
+            server_layers = model.config.n_layer - 3  # GPT-2 split at layer 3
+        else:
+            server_layers = 9  # Default estimate
+            
+        server_activation = estimate_activation_memory_mb(
+            batch_size, seq_len, hidden_dim, server_layers,
+            store_for_backward=(server_optimizer_mode == "fo")
+        )
+        info["server_standalone_estimate_mb"] = (
+            info["server_model_mb"] + 
+            info["server_gradient_mb"] + 
+            server_activation
+        )
+    
+    info["total_model_mb"] = info["client_model_mb"] + info["server_model_mb"]
+    info["total_training_mb"] = (info["client_model_mb"] + info["client_gradient_mb"] +
+                                  info["server_model_mb"] + info["server_gradient_mb"])
+    
+    return info
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -78,6 +319,11 @@ class OurArguments(TrainingArguments):
     # - "coordinate": each element gets independent random noise (original MeZO, default)
     # - "layer": each layer gets a normalized random direction (DeComFL-style)
 
+    # Multiple perturbations (DeComFL-style variance reduction)
+    num_pert: int = 1  # Number of perturbation vectors to use
+    # - 1: Original MeZO (single perturbation)
+    # - >1: DeComFL-style (average over K perturbations, reduces variance but K× more forward passes)
+
     # Per-machine optimizer modes (for split learning)
     # - "auto": follow `trainer` (FO when trainer=\"regular\", ZO when trainer=\"zo\")
     # - "fo": first-order (standard gradient-based)
@@ -104,7 +350,7 @@ class OurArguments(TrainingArguments):
     prefix_init_by_real_act: bool = True # initialize prefix by real activations of random words
 
     # LoRA
-    lora: bool = True # whether to use LoRA
+    lora: bool = False # whether to use LoRA
     lora_alpha: int = 16 # alpha in LoRA
     lora_r: int = 8 # r in LoRA
     
@@ -130,7 +376,50 @@ class Framework:
     def __init__(self, args, task):
         self.args = args
         self.task = task
+        
+        # Reset GPU memory stats before loading model
+        reset_gpu_memory_stats()
+        
         self.model, self.tokenizer = self.load_model()
+        
+        # Determine optimizer modes
+        global_trainer = getattr(self.args, "trainer", "regular")
+        client_mode = getattr(self.args, "client_optimizer", "auto")
+        server_mode = getattr(self.args, "server_optimizer", "auto")
+        
+        if client_mode == "auto":
+            client_mode = "zo" if global_trainer == "zo" else "fo"
+        if server_mode == "auto":
+            server_mode = "zo" if global_trainer == "zo" else "fo"
+        
+        optimizer_type = getattr(self.args, "optimizer", "sgd")
+        momentum = getattr(self.args, "sgd_momentum", 0.0)
+        
+        # Track model memory after loading with optimizer modes
+        batch_size = getattr(self.args, "per_device_train_batch_size", 64)
+        seq_len = getattr(self.args, "max_length", 512)
+        
+        self.model_memory_info = get_split_model_memory_info(
+            self.model, 
+            client_optimizer_mode=client_mode,
+            server_optimizer_mode=server_mode,
+            optimizer_type=optimizer_type,
+            momentum=momentum,
+            batch_size=batch_size,
+            seq_len=seq_len
+        )
+        self.gpu_memory_after_model_load = get_gpu_memory_mb()
+        
+        logger.info(f"Optimizer Modes - Client: {client_mode.upper()}, Server: {server_mode.upper()}")
+        logger.info(f"Model Memory - Client: {self.model_memory_info['client_model_mb']:.2f} MB, "
+                   f"Server: {self.model_memory_info['server_model_mb']:.2f} MB")
+        logger.info(f"Trainable Memory - Client: {self.model_memory_info['client_trainable_mb']:.2f} MB, "
+                   f"Server: {self.model_memory_info['server_trainable_mb']:.2f} MB")
+        logger.info(f"Gradient+Optimizer Memory - Client: {self.model_memory_info['client_gradient_mb']:.2f} MB, "
+                   f"Server: {self.model_memory_info['server_gradient_mb']:.2f} MB")
+        logger.info(f"Standalone GPU Estimate - Client: {self.model_memory_info['client_standalone_estimate_mb']:.2f} MB, "
+                   f"Server: {self.model_memory_info['server_standalone_estimate_mb']:.2f} MB")
+        logger.info(f"GPU Memory after model load: {self.gpu_memory_after_model_load:.2f} MB")
 
     
     def load_model(self):
@@ -344,6 +633,13 @@ class Framework:
         """
         Training function
         """
+        # Reset peak memory stats before training
+        reset_gpu_memory_stats()
+        
+        # Enable memory tracking on the model
+        if hasattr(self.model, 'enable_memory_tracking'):
+            self.model.enable_memory_tracking(True)
+        
         # Set tokenizer to left padding (so that all the options are right aligned)
         self.tokenizer.padding_side = "left"
 
@@ -433,6 +729,54 @@ class Framework:
 
         trainer.train() 
         
+        # Track peak GPU memory after training
+        self.peak_gpu_memory_mb = get_gpu_max_memory_mb()
+        self.num_training_rounds = self.args.max_steps
+        
+        # Calculate communication rounds for split learning
+        # Each forward pass = 1 communication (client sends activations to server)
+        # For MeZO: central variant uses 2 forwards per perturbation, forward variant uses 1 baseline + 1 per perturbation
+        num_pert = getattr(self.args, 'num_pert', 1)
+        zo_variant = getattr(self.args, 'zo_variant', 'central')
+        trainer_type = getattr(self.args, 'trainer', 'none')
+        
+        if trainer_type == 'zo':
+            if zo_variant == 'forward':
+                # 1 baseline forward + 1 forward per perturbation
+                forwards_per_step = 1 + num_pert
+            else:  # central (default)
+                # 2 forwards per perturbation (for +ε and -ε)
+                forwards_per_step = 2 * num_pert
+            self.num_communication_rounds = self.num_training_rounds * forwards_per_step
+        else:
+            # First-order: 1 forward + 1 backward per step = 2 communications
+            self.num_communication_rounds = self.num_training_rounds * 2
+        
+        # Get client/server peak memory if tracked
+        if hasattr(self.model, 'client_peak_memory_mb'):
+            self.client_peak_memory_mb = self.model.client_peak_memory_mb
+            self.server_peak_memory_mb = self.model.server_peak_memory_mb
+        else:
+            self.client_peak_memory_mb = 0.0
+            self.server_peak_memory_mb = 0.0
+        
+        # Calculate standalone GPU estimates (what each device would need separately)
+        # Server peak currently includes client model in memory, so subtract it
+        client_model_mb = self.model_memory_info.get("client_model_mb", 0)
+        server_model_mb = self.model_memory_info.get("server_model_mb", 0)
+        
+        # Standalone estimates: subtract the other model's memory from peak
+        self.client_standalone_mb = self.client_peak_memory_mb  # Client doesn't include server
+        self.server_standalone_mb = max(0, self.server_peak_memory_mb - client_model_mb)  # Subtract client model
+        
+        logger.info(f"Peak GPU Memory during training: {self.peak_gpu_memory_mb:.2f} MB")
+        logger.info(f"Client Peak Memory (measured): {self.client_peak_memory_mb:.2f} MB")
+        logger.info(f"Server Peak Memory (measured): {self.server_peak_memory_mb:.2f} MB")
+        logger.info(f"Client Standalone Estimate: {self.client_standalone_mb:.2f} MB")
+        logger.info(f"Server Standalone Estimate: {self.server_standalone_mb:.2f} MB")
+        logger.info(f"Number of training rounds: {self.num_training_rounds}")
+        logger.info(f"Number of communication rounds: {self.num_communication_rounds}")
+        
         # FSDP compatibility
         self.model = trainer.model 
 
@@ -491,10 +835,110 @@ def main():
                     dev_metrics = framework.evaluate([], dev_samples) 
                     for m in dev_metrics:
                         metrics["dev_" + m] = dev_metrics[m]
+                
+                # Add GPU memory and training round metrics
+                metrics["client_model_memory_mb"] = framework.model_memory_info["client_model_mb"]
+                metrics["server_model_memory_mb"] = framework.model_memory_info["server_model_mb"]
+                metrics["total_model_memory_mb"] = framework.model_memory_info["total_model_mb"]
+                # Gradient/optimizer memory (0 for ZO mode - this shows the ZO savings)
+                metrics["client_gradient_memory_mb"] = framework.model_memory_info["client_gradient_mb"]
+                metrics["server_gradient_memory_mb"] = framework.model_memory_info["server_gradient_mb"]
+                metrics["total_training_memory_mb"] = framework.model_memory_info["total_training_mb"]
+                metrics["peak_gpu_memory_mb"] = framework.peak_gpu_memory_mb
+                # Separate client/server peak memory (actual GPU required for each)
+                metrics["client_peak_memory_mb"] = getattr(framework, 'client_peak_memory_mb', 0.0)
+                metrics["server_peak_memory_mb"] = getattr(framework, 'server_peak_memory_mb', 0.0)
+                # Standalone estimates (what each device needs when running separately)
+                metrics["client_standalone_mb"] = getattr(framework, 'client_standalone_mb', 0.0)
+                metrics["server_standalone_mb"] = getattr(framework, 'server_standalone_mb', 0.0)
+                metrics["num_training_rounds"] = framework.num_training_rounds
+                metrics["num_communication_rounds"] = framework.num_communication_rounds
 
             logger.info("===== Train set %d =====" % train_set_seed)
             logger.info(metrics)
             print("results: ", metrics)
+            
+            # Print summary in a more readable format
+            print("\n" + "=" * 60)
+            print("TRAINING SUMMARY")
+            print("=" * 60)
+            print(f"Accuracy:                    {metrics.get('accuracy', 'N/A'):.4f}" if isinstance(metrics.get('accuracy'), float) else f"Accuracy:                    {metrics.get('accuracy', 'N/A')}")
+            print(f"Number of Training Rounds:   {metrics.get('num_training_rounds', 'N/A')}")
+            print(f"Number of Comm Rounds:       {metrics.get('num_communication_rounds', 'N/A')}")
+            print(f"Client Model Memory:         {metrics.get('client_model_memory_mb', 0):.2f} MB")
+            print(f"Client Gradient Memory:      {metrics.get('client_gradient_memory_mb', 0):.2f} MB (0 if ZO)")
+            print(f"Server Model Memory:         {metrics.get('server_model_memory_mb', 0):.2f} MB")
+            print(f"Server Gradient Memory:      {metrics.get('server_gradient_memory_mb', 0):.2f} MB (0 if ZO)")
+            print(f"Total Model Memory:          {metrics.get('total_model_memory_mb', 0):.2f} MB")
+            print(f"Total Training Memory:       {metrics.get('total_training_memory_mb', 0):.2f} MB")
+            print("-" * 60)
+            print("PEAK GPU MEMORY (actual GPU required):")
+            print(f"  Client Peak Memory:        {metrics.get('client_peak_memory_mb', 0):.2f} MB")
+            print(f"  Server Peak Memory:        {metrics.get('server_peak_memory_mb', 0):.2f} MB")
+            print(f"  Total Peak Memory:         {metrics.get('peak_gpu_memory_mb', 0):.2f} MB")
+            print("-" * 60)
+            
+            # Estimate communication costs (DeComFL-style)
+            # Get model info for estimation
+            total_params = sum(p.numel() for p in framework.model.parameters())
+            trainable_params = sum(p.numel() for p in framework.model.parameters() if p.requires_grad)
+            
+            # Estimate hidden state size at split point (batch_size × seq_len × hidden_dim)
+            # Using typical values for estimation
+            batch_size = args.per_device_train_batch_size
+            max_seq_len = getattr(args, 'max_length', 512)
+            hidden_dim = getattr(framework.model.client_model.config if hasattr(framework.model, 'client_model') else framework.model.config, 
+                                'hidden_size', 768)
+            
+            # dtype size (4 bytes for fp32, 2 for fp16)
+            dtype_bytes = 2 if args.load_float16 or args.load_bfloat16 else 4
+            
+            # Per-forward communication cost (Split Learning)
+            # Forward: hidden_states (batch × seq × hidden)
+            activation_size = batch_size * max_seq_len * hidden_dim * dtype_bytes
+            # Backward in ZO: just loss scalar (4 bytes) + seed (8 bytes)
+            zo_backward_size = 12  # loss (float) + seed (int64)
+            # Backward in FO: gradients same size as activations
+            fo_backward_size = activation_size
+            
+            num_comm_rounds = metrics.get('num_communication_rounds', 0)
+            is_zo = args.trainer == "zo"
+            
+            if is_zo:
+                # ZO: forward activations + loss scalar + seed
+                per_round_bytes = activation_size + zo_backward_size
+            else:
+                # FO: forward activations + backward gradients  
+                per_round_bytes = activation_size + fo_backward_size
+            
+            total_bytes = per_round_bytes * num_comm_rounds
+            
+            # Traditional FL comparison (would send full model each round)
+            traditional_fl_per_round = 2 * total_params * dtype_bytes  # send + receive full model
+            traditional_fl_total = traditional_fl_per_round * metrics.get('num_training_rounds', 0)
+            
+            # DeComFL pure (only scalars + seeds)
+            num_pert = getattr(args, 'num_pert', 1)
+            decomfl_per_round = num_pert * 4 + 8  # P scalars + seed
+            decomfl_total = decomfl_per_round * num_comm_rounds
+            
+            print("ESTIMATED COMMUNICATION COST (DeComFL-style):")
+            print(f"  Per Forward+Backward:      {format_payload_size(per_round_bytes)}")
+            print(f"  Total ({num_comm_rounds} rounds):      {format_payload_size(total_bytes)}")
+            print(f"  Traditional FL would use:  {format_payload_size(traditional_fl_total)}")
+            print(f"  DeComFL pure would use:    {format_payload_size(decomfl_total)}")
+            if traditional_fl_total > 0:
+                savings = (1 - total_bytes / traditional_fl_total) * 100
+                print(f"  Savings vs Traditional FL: {savings:.2f}%")
+            print("=" * 60 + "\n")
+            
+            # Add estimated communication metrics
+            metrics["estimated_total_bytes"] = total_bytes
+            metrics["estimated_total_bytes_formatted"] = format_payload_size(total_bytes)
+            metrics["traditional_fl_bytes"] = traditional_fl_total
+            metrics["decomfl_pure_bytes"] = decomfl_total
+            if traditional_fl_total > 0:
+                metrics["savings_vs_traditional_fl"] = 1 - (total_bytes / traditional_fl_total)
 
 if __name__ == "__main__": 
     main()

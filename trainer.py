@@ -509,6 +509,19 @@ class OurTrainer(Trainer):
         self.zo_random_seed = np.random.randint(1000000000)
         return self.zo_random_seed
 
+
+    def generate_multiple_seeds(self, num_pert):
+        """
+        Generate multiple perturbation seeds for DeComFL-style variance reduction.
+        
+        Args:
+            num_pert: Number of perturbation vectors to use
+            
+        Returns:
+            List of random seeds
+        """
+        return [np.random.randint(1000000000) for _ in range(num_pert)]
+
     def _get_sorted_trainable_params(self, module, cache_key):
         """
         Get sorted trainable parameters for a module, with caching.
@@ -834,6 +847,10 @@ class OurTrainer(Trainer):
         Implements the SplitLoRA/SplitFM protocol for zeroth-order optimization
         in split learning, where client and server are INDEPENDENT entities.
         
+        Supports multiple perturbations (DeComFL-style variance reduction):
+        - num_pert=1: Original MeZO (single perturbation)
+        - num_pert>1: Average gradient estimates over K perturbations
+        
         Two gradient estimation variants (controlled by --zo_variant):
         
         1. Central (default, --zo_variant="central"):
@@ -842,21 +859,9 @@ class OurTrainer(Trainer):
         2. Forward (--zo_variant="forward"):
            - g = (f(θ+εz) - f(θ)) / ε -- 1 forward pass, higher bias but faster
         
-        Two RNG modes (controlled by --zo_continuous_rng):
-        
-        1. Shared Seed Mode (default):
-           - Both client and server reset to same seed independently
-           - Effective z = [z₁, z₂, ..., z₁, z₂, ...] (repetition)
-           
-        2. Continuous RNG Mode (--zo_continuous_rng=True):
-           - Client perturbs first, saves RNG state
-           - Server loads RNG state and continues
-           - Effective z = [z₁, z₂, ..., zₖ, zₖ₊₁, ...] (no repetition)
-           - More faithful to original MeZO formulation
-        
         Communication:
         - Forward: activations at the cut layer
-        - Metadata: shared perturbation seed (+ RNG state in continuous mode)
+        - Metadata: shared perturbation seed(s)
         - (No gradient exchange in ZO mode - only scalar loss is needed)
         """
         inner_model = model.module if hasattr(model, "module") else model
@@ -871,120 +876,107 @@ class OurTrainer(Trainer):
         # Check configuration options
         use_continuous_rng = getattr(self.args, 'zo_continuous_rng', False)
         zo_variant = getattr(self.args, 'zo_variant', 'central')
+        num_pert = getattr(self.args, 'num_pert', 1)
         
-        # Generate shared seed (in real split learning, this is communicated)
-        self.generate_shared_perturbation_seed()
+        # Generate seeds for all perturbations
+        seeds = self.generate_multiple_seeds(num_pert)
         
         if zo_variant == "forward":
-            # ============ RGE-FORWARD: g = (f(θ+εz) - f(θ)) / ε ============
-            # PHASE 1: Compute baseline loss at unperturbed θ
+            # ============ RGE-FORWARD with multiple perturbations ============
+            # Compute baseline loss once
             loss0 = self.zo_forward(model, inputs)
-            
-            # PHASE 2: Perturb +ε and compute loss1
-            model.train()
-            if use_continuous_rng:
-                rng_state_after_client = self.zo_perturb_module(
-                    inner_model.client, "client", self.zo_random_seed, scaling_factor=1
-                )
-                self.zo_perturb_module(
-                    inner_model.server, "server", scaling_factor=1,
-                    use_rng_state=True, rng_state=rng_state_after_client
-                )
-            else:
-                self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=1)
-                self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=1)
-            
-            loss1 = self.zo_forward(model, inputs)
-            
-            # PHASE 3: Restore parameters (from θ + ε*z, apply -ε*z to get θ)
-            model.train()
-            if use_continuous_rng:
-                rng_state_after_client = self.zo_perturb_module(
-                    inner_model.client, "client", self.zo_random_seed, scaling_factor=-1
-                )
-                self.zo_perturb_module(
-                    inner_model.server, "server", scaling_factor=-1,
-                    use_rng_state=True, rng_state=rng_state_after_client
-                )
-            else:
-                self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=-1)
-                self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=-1)
-            
-            # Compute projected gradient (forward difference)
-            projected_grad = (loss1 - loss0) / self.args.zo_eps
-            
-            # For logging
             loss_for_log = loss0
+            
+            # For each perturbation, compute gradient and update
+            for k, seed in enumerate(seeds):
+                self.zo_random_seed = seed
+                
+                # Perturb +ε
+                model.train()
+                if use_continuous_rng:
+                    rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", scaling_factor=1, use_rng_state=True, rng_state=rng_state)
+                else:
+                    self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=1)
+                
+                loss1 = self.zo_forward(model, inputs)
+                
+                # Restore parameters
+                model.train()
+                if use_continuous_rng:
+                    rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-1)
+                    self.zo_perturb_module(inner_model.server, "server", scaling_factor=-1, use_rng_state=True, rng_state=rng_state)
+                else:
+                    self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-1)
+                    self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=-1)
+                
+                # Compute gradient for this perturbation (scaled by 1/num_pert for averaging)
+                projected_grad = (loss1 - loss0) / (self.args.zo_eps * num_pert)
+                
+                # Update with this perturbation's gradient contribution
+                if use_continuous_rng:
+                    rng_state = self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
+                    self.zo_update_module(inner_model.server, "server", projected_grad, use_rng_state=True, rng_state=rng_state, lr=self.server_lr)
+                else:
+                    self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
+                    self.zo_update_module(inner_model.server, "server", projected_grad, lr=self.server_lr)
+            
             delta_loss = loss1 - loss0
             
         else:
-            # ============ RGE-CENTRAL (default): g = (f(θ+εz) - f(θ-εz)) / (2ε) ============
-            # PHASE 1: Positive perturbation
-            model.train()
-            if use_continuous_rng:
-                rng_state_after_client = self.zo_perturb_module(
-                    inner_model.client, "client", self.zo_random_seed, scaling_factor=1
-                )
-                self.zo_perturb_module(
-                    inner_model.server, "server", scaling_factor=1,
-                    use_rng_state=True, rng_state=rng_state_after_client
-                )
-            else:
-                self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=1)
-                self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=1)
+            # ============ RGE-CENTRAL with multiple perturbations ============
+            loss_for_log = None
             
-            loss1 = self.zo_forward(model, inputs)
+            # For each perturbation, compute gradient and update
+            for k, seed in enumerate(seeds):
+                self.zo_random_seed = seed
+                
+                # Positive perturbation
+                model.train()
+                if use_continuous_rng:
+                    rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", scaling_factor=1, use_rng_state=True, rng_state=rng_state)
+                else:
+                    self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=1)
+                
+                loss1 = self.zo_forward(model, inputs)
+                if loss_for_log is None:
+                    loss_for_log = loss1
 
-            # PHASE 2: Negative perturbation (from θ + ε*z, apply -2ε*z to get θ - ε*z)
-            model.train()
-            if use_continuous_rng:
-                rng_state_after_client = self.zo_perturb_module(
-                    inner_model.client, "client", self.zo_random_seed, scaling_factor=-2
-                )
-                self.zo_perturb_module(
-                    inner_model.server, "server", scaling_factor=-2,
-                    use_rng_state=True, rng_state=rng_state_after_client
-                )
-            else:
-                self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=-2)
-                self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=-2)
+                # Negative perturbation (apply -2ε to go from +ε to -ε)
+                model.train()
+                if use_continuous_rng:
+                    rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-2)
+                    self.zo_perturb_module(inner_model.server, "server", scaling_factor=-2, use_rng_state=True, rng_state=rng_state)
+                else:
+                    self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-2)
+                    self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=-2)
+                
+                loss2 = self.zo_forward(model, inputs)
+                
+                # Restore parameters (apply +ε to go from -ε to 0)
+                model.train()
+                if use_continuous_rng:
+                    rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", scaling_factor=1, use_rng_state=True, rng_state=rng_state)
+                else:
+                    self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+                    self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=1)
+                
+                # Compute gradient for this perturbation (scaled by 1/num_pert for averaging)
+                projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * num_pert)
+                
+                # Update with this perturbation's gradient contribution
+                if use_continuous_rng:
+                    rng_state = self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
+                    self.zo_update_module(inner_model.server, "server", projected_grad, use_rng_state=True, rng_state=rng_state, lr=self.server_lr)
+                else:
+                    self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
+                    self.zo_update_module(inner_model.server, "server", projected_grad, lr=self.server_lr)
             
-            loss2 = self.zo_forward(model, inputs)
-            
-            # PHASE 3: Restore parameters (from θ - ε*z, apply +ε*z to get θ)
-            model.train()
-            if use_continuous_rng:
-                rng_state_after_client = self.zo_perturb_module(
-                    inner_model.client, "client", self.zo_random_seed, scaling_factor=1
-                )
-                self.zo_perturb_module(
-                    inner_model.server, "server", scaling_factor=1,
-                    use_rng_state=True, rng_state=rng_state_after_client
-                )
-            else:
-                self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=1)
-                self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=1)
-            
-            # Compute projected gradient (central difference)
-            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps)
-            
-            # For logging
-            loss_for_log = loss1
             delta_loss = loss1 - loss2
-        
-        # ============ UPDATE PARAMETERS ============
-        # Update both client and server using SAME seed/RNG state to regenerate z
-        if use_continuous_rng:
-            rng_state_after_client = self.zo_update_module(
-                inner_model.client, "client", projected_grad, lr=self.client_lr
-            )
-            self.zo_update_module(
-                inner_model.server, "server", projected_grad,
-                use_rng_state=True, rng_state=rng_state_after_client, lr=self.server_lr
-            )
-        else:
-            self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
-            self.zo_update_module(inner_model.server, "server", projected_grad, lr=self.server_lr)
         
         # ============ ZO DIAGNOSTIC LOGGING ============
         if hasattr(self, 'state') and self.state.global_step % 100 == 0:
@@ -992,10 +984,10 @@ class OurTrainer(Trainer):
             perturbation_type = getattr(self.args, 'zo_perturbation', 'coordinate')
             logger.info(
                 f"[ZO Diagnostics] Step {self.state.global_step}: "
-                f"variant={zo_variant}, perturbation={perturbation_type}, "
-                f"Δloss={delta_loss:.6f}, projected_grad={projected_grad:.6f}, "
+                f"variant={zo_variant}, perturbation={perturbation_type}, num_pert={num_pert}, "
+                f"Δloss={delta_loss:.6f}, "
                 f"client_lr={self.client_lr:.2e}, server_lr={self.server_lr:.2e}, "
-                f"seed={self.zo_random_seed}, rng_mode={rng_mode}"
+                f"rng_mode={rng_mode}"
             )
         
         # Step LR scheduler
