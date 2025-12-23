@@ -27,7 +27,6 @@ from split_communication import (
     ZOMetadata,
     serialize_payload,
     deserialize_payload,
-    CommunicationStats,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,9 +129,6 @@ class TCPBackend(CommunicationBackend):
         self._connected = False
         self._lock = threading.Lock()
         
-        # Communication cost tracking
-        self.comm_stats = CommunicationStats()
-        
     def start(self):
         """Start the server (server mode only)."""
         if self.mode != 'server':
@@ -225,8 +221,6 @@ class TCPBackend(CommunicationBackend):
         with self._lock:
             data = serialize_payload(('forward', payload))
             self._send_data(data)
-            # Track communication cost
-            self.comm_stats.record_send(len(data), payload_type="forward")
             logger.debug(f"Sent forward payload: {len(data)} bytes")
     
     def recv_forward(self) -> ForwardPayload:
@@ -253,9 +247,6 @@ class TCPBackend(CommunicationBackend):
             msg_type, payload = deserialize_payload(data, map_location=self.device)
             if msg_type != 'backward':
                 raise RuntimeError(f"Expected 'backward', got '{msg_type}'")
-            # Track communication cost
-            self.comm_stats.record_receive(len(data), payload_type="backward")
-            self.comm_stats.increment_round()  # One round = forward + backward
             logger.debug(f"Received backward payload: {len(data)} bytes")
             return payload
     
@@ -264,7 +255,6 @@ class TCPBackend(CommunicationBackend):
         with self._lock:
             data = serialize_payload(('zo_metadata', metadata))
             self._send_data(data)
-            self.comm_stats.record_send(len(data), payload_type="zo_metadata")
             logger.debug(f"Sent ZO metadata: seed={metadata.seed}, {len(data)} bytes")
     
     def recv_zo_metadata(self) -> ZOMetadata:

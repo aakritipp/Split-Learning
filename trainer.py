@@ -1,41 +1,15 @@
-# coding=utf-8
-# Copyright 2020-present the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
-The Trainer class for Split Learning with MeZO (Memory-efficient Zeroth-Order).
+Custom trainer extending HuggingFace Trainer for split learning.
 
-True Split Learning Protocol (SplitLoRA/SplitFM-style):
-1. Client and Server are INDEPENDENT (can run on separate machines)
-2. Only activations (forward) and gradients (backward) are exchanged
-3. For MeZO: Both parties share the SAME perturbation seed
+This module provides OurTrainer, which extends the HuggingFace Trainer class
+with support for split learning architectures and zeroth-order (ZO) optimization.
 
-Two RNG Approaches (controlled by --zo_continuous_rng flag):
-
-1. Shared Seed Approach (default, --zo_continuous_rng=False):
-   - Both client and server independently use torch.manual_seed(shared_seed)
-   - Each generates reproducible perturbations for their own parameters
-   - Client and server get the SAME z values (z₁, z₂, ...)
-   
-2. Continuous RNG Approach (--zo_continuous_rng=True):
-   - Client perturbs first, then saves RNG state
-   - Server loads RNG state and continues the sequence
-   - Creates one continuous z vector: [z_client..., z_server...]
-   - More faithful to original MeZO formulation (unique z per parameter)
-
-Parameters are sorted by name for deterministic iteration order in both modes.
+Key features:
+- Split learning with configurable client/server optimization modes (ZO/FO)
+- Coordinated perturbation generation for ZO optimization
+- Support for both coordinate-wise and layer-wise perturbation strategies
+- Separate optimizers for client and server modules
 """
-
 import math
 import os
 import random
@@ -115,7 +89,7 @@ class OurTrainer(Trainer):
         """
 
         # Use get instead of pop to avoid mutating inputs in-place.
-        # This is critical for MeZO (zo_step) which reuses inputs across multiple forward passes.
+        # This is critical for ZO (zo_step) which reuses inputs across multiple forward passes.
         labels = inputs.get("labels")
 
         if labels is not None:
@@ -179,7 +153,7 @@ class OurTrainer(Trainer):
         # Helper to create optimizer for a module
         def make_opt(model_part, mode, lr):
             if mode == "zo":
-                # In pure zeroth-order (MeZO) mode we do *not* use a torch optimizer to
+                # In pure zeroth-order mode we do *not* use a torch optimizer to
                 # update parameters, but Hugging Face's Trainer still expects a real
                 # optimizer object so that:
                 #   - `create_scheduler(...)` can build a scheduler, and
@@ -270,8 +244,7 @@ class OurTrainer(Trainer):
         self, batch_size=None, args=None, trial=None, ignore_keys_for_eval=None, resume_from_checkpoint=None
     ):
         """
-        We overload the original training loop to add linear probing and MeZO. Search key word "MeZO added"
-        for those updates.
+        We overload the original training loop to add linear probing and ZO support.
         """
         self._train_batch_size = batch_size
         # Data loader and number of training steps
@@ -497,11 +470,11 @@ class OurTrainer(Trainer):
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
 
-    ############## MeZO and Split Learning ##############
+    ############## ZO and Split Learning ##############
     
     def generate_shared_perturbation_seed(self):
         """
-        Generate a shared perturbation seed for coordinated MeZO.
+        Generate a shared perturbation seed for coordinated ZO.
         
         In true split learning, both client and server use the SAME seed
         for perturbations, ensuring identical perturbation patterns.
@@ -512,7 +485,7 @@ class OurTrainer(Trainer):
 
     def generate_multiple_seeds(self, num_pert):
         """
-        Generate multiple perturbation seeds for DeComFL-style variance reduction.
+        Generate multiple perturbation seeds for variance reduction.
         
         Args:
             num_pert: Number of perturbation vectors to use
@@ -558,11 +531,11 @@ class OurTrainer(Trainer):
         
         Two modes controlled by --zo_perturbation:
         
-        1. Coordinate-wise (MeZO original):
+        1. Coordinate-wise:
            - z ~ N(0, 1) with same shape as param
            - Each element gets independent random noise
            
-        2. Layer-wise (DeComFL-style):
+        2. Layer-wise:
            - z ~ N(0, 1) with same shape as param, then normalized to unit norm
            - Each layer gets a random DIRECTION (unit vector)
            - This reduces variance but may have different convergence properties
@@ -588,7 +561,7 @@ class OurTrainer(Trainer):
             # This ensures the expected perturbation magnitude is comparable
             z = z * (param.numel() ** 0.5)
         else:
-            # Coordinate-wise (default MeZO): each element gets independent N(0,1)
+            # Coordinate-wise (default): each element gets independent N(0,1)
             z = torch.normal(mean=0, std=1, size=param.data.size(), 
                            device=param.data.device, dtype=param.data.dtype)
         
@@ -612,8 +585,8 @@ class OurTrainer(Trainer):
            - Creates one continuous z vector across all parameters
         
         Perturbation type controlled by --zo_perturbation:
-        - "coordinate": Each element gets independent N(0,1) noise (MeZO original)
-        - "layer": Each layer gets a normalized random direction (DeComFL-style)
+        - "coordinate": Each element gets independent N(0,1) noise
+        - "layer": Each layer gets a normalized random direction
         
         Args:
             module: The module to perturb (client or server)
@@ -655,8 +628,8 @@ class OurTrainer(Trainer):
         RNG sequence matching between perturbation and update phases.
         
         Perturbation type controlled by --zo_perturbation:
-        - "coordinate": Each element gets independent N(0,1) noise (MeZO original)
-        - "layer": Each layer gets a normalized random direction (DeComFL-style)
+        - "coordinate": Each element gets independent N(0,1) noise
+        - "layer": Each layer gets a normalized random direction
         """
         seed = random_seed if random_seed is not None else self.zo_random_seed
         torch.manual_seed(seed)
@@ -712,8 +685,8 @@ class OurTrainer(Trainer):
         where z is the SAME perturbation vector used during forward passes.
         
         Perturbation type controlled by --zo_perturbation:
-        - "coordinate": Each element gets independent N(0,1) noise (MeZO original)
-        - "layer": Each layer gets a normalized random direction (DeComFL-style)
+        - "coordinate": Each element gets independent N(0,1) noise
+        - "layer": Each layer gets a normalized random direction
         
         Args:
             module: The module to update (client or server)
@@ -762,8 +735,8 @@ class OurTrainer(Trainer):
         zo_perturb_parameters to ensure identical z vectors are regenerated.
         
         Perturbation type controlled by --zo_perturbation:
-        - "coordinate": Each element gets independent N(0,1) noise (MeZO original)
-        - "layer": Each layer gets a normalized random direction (DeComFL-style)
+        - "coordinate": Each element gets independent N(0,1) noise
+        - "layer": Each layer gets a normalized random direction
         """
         torch.manual_seed(self.zo_random_seed)
         updated_params = set()
@@ -842,13 +815,13 @@ class OurTrainer(Trainer):
 
     def zo_step_split_coordinated(self, model, inputs):
         """
-        True Split Learning MeZO step with shared perturbation seed.
+        True Split Learning ZO step with shared perturbation seed.
         
-        Implements the SplitLoRA/SplitFM protocol for zeroth-order optimization
+        Implements the protocol for zeroth-order optimization
         in split learning, where client and server are INDEPENDENT entities.
         
-        Supports multiple perturbations (DeComFL-style variance reduction):
-        - num_pert=1: Original MeZO (single perturbation)
+        Supports multiple perturbations for variance reduction:
+        - num_pert=1: Single perturbation
         - num_pert>1: Average gradient estimates over K perturbations
         
         Two gradient estimation variants (controlled by --zo_variant):
@@ -997,7 +970,7 @@ class OurTrainer(Trainer):
 
     def zo_step_coordinated(self, model, inputs, modules):
         """
-        Legacy coordinated MeZO step - kept for backwards compatibility.
+        Legacy coordinated ZO step - kept for backwards compatibility.
         Perturbs all modules together (not truly split).
         
         Supports both RGE-central and RGE-forward variants via --zo_variant.
@@ -1043,10 +1016,10 @@ class OurTrainer(Trainer):
 
     def training_step(self, model, inputs):
         """
-        Unified training step for split learning + MeZO.
+        Unified training step for split learning + ZO.
 
         Supported modes:
-        - ZO/ZO: Both client and server use zeroth-order (MeZO) with shared seed
+        - ZO/ZO: Both client and server use zeroth-order with shared seed
         - FO/FO: Standard first-order split learning with gradient backprop
         - ZO/FO: Client uses ZO, server uses FO (hybrid)
         - FO/ZO: Client uses FO, server uses ZO (hybrid)
@@ -1054,7 +1027,7 @@ class OurTrainer(Trainer):
         True Split Learning Protocol:
         - Client and server are INDEPENDENT modules
         - Only activations (forward) and gradients (backward) are exchanged
-        - For MeZO: Both parties share the SAME perturbation seed
+        - For ZO: Both parties share the SAME perturbation seed
         
         Hybrid Modes:
         - ZO/FO: Client optimized via zeroth-order (no gradients needed), 
@@ -1081,7 +1054,7 @@ class OurTrainer(Trainer):
 
         inner_model = model.module if hasattr(model, "module") else model
 
-        # Pure ZO/ZO: TRUE split MeZO with shared seed
+        # Pure ZO/ZO: TRUE split ZO with shared seed
         if client_mode == "zo" and server_mode == "zo":
             return self.zo_step_split_coordinated(model, inputs)
 

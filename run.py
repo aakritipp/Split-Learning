@@ -1,3 +1,15 @@
+"""
+Main entry point for running experiments.
+
+This module provides the Framework class for training and evaluating split learning
+models on various NLP tasks. It supports both GPT-2 and OPT model architectures
+with configurable split points, LoRA fine-tuning, and zeroth-order optimization.
+
+Key components:
+- OurArguments: Configuration dataclass for training hyperparameters
+- Framework: Main class for model loading, training, and evaluation
+- NondiffCollator: Data collator for non-differentiable objective training
+"""
 import logging
 import os
 
@@ -26,7 +38,6 @@ from trainer import OurTrainer
 from dataset import get_task
 from splitmodel import GPT2Config, GPT2LMModel_Server, GPT2LMModel_Client, SplitGPT2, SplitOPT
 from lora import *
-from split_communication import format_payload_size
 
 
 class NondiffCollator:
@@ -298,36 +309,36 @@ class OurArguments(TrainingArguments):
     no_auto_device: bool = False
 
     # Training
-    # Default to standard first-order (FO) training; MeZO (ZO) must be requested explicitly
+    # Default to standard first-order (FO) training; ZO must be requested explicitly
     trainer: str = "regular" 
     ## options
     ## - none: no training -- for zero-shot or in-context learning (ICL)
     ## - regular: regular huggingface trainer -- for fine-tuning
-    ## - zo: zeroth-order (MeZO) training
+    ## - zo: zeroth-order training
 
-    # MeZO
-    zo_eps: float = 1e-3 # eps in MeZO
-    zo_continuous_rng: bool = True  # Use continuous RNG across client/server (faithful MeZO)
-    # If False (default): client and server both reset to same seed (z values repeat)
+    # Zeroth-Order Optimization
+    zo_eps: float = 1e-3  # Epsilon for perturbation
+    zo_continuous_rng: bool = True  # Use continuous RNG across client/server
+    # If False: client and server both reset to same seed (z values repeat)
     # If True: client perturbs first, saves RNG state, server continues (unique z per param)
     
     zo_variant: str = "central"  # "central" (two-point) or "forward" (one-point) gradient estimation
     # - "central": g = (f(θ+εz) - f(θ-εz)) / (2ε) -- 2 forward passes, lower bias
     # - "forward": g = (f(θ+εz) - f(θ)) / ε -- 1 forward pass, higher bias but faster
     
-    zo_perturbation: str = "coordinate"  # "coordinate" (MeZO) or "layer" (DeComFL-style)
-    # - "coordinate": each element gets independent random noise (original MeZO, default)
-    # - "layer": each layer gets a normalized random direction (DeComFL-style)
+    zo_perturbation: str = "coordinate"  # "coordinate" or "layer"
+    # - "coordinate": each element gets independent random noise (default)
+    # - "layer": each layer gets a normalized random direction
 
-    # Multiple perturbations (DeComFL-style variance reduction)
+    # Multiple perturbations for variance reduction
     num_pert: int = 1  # Number of perturbation vectors to use
-    # - 1: Original MeZO (single perturbation)
-    # - >1: DeComFL-style (average over K perturbations, reduces variance but K× more forward passes)
+    # - 1: Single perturbation
+    # - >1: Average over K perturbations, reduces variance but K× more forward passes
 
     # Per-machine optimizer modes (for split learning)
-    # - "auto": follow `trainer` (FO when trainer=\"regular\", ZO when trainer=\"zo\")
+    # - "auto": follow `trainer` (FO when trainer="regular", ZO when trainer="zo")
     # - "fo": first-order (standard gradient-based)
-    # - "zo": zeroth-order (MeZO-style)
+    # - "zo": zeroth-order
     client_optimizer: str = "auto"
     server_optimizer: str = "auto"
     optimizer: str = "sgd"
@@ -734,26 +745,6 @@ class Framework:
         
         # Track peak GPU memory after training
         self.peak_gpu_memory_mb = get_gpu_max_memory_mb()
-        self.num_training_rounds = self.args.max_steps
-        
-        # Calculate communication rounds for split learning
-        # Each forward pass = 1 communication (client sends activations to server)
-        # For MeZO: central variant uses 2 forwards per perturbation, forward variant uses 1 baseline + 1 per perturbation
-        num_pert = getattr(self.args, 'num_pert', 1)
-        zo_variant = getattr(self.args, 'zo_variant', 'central')
-        trainer_type = getattr(self.args, 'trainer', 'none')
-        
-        if trainer_type == 'zo':
-            if zo_variant == 'forward':
-                # 1 baseline forward + 1 forward per perturbation
-                forwards_per_step = 1 + num_pert
-            else:  # central (default)
-                # 2 forwards per perturbation (for +ε and -ε)
-                forwards_per_step = 2 * num_pert
-            self.num_communication_rounds = self.num_training_rounds * forwards_per_step
-        else:
-            # First-order: 1 forward + 1 backward per step = 2 communications
-            self.num_communication_rounds = self.num_training_rounds * 2
         
         # Get client/server peak memory if tracked
         if hasattr(self.model, 'client_peak_memory_mb'):
@@ -777,8 +768,6 @@ class Framework:
         logger.info(f"Server Peak Memory (measured): {self.server_peak_memory_mb:.2f} MB")
         logger.info(f"Client Standalone Estimate: {self.client_standalone_mb:.2f} MB")
         logger.info(f"Server Standalone Estimate: {self.server_standalone_mb:.2f} MB")
-        logger.info(f"Number of training rounds: {self.num_training_rounds}")
-        logger.info(f"Number of communication rounds: {self.num_communication_rounds}")
         
         # FSDP compatibility
         self.model = trainer.model 
@@ -854,8 +843,6 @@ def main():
                 # Standalone estimates (what each device needs when running separately)
                 metrics["client_standalone_mb"] = getattr(framework, 'client_standalone_mb', 0.0)
                 metrics["server_standalone_mb"] = getattr(framework, 'server_standalone_mb', 0.0)
-                metrics["num_training_rounds"] = framework.num_training_rounds
-                metrics["num_communication_rounds"] = framework.num_communication_rounds
 
             logger.info("===== Train set %d =====" % train_set_seed)
             logger.info(metrics)
@@ -867,7 +854,6 @@ def main():
             print("=" * 60)
             print(f"Accuracy:                    {metrics.get('accuracy', 'N/A'):.4f}" if isinstance(metrics.get('accuracy'), float) else f"Accuracy:                    {metrics.get('accuracy', 'N/A')}")
             print(f"Number of Training Rounds:   {metrics.get('num_training_rounds', 'N/A')}")
-            print(f"Number of Comm Rounds:       {metrics.get('num_communication_rounds', 'N/A')}")
             print(f"Client Model Memory:         {metrics.get('client_model_memory_mb', 0):.2f} MB")
             print(f"Client Gradient Memory:      {metrics.get('client_gradient_memory_mb', 0):.2f} MB (0 if ZO)")
             print(f"Server Model Memory:         {metrics.get('server_model_memory_mb', 0):.2f} MB")
@@ -879,69 +865,7 @@ def main():
             print(f"  Client Peak Memory:        {metrics.get('client_peak_memory_mb', 0):.2f} MB")
             print(f"  Server Peak Memory:        {metrics.get('server_peak_memory_mb', 0):.2f} MB")
             print(f"  Total Peak Memory:         {metrics.get('peak_gpu_memory_mb', 0):.2f} MB")
-            print("-" * 60)
-            
-            # Estimate communication costs (DeComFL-style)
-            # Get model info for estimation
-            total_params = sum(p.numel() for p in framework.model.parameters())
-            trainable_params = sum(p.numel() for p in framework.model.parameters() if p.requires_grad)
-            
-            # Estimate hidden state size at split point (batch_size × seq_len × hidden_dim)
-            # Using typical values for estimation
-            batch_size = args.per_device_train_batch_size
-            max_seq_len = getattr(args, 'max_length', 512)
-            hidden_dim = getattr(framework.model.client_model.config if hasattr(framework.model, 'client_model') else framework.model.config, 
-                                'hidden_size', 768)
-            
-            # dtype size (4 bytes for fp32, 2 for fp16)
-            dtype_bytes = 2 if args.load_float16 or args.load_bfloat16 else 4
-            
-            # Per-forward communication cost (Split Learning)
-            # Forward: hidden_states (batch × seq × hidden)
-            activation_size = batch_size * max_seq_len * hidden_dim * dtype_bytes
-            # Backward in ZO: just loss scalar (4 bytes) + seed (8 bytes)
-            zo_backward_size = 12  # loss (float) + seed (int64)
-            # Backward in FO: gradients same size as activations
-            fo_backward_size = activation_size
-            
-            num_comm_rounds = metrics.get('num_communication_rounds', 0)
-            is_zo = args.trainer == "zo"
-            
-            if is_zo:
-                # ZO: forward activations + loss scalar + seed
-                per_round_bytes = activation_size + zo_backward_size
-            else:
-                # FO: forward activations + backward gradients  
-                per_round_bytes = activation_size + fo_backward_size
-            
-            total_bytes = per_round_bytes * num_comm_rounds
-            
-            # Traditional FL comparison (would send full model each round)
-            traditional_fl_per_round = 2 * total_params * dtype_bytes  # send + receive full model
-            traditional_fl_total = traditional_fl_per_round * metrics.get('num_training_rounds', 0)
-            
-            # DeComFL pure (only scalars + seeds)
-            num_pert = getattr(args, 'num_pert', 1)
-            decomfl_per_round = num_pert * 4 + 8  # P scalars + seed
-            decomfl_total = decomfl_per_round * num_comm_rounds
-            
-            print("ESTIMATED COMMUNICATION COST (DeComFL-style):")
-            print(f"  Per Forward+Backward:      {format_payload_size(per_round_bytes)}")
-            print(f"  Total ({num_comm_rounds} rounds):      {format_payload_size(total_bytes)}")
-            print(f"  Traditional FL would use:  {format_payload_size(traditional_fl_total)}")
-            print(f"  DeComFL pure would use:    {format_payload_size(decomfl_total)}")
-            if traditional_fl_total > 0:
-                savings = (1 - total_bytes / traditional_fl_total) * 100
-                print(f"  Savings vs Traditional FL: {savings:.2f}%")
             print("=" * 60 + "\n")
-            
-            # Add estimated communication metrics
-            metrics["estimated_total_bytes"] = total_bytes
-            metrics["estimated_total_bytes_formatted"] = format_payload_size(total_bytes)
-            metrics["traditional_fl_bytes"] = traditional_fl_total
-            metrics["decomfl_pure_bytes"] = decomfl_total
-            if traditional_fl_total > 0:
-                metrics["savings_vs_traditional_fl"] = 1 - (total_bytes / traditional_fl_total)
 
 if __name__ == "__main__": 
     main()

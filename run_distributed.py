@@ -131,7 +131,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transformers import AutoTokenizer, DataCollatorForTokenClassification, HfArgumentParser, TrainingArguments
 from grpc_backend import TCPBackend, create_backend
-from split_communication import ForwardPayload, BackwardPayload, ZOMetadata, CommunicationStats
+from split_communication import ForwardPayload, BackwardPayload, ZOMetadata
 from splitmodel import GPT2Config, GPT2LMModel_Client, GPT2LMModel_Server
 from OPT_splitmodel import SplitOPT, OPTConfig, OPTLMModel_Client, OPTLMModel_Server
 from utils import apply_lora_to_opt, mark_only_lora_as_trainable
@@ -968,7 +968,6 @@ class DistributedClient:
         self.tokenizer = None
         self.backend = None
         self._sorted_params = None
-        self.communication_rounds = 0  # Counter for actual communication exchanges
         self._client_output = None  # For FO mode backward pass
         self._fo_optimizer = None  # FO optimizer (initialized if client_mode == "fo")
         
@@ -1282,9 +1281,7 @@ class DistributedClient:
         )
         
         self.backend.send_forward(forward_payload)
-        self.communication_rounds += 1  # Count send_forward
         backward_payload = self.backend.recv_backward()
-        self.communication_rounds += 1  # Count recv_backward
         
         if mode == "inference":
             return backward_payload.logits
@@ -1313,7 +1310,6 @@ class DistributedClient:
             restore_scaling_factor=restore_scaling_factor,
         )
         self.backend.send_zo_metadata(zo_metadata)
-        self.communication_rounds += 1  # Count send_zo_metadata
     
     def _zo_training_step(self, inputs, step):
         """
@@ -1672,7 +1668,6 @@ class DistributedClient:
         
         avg_loss = total_loss / global_step if global_step > 0 else 0
         logger.info(f"Training completed. Steps: {global_step}, Avg loss: {avg_loss:.4f}")
-        logger.info(f"Communication rounds during training: {self.communication_rounds}")
         if best_accuracy > 0:
             logger.info(f"Best evaluation accuracy during training: {best_accuracy:.4f}")
     
@@ -1819,9 +1814,7 @@ def main():
             logger.info(f"Accuracy: {metrics.get('accuracy', 'N/A')}")
             if 'dev_accuracy' in metrics:
                 logger.info(f"Dev Accuracy: {metrics.get('dev_accuracy', 'N/A')}")
-            logger.info(f"Total communication rounds: {client.communication_rounds}")
             logger.info("=" * 60)
-            metrics['num_communication_rounds'] = client.communication_rounds
             
             # Print client GPU memory summary
             client.memory_tracker.print_summary()
@@ -1833,43 +1826,6 @@ def main():
                 'client_peak_gpu_memory_allocated_gb': client_memory['peak_gpu_memory_allocated_gb'],
                 'client_peak_gpu_memory_reserved_bytes': client_memory['peak_gpu_memory_reserved_bytes'],
                 'client_peak_gpu_memory_reserved_gb': client_memory['peak_gpu_memory_reserved_gb'],
-            })
-            
-            # Get model parameter counts for communication cost comparison
-            client_params = sum(p.numel() for p in client.client_model.parameters())
-            trainable_params = sum(p.numel() for p in client.client_model.parameters() if p.requires_grad)
-            
-            # Add communication cost metrics
-            if hasattr(client.backend, 'comm_stats'):
-                comm_summary = client.backend.comm_stats.get_summary(
-                    model_params=client_params,
-                    num_perturbations=args.num_pert
-                )
-                
-                # Print detailed communication summary
-                client.backend.comm_stats.print_summary(
-                    model_params=client_params,
-                    num_perturbations=args.num_pert
-                )
-                
-                # Add to metrics dict
-                metrics.update({
-                    'total_bytes_transferred': comm_summary['total_bytes'],
-                    'total_bytes_formatted': comm_summary['total_bytes_formatted'],
-                    'total_bytes_sent': comm_summary['total_bytes_sent'],
-                    'total_bytes_received': comm_summary['total_bytes_received'],
-                    'avg_bytes_per_round': comm_summary['avg_bytes_per_round'],
-                    'forward_payload_bytes': comm_summary['forward_payload_bytes'],
-                    'backward_payload_bytes': comm_summary['backward_payload_bytes'],
-                    'zo_metadata_bytes': comm_summary['zo_metadata_bytes'],
-                    'total_mb': comm_summary['total_mb'],
-                })
-                
-                if 'traditional_fl_bytes' in comm_summary:
-                    metrics.update({
-                        'traditional_fl_bytes': comm_summary['traditional_fl_bytes'],
-                        'savings_vs_traditional_fl': comm_summary['savings_vs_traditional_fl'],
-                        'compression_ratio_vs_fl': comm_summary['compression_ratio_vs_fl'],
                     })
             
             print("results:", metrics)

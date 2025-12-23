@@ -1,14 +1,24 @@
+"""
+Prompt templates for various NLP tasks.
+
+This module provides template classes that define how to format examples
+for different classification and multiple-choice tasks. Each template
+implements encode() and verbalize() methods for prompt construction.
+
+Key components:
+- Template: Abstract base class for all templates
+- SST2Template, BoolQTemplate, CBTemplate, etc.: Task-specific templates
+- Verbalizers: Mappings from labels to natural language expressions
+"""
+
+
 class Template:
     def encode(self, sample):
-        """
-        Return prompted version of the example (without the answer/candidate)
-        """
+        """Return prompted version of the example (without the answer/candidate)."""
         raise NotImplementedError
     
     def verbalize(self, sample, candidate):
-        """
-        Return the prompted version of the example (with the answer/candidate)
-        """
+        """Return the prompted version of the example (with the answer/candidate)."""
         return candidate
 
 

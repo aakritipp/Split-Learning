@@ -1,3 +1,15 @@
+"""
+Prefix tuning implementation for transformer models.
+
+This module provides prefix tuning functionality which prepends learnable
+prefix tokens to the attention layers of a transformer model. Only the
+prefix parameters are trained while the base model remains frozen.
+
+Key components:
+- PrefixTuning: Main class for applying prefix tuning to a model
+- attn_forward_hook: Modified attention forward for prefix handling
+- prepare_inputs_for_generation: Generation-compatible input preparation
+"""
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -9,7 +21,7 @@ from torch import nn
 
 def find_module(root_module: nn.Module, key: str):
     """
-    Find a module with a specific name in a Transformer model
+    Find a module with a specific name in a Transformer model.
     From OpenDelta https://github.com/thunlp/OpenDelta
     """
     sub_keys = key.split(".")
@@ -90,12 +102,14 @@ class PrefixTuning:
 
     def __init__(self, model, num_prefix, reparam=True, embed_dim=512, mid_dim=512, float16=False, init_by_real_act=False):
         """
-        Inputs:
-        num_prefix: number of prefix tokens
-        reparam: use reparameterization trick (not used in MeZO)
-        embed_dim, mid_dim: hyperparameters for reparameterization trick (not used in MeZO)
-        float15: whether the model parameters are float15
-        init_by_real_act: init prefix tokens by real activations
+        Initialize prefix tuning for a model.
+        
+        Args:
+            num_prefix: Number of prefix tokens to prepend
+            reparam: Use reparameterization trick
+            embed_dim, mid_dim: Hyperparameters for reparameterization
+            float16: Whether the model parameters are float16
+            init_by_real_act: Initialize prefix tokens by real activations
         """
 
         self.model = model

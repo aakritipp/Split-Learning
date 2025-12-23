@@ -1,3 +1,15 @@
+"""
+Utility functions and helpers for split learning experiments.
+
+This module provides common utilities used across the codebase including
+prompt encoding, forward function wrappers, and data handling helpers.
+
+Key components:
+- encode_prompt: Encode prompts for evaluation with in-context learning
+- forward_wrap_with_option_len: Wrapper for partial target sequence loss
+- temp_seed: Context manager for temporary random seed
+- Prediction: Dataclass for storing prediction results
+"""
 import contextlib
 import time
 import logging
@@ -211,7 +223,7 @@ def apply_lora_to_opt(model, lora_r, lora_alpha, lora_dropout):
                     r=lora_r,
                     lora_alpha=lora_alpha,
                     lora_dropout=lora_dropout,
-                    merge_weights=False # Important for MeZO to control merge state
+                    merge_weights=False  # Important for ZO to control merge state
                 )
                 
                 # Initialize weights to match original (copy pretrained weights)
@@ -254,7 +266,7 @@ class DataCollatorWithPaddingAndNesting:
         )
         
         if labels is not None:
-            # MeZO Fix: Handle case where labels are integers (classification indices)
+            # Handle case where labels are integers (classification indices)
             if isinstance(labels[0], int):
                 # If labels are integers, we just convert them to tensor directly, no padding needed
                 batch["labels"] = torch.tensor(labels, dtype=torch.long)
