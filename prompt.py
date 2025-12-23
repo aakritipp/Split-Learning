@@ -23,6 +23,55 @@ class SST2Template(Template):
         return f"{text} It was {self.verbalizer[candidate]}"      
 
 
+class BoolQTemplateV2(Template):
+    def encode(self, sample):
+        passage = sample.data["passage"]
+        question = sample.data["question"]
+        if not question.endswith("?"):
+            question = question + "?"
+        question = question[0].upper() + question[1:]
+        return f"{passage} {question}\\n\\n"
+
+    def verbalize(self, sample, candidate):
+        passage = sample.data["passage"]
+        question = sample.data["question"]
+        if not question.endswith("?"):
+            question = question + "?"
+        question = question[0].upper() + question[1:]
+        return f"{passage} {question}\\n\\n{candidate}"
+    
+    def encode_sfc(self, sample):
+        return ""
+    
+    def verbalize_sfc(self, sample, candidate):
+        return candidate
+
+
+class BoolQTemplateV3(Template):
+    def encode(self, sample):
+        passage = sample.data["passage"]
+        question = sample.data["question"]
+        if not question.endswith("?"):
+            question = question + "?"
+        question = question[0].upper() + question[1:]
+        return f"{passage} {question}\n"
+
+    def verbalize(self, sample, candidate):
+        passage = sample.data["passage"]
+        question = sample.data["question"]
+        if not question.endswith("?"):
+            question = question + "?"
+        question = question[0].upper() + question[1:]
+        return f"{passage} {question}\n{candidate}"
+    
+    def encode_sfc(self, sample):
+        return ""
+    
+    def verbalize_sfc(self, sample, candidate):
+        return candidate
+
+
+
 class BoolQTemplate(Template):
     def encode(self, sample):
         passage = sample.data["passage"]

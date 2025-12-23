@@ -34,8 +34,104 @@ from dataclasses import dataclass, field
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm import tqdm
 
+# Note: Accelerate's DDP doesn't work for split learning (single TCP connection architecture)
+# Multi-GPU is supported via DataParallel instead (single-process, multi-GPU)
+# Keeping import for compatibility but not using Accelerator for DDP
+try:
+    from accelerate import Accelerator
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# GPU MEMORY TRACKING
+# =============================================================================
+
+class GPUMemoryTracker:
+    """Track GPU memory usage and peak memory on a device."""
+    
+    def __init__(self, device=None, role="unknown"):
+        self.role = role
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.peak_memory_bytes = 0
+        self.peak_memory_allocated_bytes = 0
+        self.peak_memory_reserved_bytes = 0
+        self.tracking = False
+        
+        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+            # Reset peak stats at initialization
+            torch.cuda.reset_peak_memory_stats(self.device)
+    
+    def start_tracking(self):
+        """Start/reset memory tracking."""
+        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+            torch.cuda.reset_peak_memory_stats(self.device)
+            self.tracking = True
+    
+    def update_peak(self):
+        """Update peak memory stats by checking current peak values."""
+        if not torch.cuda.is_available() or not str(self.device).startswith('cuda'):
+            return
+        
+        # Get current peak memory stats
+        current_allocated = torch.cuda.max_memory_allocated(self.device)
+        current_reserved = torch.cuda.max_memory_reserved(self.device)
+        
+        # Update our tracked peaks
+        if current_allocated > self.peak_memory_allocated_bytes:
+            self.peak_memory_allocated_bytes = current_allocated
+        if current_reserved > self.peak_memory_reserved_bytes:
+            self.peak_memory_reserved_bytes = current_reserved
+        
+        # Track overall peak (using allocated as the primary metric)
+        self.peak_memory_bytes = self.peak_memory_allocated_bytes
+    
+    def get_current_memory(self):
+        """Get current memory usage."""
+        if not torch.cuda.is_available() or not str(self.device).startswith('cuda'):
+            return {'allocated': 0, 'reserved': 0}
+        
+        return {
+            'allocated': torch.cuda.memory_allocated(self.device),
+            'reserved': torch.cuda.memory_reserved(self.device),
+        }
+    
+    def get_peak_memory(self):
+        """Get peak memory usage tracked so far."""
+        self.update_peak()
+        return {
+            'peak_allocated_bytes': self.peak_memory_allocated_bytes,
+            'peak_reserved_bytes': self.peak_memory_reserved_bytes,
+            'peak_allocated_gb': self.peak_memory_allocated_bytes / (1024**3),
+            'peak_reserved_gb': self.peak_memory_reserved_bytes / (1024**3),
+            'peak_allocated_mb': self.peak_memory_allocated_bytes / (1024**2),
+            'peak_reserved_mb': self.peak_memory_reserved_bytes / (1024**2),
+        }
+    
+    def get_summary(self):
+        """Get a summary dict of memory usage."""
+        peak = self.get_peak_memory()
+        return {
+            'role': self.role,
+            'peak_gpu_memory_allocated_bytes': peak['peak_allocated_bytes'],
+            'peak_gpu_memory_reserved_bytes': peak['peak_reserved_bytes'],
+            'peak_gpu_memory_allocated_gb': peak['peak_allocated_gb'],
+            'peak_gpu_memory_reserved_gb': peak['peak_reserved_gb'],
+        }
+    
+    def print_summary(self):
+        """Print memory summary."""
+        peak = self.get_peak_memory()
+        print(f"\n{'='*60}")
+        print(f"GPU MEMORY USAGE - {self.role.upper()}")
+        print(f"{'='*60}")
+        print(f"Peak GPU Memory Allocated:   {peak['peak_allocated_gb']:.2f} GB ({peak['peak_allocated_mb']:.2f} MB)")
+        print(f"Peak GPU Memory Reserved:    {peak['peak_reserved_gb']:.2f} GB ({peak['peak_reserved_mb']:.2f} MB)")
+        print(f"{'='*60}")
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,7 +139,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transformers import AutoTokenizer, DataCollatorForTokenClassification, HfArgumentParser, TrainingArguments
 from grpc_backend import TCPBackend, create_backend
 from split_communication import ForwardPayload, BackwardPayload, ZOMetadata, CommunicationStats
-from splitmodel import GPT2Config, GPT2LMModel_Client, GPT2LMModel_Server, SplitOPT
+from splitmodel import GPT2Config, GPT2LMModel_Client, GPT2LMModel_Server
+from OPT_splitmodel import SplitOPT, OPTConfig, OPTLMModel_Client, OPTLMModel_Server
 from utils import apply_lora_to_opt, mark_only_lora_as_trainable
 from dataset import get_task
 from utils import encode_prompt, DataCollatorWithPaddingAndNesting, Prediction
@@ -86,6 +183,9 @@ class DistributedArguments(TrainingArguments):
     load_int8: bool = False
     no_auto_device: bool = False
     
+    # Split layer configuration
+    split_layer: int = 3  # layer index where to split the model (default: 3 for OPT/GPT-2)
+    
     # Data settings
     num_train: int = 1000
     num_dev: int = 500
@@ -108,6 +208,9 @@ class DistributedArguments(TrainingArguments):
     # Optimizer
     optimizer: str = "sgd"
     sgd_momentum: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
     client_learning_rate: Optional[float] = None
     server_learning_rate: Optional[float] = None
     
@@ -152,25 +255,35 @@ class NondiffCollator:
         padding_side = getattr(self.tokenizer, 'padding_side', 'left')
         pad_token_id = self.tokenizer.pad_token_id or 0
         
+        attention_masks = []
+        
         for f in features:
             input_ids = f["input_ids"]
             labels = f.get("labels", input_ids)
             option_len = f.get("option_len", 0)
             
+            seq_len = len(input_ids)
+            pad_len = max_length - seq_len
+            
             if padding_side == "left":
-                padded = [pad_token_id] * (max_length - len(input_ids)) + list(input_ids)
-                padded_lab = [-100] * (max_length - len(labels)) + list(labels)
+                padded = [pad_token_id] * pad_len + list(input_ids)
+                padded_lab = [-100] * pad_len + list(labels)
+                # attention_mask: 0 for padding, 1 for real tokens
+                attn_mask = [0] * pad_len + [1] * seq_len
             else:
-                padded = list(input_ids) + [pad_token_id] * (max_length - len(input_ids))
-                padded_lab = list(labels) + [-100] * (max_length - len(labels))
+                padded = list(input_ids) + [pad_token_id] * pad_len
+                padded_lab = list(labels) + [-100] * pad_len
+                attn_mask = [1] * seq_len + [0] * pad_len
             
             padded_input_ids.append(padded)
             padded_labels.append(padded_lab)
+            attention_masks.append(attn_mask)
             option_lens.append(option_len)
         
         batch = {
             "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
             "labels": torch.tensor(padded_labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
             "option_len": option_lens,
         }
         if any(g is not None for g in golds):
@@ -196,12 +309,27 @@ class DistributedServer:
     """
     Server for distributed split learning.
     Loads server portion of model and processes forward passes from client.
+    
+    Multi-GPU Support:
+    - Split learning uses single TCP connection, so DDP (multi-process) doesn't work
+    - Instead, we support DataParallel (single-process, multi-GPU) for batch parallelism
+    - For large models that don't fit on one GPU, use model sharding via device placement
     """
     
     def __init__(self, args: DistributedArguments):
         self.args = args
-        self.device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
         self.server_lr = args.server_learning_rate or args.learning_rate
+        
+        # Multi-GPU support via DataParallel (single-process)
+        # Note: DDP/Accelerate with multiple processes doesn't work for split learning
+        # due to single TCP connection architecture
+        self.n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        self.use_data_parallel = (self.n_gpu > 1)
+        
+        if self.n_gpu > 1:
+            logger.info(f"Multi-GPU detected: {self.n_gpu} GPUs available")
+            logger.info(f"Using DataParallel for batch parallelism (single-process)")
         
         # Resolve optimizer mode
         global_trainer = args.trainer
@@ -210,25 +338,40 @@ class DistributedServer:
             self.server_mode = "zo" if global_trainer == "zo" else "fo"
         
         self.server_model = None
+        self._server_module = None  # Underlying module (for DataParallel)
         self.backend = None
         self._sorted_params = None
         self._fo_optimizer = None  # FO optimizer (initialized if server_mode == "fo")
         
+        # GPU memory tracking
+        self.memory_tracker = GPUMemoryTracker(device=self.device, role="server")
+        
     def load_model(self):
-        """Load server portion of split model"""
+        """Load server portion of split model - matching run.py Framework.load_model()"""
         logger.info(f"Loading server model: {self.args.model_name}")
         
         if "opt" in self.args.model_name.lower():
-            from transformers import OPTForCausalLM
-            from splitmodel import OPTLMModel_Server
+            # Use OPT_splitmodel.py implementation with fixes
+            split_layer = getattr(self.args, 'split_layer', 3)
+            logger.info(f"Creating OPT split model with split_layer={split_layer}")
             
-            opt_model = OPTForCausalLM.from_pretrained(self.args.model_name)
-            self.server_model = OPTLMModel_Server(opt_model)
+            # Create config from pretrained model
+            opt_config = OPTConfig.from_pretrained(self.args.model_name)
             
+            # Add LoRA config if enabled
+            if self.args.lora:
+                opt_config.lora_attn_dim = self.args.lora_r
+                opt_config.lora_attn_alpha = self.args.lora_alpha
+                opt_config.lora_dropout = 0.0
+            
+            # Create split model and load weights
+            self.server_model = SplitOPT(opt_config, split_layer=split_layer)
+            self.server_model.load_weight(self.args.model_name)
+
             if self.args.lora:
                 logger.info(f"Applying LoRA (r={self.args.lora_r}, alpha={self.args.lora_alpha})")
-                apply_lora_to_opt(self.server_model, self.args.lora_r, self.args.lora_alpha, 0.0)
-                mark_only_lora_as_trainable(self.server_model)
+                apply_lora_to_opt(self.server_model.server, self.args.lora_r, self.args.lora_alpha, 0.0)
+                mark_only_lora_as_trainable(self.server_model.server)
         else:
             # GPT-2 style models
             if self.args.model_card == "gpt2.md":
@@ -261,29 +404,48 @@ class DistributedServer:
         
         self.server_model = self.server_model.to(self.device)
         
-        # Cache sorted params for ZO
+        # Store reference to underlying module before wrapping
+        self._server_module = self.server_model
+        
+        # Multi-GPU: Use DataParallel for batch parallelism (single-process)
+        # Note: ZO perturbations are applied to self._server_module (the unwrapped model)
+        # DataParallel replicates the model during forward, so perturbations are consistent
+        if self.use_data_parallel and self.n_gpu > 1:
+            self.server_model = torch.nn.DataParallel(self.server_model)
+            logger.info(f"Model wrapped with DataParallel for {self.n_gpu} GPU(s)")
+        
+        # Initialize FO optimizer if needed
+        if self.server_mode == "fo":
+            # Use parameters from the underlying module (not DataParallel wrapper)
+            trainable_params = [p for p in self._server_module.parameters() if p.requires_grad]
+            if self.args.optimizer.lower() == "adam":
+                self._fo_optimizer = torch.optim.Adam(
+                    trainable_params, lr=self.server_lr,
+                    betas=(self.args.adam_beta1, self.args.adam_beta2),
+                    eps=self.args.adam_epsilon,
+                    weight_decay=self.args.weight_decay
+                )
+                logger.info(f"Initialized Adam optimizer for FO server (lr={self.server_lr}, betas=({self.args.adam_beta1}, {self.args.adam_beta2}))")
+            else:
+                self._fo_optimizer = torch.optim.SGD(
+                    trainable_params, lr=self.server_lr,
+                    momentum=self.args.sgd_momentum,
+                    weight_decay=self.args.weight_decay
+                )
+                logger.info(f"Initialized SGD optimizer for FO server (lr={self.server_lr}, momentum={self.args.sgd_momentum})")
+        
+        # Cache sorted params for ZO (use underlying module, not DataParallel wrapper)
+        server_module = self._get_server_module()
         self._sorted_params = sorted(
-            [(name, param) for name, param in self.server_model.named_parameters() 
+            [(name, param) for name, param in server_module.named_parameters() 
              if param.requires_grad],
             key=lambda x: x[0]
         )
         
-        trainable = sum(p.numel() for p in self.server_model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.server_model.parameters())
+        trainable = sum(p.numel() for p in self._server_module.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self._server_module.parameters())
         logger.info(f"Server model: {total:,} params, {trainable:,} trainable")
         logger.info(f"Server mode: {self.server_mode.upper()}")
-        
-        # Initialize FO optimizer if needed
-        if self.server_mode == "fo":
-            trainable_params = [p for p in self.server_model.parameters() if p.requires_grad]
-            if self.args.optimizer.lower() == "adam":
-                self._fo_optimizer = torch.optim.Adam(trainable_params, lr=self.server_lr)
-            else:
-                self._fo_optimizer = torch.optim.SGD(
-                    trainable_params, lr=self.server_lr,
-                    momentum=self.args.sgd_momentum
-                )
-            logger.info(f"Initialized {self.args.optimizer} optimizer for FO server (lr={self.server_lr})")
         
     def _load_gpt2_pretrained_weights(self):
         """Load pretrained GPT-2 weights for server (layers 3+)"""
@@ -294,7 +456,7 @@ class DistributedServer:
             hf_model = GPT2LMHeadModel.from_pretrained(self.args.model_name)
             state_dict = hf_model.state_dict()
             server_state_dict = OrderedDict()
-            split_layer = 3
+            split_layer = getattr(self.args, 'split_layer', 3)
             
             for key, value in state_dict.items():
                 key_clean = key.replace("transformer.", "") if key.startswith("transformer.") else key
@@ -315,9 +477,89 @@ class DistributedServer:
                         
             self.server_model.load_state_dict(server_state_dict, strict=False)
             self.server_model.set_tied()
-            logger.info("Loaded pretrained GPT-2 server weights")
+            logger.info(f"Loaded pretrained GPT-2 server weights (split_layer={split_layer})")
         except Exception as e:
             logger.warning(f"Could not load pretrained weights: {e}")
+    
+    def _load_opt_server_weights(self, hf_model, split_layer):
+        """Load pretrained OPT weights for server (layers split_layer+)"""
+        try:
+            from collections import OrderedDict
+            
+            hf_state_dict = hf_model.state_dict()
+            server_state_dict = OrderedDict()
+            loaded_layers = set()
+            
+            for key, value in hf_state_dict.items():
+                # Remove HF prefixes
+                new_key = key
+                if new_key.startswith("model.decoder."):
+                    new_key = new_key[len("model.decoder."):]
+                
+                # Embeddings go to server for weight tying
+                if new_key.startswith("embed_tokens."):
+                    server_key = f"transformer_Server.{new_key}"
+                    server_state_dict[server_key] = value.clone()
+                
+                # Final layer norm goes to server
+                elif new_key.startswith("final_layer_norm."):
+                    server_key = f"transformer_Server.{new_key}"
+                    server_state_dict[server_key] = value.clone()
+                
+                # LM head
+                elif key.startswith("lm_head."):
+                    server_state_dict[key] = value.clone()
+                
+                # Split layers: server gets layers >= split_layer
+                elif new_key.startswith("layers."):
+                    parts = new_key.split(".")
+                    layer_idx = int(parts[1])
+                    rest = ".".join(parts[2:])
+                    
+                    # Map HF structure to our structure (fc1/fc2 -> mlp.fc1/mlp.fc2)
+                    if rest.startswith("fc1") or rest.startswith("fc2"):
+                        mapped_rest = "mlp." + rest
+                    else:
+                        mapped_rest = rest
+                    
+                    if layer_idx >= split_layer:
+                        new_layer_idx = layer_idx - split_layer
+                        server_key = f"transformer_Server.h.{new_layer_idx}.{mapped_rest}"
+                        server_state_dict[server_key] = value.clone()
+                        loaded_layers.add(layer_idx)
+            
+            missing, unexpected = self.server_model.load_state_dict(server_state_dict, strict=False)
+            self.server_model.set_tied()
+            
+            # Verify embeddings loaded correctly (for weight tying)
+            if hasattr(self.server_model, 'transformer_Server'):
+                embed_weight = self.server_model.transformer_Server.embed_tokens.weight
+                embed_sum = embed_weight.abs().sum().item()
+                if embed_sum == 0:
+                    logger.error("CRITICAL: Server embeddings not loaded properly!")
+                else:
+                    logger.info(f"Server embeddings verified (sum={embed_sum:.2f})")
+                
+                # Verify final layer norm
+                ln_weight = self.server_model.transformer_Server.final_layer_norm.weight
+                ln_sum = ln_weight.abs().sum().item()
+                if ln_sum == 0:
+                    logger.error("CRITICAL: Server final_layer_norm not loaded properly!")
+                else:
+                    logger.info(f"Server final_layer_norm verified (sum={ln_sum:.2f})")
+            
+            # Log any missing keys (excluding LoRA)
+            if missing:
+                real_missing = [k for k in missing if 'lora' not in k.lower()]
+                if real_missing:
+                    logger.warning(f"Server missing keys: {real_missing}")
+            
+            logger.info(f"Loaded pretrained OPT server weights (split_layer={split_layer})")
+            logger.info(f"  Loaded layers: {sorted(loaded_layers)}")
+        except Exception as e:
+            logger.error(f"Could not load OPT pretrained weights: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _generate_perturbation(self, param):
         """Generate perturbation vector - matching trainer.py"""
@@ -332,6 +574,17 @@ class DistributedServer:
             z = torch.normal(mean=0, std=1, size=param.data.size(),
                            device=param.data.device, dtype=param.data.dtype)
         return z
+    
+    def _get_server_module(self):
+        """Get the server module (handles DataParallel wrapping)"""
+        # Use stored reference to underlying module
+        if self._server_module is not None:
+            return self._server_module.server
+        # Fallback: unwrap DataParallel if needed
+        model = self.server_model
+        if hasattr(model, 'module'):
+            model = model.module
+        return model.server
     
     def _perturb_parameters(self, seed: int, scaling_factor: float):
         """Perturb server parameters - matching trainer.py"""
@@ -417,13 +670,15 @@ class DistributedServer:
     def _process_forward_zo(self, hidden_states, presents, input_shape, labels, lm_mask,
                             option_len, batch_id, mode):
         """ZO mode forward: inference only, no gradients"""
+        server_module = self._get_server_module()
         with torch.inference_mode():
-            outputs = self.server_model(
+            outputs = server_module(
                 input_ids_shape=input_shape,
                 hidden_states_client=hidden_states,
                 presents_client=presents,
                 lm_labels=labels if mode == "train" else None,
                 lm_mask=lm_mask,
+                attention_mask=lm_mask,
             )
             
             if mode == "inference":
@@ -446,6 +701,10 @@ class DistributedServer:
                     vocab_size = logits.size(-1)
                     loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
                 
+                # Ensure loss is a scalar (average if batch dimension present)
+                if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+                    loss = loss.mean()
+                
                 loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
             else:
                 loss_value = None
@@ -461,15 +720,17 @@ class DistributedServer:
         # Enable gradient tracking on hidden_states
         hidden_states = hidden_states.clone().detach().requires_grad_(True)
         
-        self.server_model.train()
+        server_module = self._get_server_module()
+        server_module.train()
         # Note: Don't zero gradients - we'll accumulate and update later
-        
-        outputs = self.server_model(
+
+        outputs = server_module(
             input_ids_shape=input_shape,
             hidden_states_client=hidden_states,
             presents_client=presents,
             lm_labels=labels if mode == "train" else None,
             lm_mask=lm_mask,
+            attention_mask=lm_mask,
         )
         
         if labels is not None:
@@ -488,7 +749,12 @@ class DistributedServer:
                 vocab_size = logits.size(-1)
                 loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
             
+            # Ensure loss is a scalar (average if batch dimension present)
+            if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+                loss = loss.mean()
+            
             # Backward to compute gradients (stored in .grad, but don't update)
+            # DataParallel handles gradient aggregation across GPUs automatically
             loss.backward()
             
             loss_value = loss.item()
@@ -504,16 +770,18 @@ class DistributedServer:
         # Enable gradient tracking on hidden_states (the split point)
         hidden_states = hidden_states.clone().detach().requires_grad_(True)
         
-        self.server_model.train()
+        server_module = self._get_server_module()
+        server_module.train()
         if self._fo_optimizer:
             self._fo_optimizer.zero_grad()
-        
-        outputs = self.server_model(
+
+        outputs = server_module(
             input_ids_shape=input_shape,
             hidden_states_client=hidden_states,
             presents_client=presents,
             lm_labels=labels if mode == "train" else None,
             lm_mask=lm_mask,
+            attention_mask=lm_mask,
         )
         
         if mode == "inference":
@@ -536,7 +804,12 @@ class DistributedServer:
                 vocab_size = logits.size(-1)
                 loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
             
+            # Ensure loss is a scalar (average if batch dimension present)
+            if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+                loss = loss.mean()
+
             # Backward pass to compute gradients
+            # DataParallel handles gradient aggregation across GPUs automatically
             loss.backward()
             
             # Get gradient at split point (to send back to client)
@@ -558,6 +831,9 @@ class DistributedServer:
         """Main server loop"""
         logger.info("Starting Distributed Server...")
         self.load_model()
+        
+        # Start GPU memory tracking
+        self.memory_tracker.start_tracking()
         
         self.backend = create_backend(
             backend_type=self.args.backend,
@@ -608,6 +884,9 @@ class DistributedServer:
                 backward_payload = self._process_forward(forward_payload)
                 self.backend.send_backward(backward_payload)
                 
+                # Update GPU memory peak tracking
+                self.memory_tracker.update_peak()
+                
                 # Check for update signal based on phase
                 phase = getattr(forward_payload, 'phase', None)
                 
@@ -649,6 +928,9 @@ class DistributedServer:
         except KeyboardInterrupt:
             logger.info("Server interrupted")
         finally:
+            # Print GPU memory summary
+            self.memory_tracker.print_summary()
+            
             if self.backend:
                 self.backend.close()
             logger.info("Server stopped")
@@ -662,13 +944,25 @@ class DistributedClient:
     """
     Client for distributed split learning.
     Loads client portion, handles data, and drives training loop.
+    
+    Multi-GPU Support:
+    - Split learning uses single TCP connection, so DDP (multi-process) doesn't work
+    - Instead, we support DataParallel (single-process, multi-GPU) for batch parallelism
     """
     
     def __init__(self, args: DistributedArguments, task):
         self.args = args
         self.task = task
-        self.device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
         self.client_lr = args.client_learning_rate or args.learning_rate
+        
+        # Multi-GPU support via DataParallel (single-process)
+        self.n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        self.use_data_parallel = (self.n_gpu > 1)
+        
+        if self.n_gpu > 1:
+            logger.info(f"Multi-GPU detected: {self.n_gpu} GPUs available")
+            logger.info(f"Using DataParallel for batch parallelism (single-process)")
         
         # Resolve optimizer mode
         global_trainer = args.trainer
@@ -677,12 +971,16 @@ class DistributedClient:
             self.client_mode = "zo" if global_trainer == "zo" else "fo"
         
         self.client_model = None
+        self._client_module = None  # Underlying module (for DataParallel)
         self.tokenizer = None
         self.backend = None
         self._sorted_params = None
         self.communication_rounds = 0  # Counter for actual communication exchanges
         self._client_output = None  # For FO mode backward pass
         self._fo_optimizer = None  # FO optimizer (initialized if client_mode == "fo")
+        
+        # GPU memory tracking
+        self.memory_tracker = GPUMemoryTracker(device=self.device, role="client")
         
         # Resolve server mode for hybrid modes
         self.server_mode = args.server_optimizer
@@ -694,20 +992,26 @@ class DistributedClient:
         logger.info(f"Loading client model: {self.args.model_name}")
         
         if "opt" in self.args.model_name.lower():
-            from transformers import OPTForCausalLM
-            from splitmodel import OPTLMModel_Client
+            # Use OPT_splitmodel.py implementation with fixes
+            split_layer = getattr(self.args, 'split_layer', 3)
+            logger.info(f"Creating OPT split model with split_layer={split_layer}")
             
-            opt_model = OPTForCausalLM.from_pretrained(self.args.model_name)
-            embed_tokens = nn.Embedding(
-                opt_model.model.decoder.embed_tokens.num_embeddings,
-                opt_model.model.decoder.embed_tokens.embedding_dim,
-                padding_idx=opt_model.model.decoder.embed_tokens.padding_idx,
-            )
-            embed_tokens.weight.data.copy_(opt_model.model.decoder.embed_tokens.weight.data)
-            self.client_model = OPTLMModel_Client(embed_tokens, opt_model.config)
+            # Create config from pretrained model
+            opt_config = OPTConfig.from_pretrained(self.args.model_name)
             
+            # Add LoRA config if enabled
             if self.args.lora:
-                mark_only_lora_as_trainable(self.client_model)
+                opt_config.lora_attn_dim = self.args.lora_r
+                opt_config.lora_attn_alpha = self.args.lora_alpha
+                opt_config.lora_dropout = 0.0
+            
+            # Create split model and load weights
+            self.client_model = SplitOPT(opt_config, split_layer=split_layer)
+            self.client_model.load_weight(self.args.model_name)
+
+            if self.args.lora:
+                apply_lora_to_opt(self.client_model.client, self.args.lora_r, self.args.lora_alpha, 0.0)
+                mark_only_lora_as_trainable(self.client_model.client)
         else:
             # GPT-2 style models
             if self.args.model_card == "gpt2.md":
@@ -741,34 +1045,51 @@ class DistributedClient:
         
         self.client_model = self.client_model.to(self.device)
         
-        # Cache sorted params for ZO
+        # Store reference to underlying module before wrapping
+        self._client_module = self.client_model
+        
+        # Multi-GPU: Use DataParallel for batch parallelism (single-process)
+        if self.use_data_parallel and self.n_gpu > 1:
+            self.client_model = torch.nn.DataParallel(self.client_model)
+            logger.info(f"Model wrapped with DataParallel for {self.n_gpu} GPU(s)")
+        
+        # Initialize FO optimizer if needed
+        if self.client_mode == "fo":
+            # Use parameters from the underlying module (not DataParallel wrapper)
+            trainable_params = [p for p in self._client_module.parameters() if p.requires_grad]
+            if len(trainable_params) > 0:
+                if self.args.optimizer.lower() == "adam":
+                    self._fo_optimizer = torch.optim.Adam(
+                        trainable_params, lr=self.client_lr,
+                        betas=(self.args.adam_beta1, self.args.adam_beta2),
+                        eps=self.args.adam_epsilon,
+                        weight_decay=self.args.weight_decay
+                    )
+                    logger.info(f"Initialized Adam optimizer for FO client (lr={self.client_lr}, betas=({self.args.adam_beta1}, {self.args.adam_beta2}))")
+                else:
+                    self._fo_optimizer = torch.optim.SGD(
+                        trainable_params, lr=self.client_lr, 
+                        momentum=self.args.sgd_momentum,
+                        weight_decay=self.args.weight_decay
+                    )
+                    logger.info(f"Initialized SGD optimizer for FO client (lr={self.client_lr}, momentum={self.args.sgd_momentum})")
+            else:
+                logger.warning("Client has 0 trainable parameters - no client optimizer created")
+                logger.warning("Client gradients will be computed but not applied (only server trains)")
+        
+        # Cache sorted params for ZO (use underlying module, not DataParallel wrapper)
+        client_module = self._get_client_module()
         self._sorted_params = sorted(
-            [(name, param) for name, param in self.client_model.named_parameters() 
+            [(name, param) for name, param in client_module.named_parameters() 
              if param.requires_grad],
             key=lambda x: x[0]
         )
         
-        trainable = sum(p.numel() for p in self.client_model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.client_model.parameters())
+        trainable = sum(p.numel() for p in self._client_module.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self._client_module.parameters())
         logger.info(f"Client model: {total:,} params, {trainable:,} trainable")
         logger.info(f"Client mode: {self.client_mode.upper()}")
         logger.info(f"Server mode: {self.server_mode.upper()}")
-        
-        # Initialize FO optimizer if needed
-        if self.client_mode == "fo":
-            trainable_params = [p for p in self.client_model.parameters() if p.requires_grad]
-            if len(trainable_params) > 0:
-                if self.args.optimizer.lower() == "adam":
-                    self._fo_optimizer = torch.optim.Adam(trainable_params, lr=self.client_lr)
-                else:
-                    self._fo_optimizer = torch.optim.SGD(
-                        trainable_params, lr=self.client_lr, 
-                        momentum=self.args.sgd_momentum
-                    )
-                logger.info(f"Initialized {self.args.optimizer} optimizer for FO client (lr={self.client_lr})")
-            else:
-                logger.warning("Client has 0 trainable parameters - no client optimizer created")
-                logger.warning("Client gradients will be computed but not applied (only server trains)")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=False)
@@ -778,7 +1099,7 @@ class DistributedClient:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
     def _load_gpt2_pretrained_weights(self):
-        """Load pretrained GPT-2 weights for client (layers 0-2)"""
+        """Load pretrained GPT-2 weights for client (layers 0 to split_layer-1)"""
         try:
             from transformers import GPT2LMHeadModel
             from collections import OrderedDict
@@ -786,7 +1107,7 @@ class DistributedClient:
             hf_model = GPT2LMHeadModel.from_pretrained(self.args.model_name)
             state_dict = hf_model.state_dict()
             client_state_dict = OrderedDict()
-            split_layer = 3
+            split_layer = getattr(self.args, 'split_layer', 3)
             
             for key, value in state_dict.items():
                 key_clean = key.replace("transformer.", "") if key.startswith("transformer.") else key
@@ -801,9 +1122,77 @@ class DistributedClient:
                         client_state_dict[f"transformer_Client.h.{layer_idx}.{rest}"] = value.clone()
                         
             self.client_model.load_state_dict(client_state_dict, strict=False)
-            logger.info("Loaded pretrained GPT-2 client weights")
+            logger.info(f"Loaded pretrained GPT-2 client weights (split_layer={split_layer})")
         except Exception as e:
             logger.warning(f"Could not load pretrained weights: {e}")
+    
+    def _load_opt_client_weights(self, hf_model, split_layer):
+        """Load pretrained OPT weights for client (layers 0 to split_layer-1)"""
+        try:
+            from collections import OrderedDict
+            
+            hf_state_dict = hf_model.state_dict()
+            client_state_dict = OrderedDict()
+            loaded_layers = set()
+            
+            for key, value in hf_state_dict.items():
+                # Remove HF prefixes
+                new_key = key
+                if new_key.startswith("model.decoder."):
+                    new_key = new_key[len("model.decoder."):]
+                
+                # Embeddings go to client
+                if new_key.startswith("embed_tokens.") or new_key.startswith("embed_positions."):
+                    client_key = f"transformer_Client.{new_key}"
+                    client_state_dict[client_key] = value.clone()
+                
+                # Split layers: client gets layers < split_layer
+                elif new_key.startswith("layers."):
+                    parts = new_key.split(".")
+                    layer_idx = int(parts[1])
+                    rest = ".".join(parts[2:])
+                    
+                    # Map HF structure to our structure (fc1/fc2 -> mlp.fc1/mlp.fc2)
+                    if rest.startswith("fc1") or rest.startswith("fc2"):
+                        mapped_rest = "mlp." + rest
+                    else:
+                        mapped_rest = rest
+                    
+                    if layer_idx < split_layer:
+                        client_key = f"transformer_Client.h.{layer_idx}.{mapped_rest}"
+                        client_state_dict[client_key] = value.clone()
+                        loaded_layers.add(layer_idx)
+            
+            missing, unexpected = self.client_model.load_state_dict(client_state_dict, strict=False)
+            
+            # Verify embeddings loaded correctly
+            if hasattr(self.client_model, 'transformer_Client'):
+                embed_weight = self.client_model.transformer_Client.embed_tokens.weight
+                embed_sum = embed_weight.abs().sum().item()
+                if embed_sum == 0:
+                    logger.error("CRITICAL: Client embeddings not loaded properly!")
+                else:
+                    logger.info(f"Client embeddings verified (sum={embed_sum:.2f})")
+                
+                pos_embed_weight = self.client_model.transformer_Client.embed_positions.weight
+                pos_sum = pos_embed_weight.abs().sum().item()
+                if pos_sum == 0:
+                    logger.error("CRITICAL: Client position embeddings not loaded properly!")
+                else:
+                    logger.info(f"Client position embeddings verified (sum={pos_sum:.2f})")
+            
+            # Log any missing keys (excluding LoRA)
+            if missing:
+                real_missing = [k for k in missing if 'lora' not in k.lower()]
+                if real_missing:
+                    logger.warning(f"Client missing keys: {real_missing}")
+            
+            logger.info(f"Loaded pretrained OPT client weights (split_layer={split_layer})")
+            logger.info(f"  Loaded layers: {sorted(loaded_layers) if loaded_layers else 'embeddings only'}")
+        except Exception as e:
+            logger.error(f"Could not load OPT pretrained weights: {e}")
+            import traceback
+            traceback.print_exc()
     
     def connect(self):
         """Connect to server"""
@@ -817,6 +1206,17 @@ class DistributedClient:
         )
         self.backend.connect()
         logger.info("Connected to server")
+    
+    def _get_client_module(self):
+        """Get the client module (handles DataParallel wrapping)"""
+        # Use stored reference to underlying module
+        if self._client_module is not None:
+            return self._client_module.client
+        # Fallback: unwrap DataParallel if needed
+        model = self.client_model
+        if hasattr(model, 'module'):
+            model = model.module
+        return model.client
     
     def _generate_perturbation(self, param):
         """Generate perturbation vector - matching trainer.py"""
@@ -859,15 +1259,21 @@ class DistributedClient:
             requires_grad: If True, enable gradient tracking for FO mode.
                           Client will store output for backward pass.
         """
+        # Get the actual client module (handles Accelerate/DDP wrapping)
+        client_module = self._get_client_module()
+        
         if requires_grad:
             # FO mode: Need gradients, don't use inference_mode
-            self.client_model.train()
-            hidden_states, presents = self.client_model(input_ids)
+            client_module.train()
+            hidden_states, presents = client_module(input_ids, attention_mask=attention_mask)
+            # Ensure gradients are enabled for the output
+            if not hidden_states.requires_grad:
+                hidden_states = hidden_states.clone().detach().requires_grad_(True)
             # Store for backward pass
             self._client_output = hidden_states
         else:
             with torch.inference_mode():
-                hidden_states, presents = self.client_model(input_ids)
+                hidden_states, presents = client_module(input_ids, attention_mask=attention_mask)
         
         forward_payload = ForwardPayload(
             activations=hidden_states.detach().cpu() if not requires_grad else hidden_states.cpu(),
@@ -1011,6 +1417,7 @@ class DistributedClient:
             )
             
             # Backward through client using gradient from server
+            # DataParallel handles gradient aggregation across GPUs automatically
             if grad_activations is not None and self._client_output is not None:
                 grad_activations = grad_activations.to(self.device)
                 self._client_output.backward(grad_activations)
@@ -1121,6 +1528,8 @@ class DistributedClient:
                 option_len=option_len, requires_grad=True, phase='fo_backward'
             )
             
+            # Backward through client using gradient from server
+            # DataParallel handles gradient aggregation across GPUs automatically
             if grad_activations is not None and self._client_output is not None:
                 grad_activations = grad_activations.to(self.device)
                 self._client_output.backward(grad_activations)
@@ -1135,6 +1544,9 @@ class DistributedClient:
         """Training loop - matching run.py Framework.train()"""
         if self.client_model is None:
             self.load_model()
+        
+        # Start GPU memory tracking
+        self.memory_tracker.start_tracking()
         
         # Store eval_samples for periodic evaluation
         self._eval_samples = eval_samples
@@ -1242,6 +1654,9 @@ class DistributedClient:
                 log_steps += 1
                 global_step += 1
                 
+                # Update GPU memory peak tracking
+                self.memory_tracker.update_peak()
+                
                 if global_step % self.args.logging_steps == 0:
                     avg_loss = log_loss / log_steps
                     logger.info(f"Step {global_step}/{self.args.max_steps}: loss = {avg_loss:.4f}")
@@ -1340,6 +1755,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(args)
     set_seed(args.seed)
     
     logger.info("=" * 60)
@@ -1347,7 +1763,13 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Model: {args.model_name}")
     logger.info(f"Task: {args.task_name}")
+    logger.info(f"Split Layer: {args.split_layer}")
     logger.info(f"Trainer: {args.trainer}")
+    logger.info(f"Optimizer: {args.optimizer}")
+    if args.optimizer.lower() == "sgd":
+        logger.info(f"SGD Momentum: {args.sgd_momentum}")
+    else:
+        logger.info(f"Adam Betas: ({args.adam_beta1}, {args.adam_beta2})")
     logger.info(f"ZO: variant={args.zo_variant}, pert={args.zo_perturbation}, eps={args.zo_eps}")
     logger.info(f"Num Pert: {args.num_pert}")
     logger.info(f"LR: {args.learning_rate}")
@@ -1407,6 +1829,18 @@ def main():
             logger.info(f"Total communication rounds: {client.communication_rounds}")
             logger.info("=" * 60)
             metrics['num_communication_rounds'] = client.communication_rounds
+            
+            # Print client GPU memory summary
+            client.memory_tracker.print_summary()
+            
+            # Add GPU memory metrics
+            client_memory = client.memory_tracker.get_summary()
+            metrics.update({
+                'client_peak_gpu_memory_allocated_bytes': client_memory['peak_gpu_memory_allocated_bytes'],
+                'client_peak_gpu_memory_allocated_gb': client_memory['peak_gpu_memory_allocated_gb'],
+                'client_peak_gpu_memory_reserved_bytes': client_memory['peak_gpu_memory_reserved_bytes'],
+                'client_peak_gpu_memory_reserved_gb': client_memory['peak_gpu_memory_reserved_gb'],
+            })
             
             # Get model parameter counts for communication cost comparison
             client_params = sum(p.numel() for p in client.client_model.parameters())

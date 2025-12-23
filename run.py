@@ -357,6 +357,7 @@ class OurArguments(TrainingArguments):
     # Split Learning
     init_checkpoint: str = None # path to pretrained checkpoint
     model_card: str = "gpt2.sm" # model card for split learning
+    split_layer: int = 3 # layer index where to split the model (default: 3 for OPT/GPT-2)
 
     head_tuning: bool = False # head tuning: only tune the LM head
 
@@ -430,7 +431,8 @@ class Framework:
             if "opt" in self.args.model_name.lower():
                 # Split OPT path: use HuggingFace OPTForCausalLM under the hood.
                 logger.info(f"Loading split OPT model with pretrained weights: {self.args.model_name}")
-                model = SplitOPT(self.args.model_name)
+                logger.info(f"Split layer: {self.args.split_layer}")
+                model = SplitOPT(self.args.model_name, split_layer=self.args.split_layer)
                 # For OPT we currently fine-tune all parameters; LoRA masking is
                 # not wired into the OPT architecture in this codebase.
                 if self.args.lora:
@@ -478,12 +480,13 @@ class Framework:
                         lora_dropout=0.0,
                     )
 
-                model = SplitGPT2(config)
+                logger.info(f"Split layer: {self.args.split_layer}")
+                model = SplitGPT2(config, split_layer=self.args.split_layer)
                 
                 # Load pretrained weights if model_name is a GPT-2 variant
                 if "gpt2" in self.args.model_name.lower():
                     logger.info(f"Loading pretrained weights: {self.args.model_name}")
-                    model.load_weight(self.args.model_name, split_layer=3)
+                    model.load_weight(self.args.model_name)
                 else:
                     logger.info("No pretrained weights loaded (random initialization)")
 
