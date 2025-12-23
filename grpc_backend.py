@@ -1,18 +1,15 @@
-# ------------------------------------------------------------------------------------------
-# gRPC Backend for Split Learning
-#
-# Implements network communication for true multi-machine split learning.
-# Similar to DeComFL's approach: https://github.com/ZidongLiu/DeComFL
-#
-# Architecture:
-#   - Server: Runs the server portion of the model, listens for client connections
-#   - Client: Runs the client portion, sends activations to server
-#
-# Usage:
-#   Server machine: python run_server.py --host 0.0.0.0 --port 50051
-#   Client machine: python run_client.py --server_address <server_ip>:50051
-# ------------------------------------------------------------------------------------------
+"""
+gRPC and TCP communication backends for distributed split learning.
 
+This module provides network communication backends that enable split learning
+across multiple machines. It implements both gRPC (robust) and TCP (simple)
+protocols for payload exchange.
+
+Key components:
+- SplitLearningServicer: gRPC service implementation for server side
+- TCPBackend: Simple TCP socket-based communication
+- GRPCBackend: Full gRPC-based communication with streaming support
+"""
 import logging
 import time
 import threading
@@ -108,36 +105,12 @@ class SplitLearningServicer:
         return self._is_ready, "ready" if self._is_ready else "not_ready"
 
 
-# =============================================================================
-# Simple TCP-based Backend (Alternative to full gRPC)
-# =============================================================================
-
 import socket
 import struct
 import pickle
 
 
 class TCPBackend(CommunicationBackend):
-    """
-    Simple TCP socket-based communication backend.
-    
-    This is a lightweight alternative to gRPC that's easier to set up
-    and sufficient for split learning with a single client-server pair.
-    
-    Protocol:
-        1. Send 4-byte length prefix (big-endian)
-        2. Send serialized payload
-        
-    Usage:
-        # Server side
-        backend = TCPBackend(mode='server', host='0.0.0.0', port=50051)
-        backend.start()
-        
-        # Client side  
-        backend = TCPBackend(mode='client', host='server_ip', port=50051)
-        backend.connect()
-    """
-    
     def __init__(
         self,
         mode: str = 'client',  # 'client' or 'server'
@@ -157,7 +130,7 @@ class TCPBackend(CommunicationBackend):
         self._connected = False
         self._lock = threading.Lock()
         
-        # Communication cost tracking (DeComFL-style)
+        # Communication cost tracking
         self.comm_stats = CommunicationStats()
         
     def start(self):
@@ -225,7 +198,6 @@ class TCPBackend(CommunicationBackend):
     def _send_data(self, data: bytes):
         """Send data with length prefix."""
         sock = self._get_socket()
-        # Send 8-byte length prefix (supports up to 16 exabytes)
         length = len(data)
         sock.sendall(struct.pack('>Q', length))
         # Send data in chunks
@@ -234,10 +206,8 @@ class TCPBackend(CommunicationBackend):
     def _recv_data(self) -> bytes:
         """Receive data with length prefix."""
         sock = self._get_socket()
-        # Receive length prefix
         length_bytes = self._recv_exactly(sock, 8)
         length = struct.unpack('>Q', length_bytes)[0]
-        # Receive data
         return self._recv_exactly(sock, length)
     
     def _recv_exactly(self, sock: socket.socket, n: int) -> bytes:
@@ -294,7 +264,6 @@ class TCPBackend(CommunicationBackend):
         with self._lock:
             data = serialize_payload(('zo_metadata', metadata))
             self._send_data(data)
-            # Track communication cost - this is the DeComFL-style minimal communication
             self.comm_stats.record_send(len(data), payload_type="zo_metadata")
             logger.debug(f"Sent ZO metadata: seed={metadata.seed}, {len(data)} bytes")
     
@@ -347,33 +316,7 @@ class TCPBackend(CommunicationBackend):
         logger.info("Connection closed")
 
 
-# =============================================================================
-# Full gRPC Backend (More robust, supports multiple clients)
-# =============================================================================
-
 class GRPCBackend(CommunicationBackend):
-    """
-    Full gRPC-based communication backend for split learning.
-    
-    This provides a more robust implementation with:
-    - Automatic reconnection
-    - Health checks
-    - Streaming support for batch processing
-    - Better error handling
-    
-    Requires protobuf compilation:
-        python -m grpc_tools.protoc -I protos --python_out=. --grpc_python_out=. protos/split_learning.proto
-    
-    Usage:
-        # Server
-        backend = GRPCBackend(mode='server', host='0.0.0.0', port=50051)
-        backend.start_server(model_handler)
-        
-        # Client
-        backend = GRPCBackend(mode='client', host='server_ip', port=50051)
-        backend.connect()
-    """
-    
     def __init__(
         self,
         mode: str = 'client',
@@ -395,13 +338,6 @@ class GRPCBackend(CommunicationBackend):
         self._lock = threading.Lock()
         
     def start_server(self, train_handler: Callable):
-        """
-        Start the gRPC server with the given training handler.
-        
-        Args:
-            train_handler: Function that processes (forward_payload, zo_metadata, step, mode)
-                          and returns (backward_payload, loss)
-        """
         if self.mode != 'server':
             raise RuntimeError("start_server() is only for server mode")
         
@@ -514,18 +450,6 @@ class GRPCBackend(CommunicationBackend):
         step: int = 0,
         mode: str = 'zo'
     ) -> tuple:
-        """
-        Send a complete training request and wait for response.
-        
-        Args:
-            forward_payload: Activations from client model
-            zo_metadata: ZO optimization metadata (optional)
-            step: Current training step
-            mode: Training mode ('zo', 'fo', 'zo_fo', 'fo_zo')
-            
-        Returns:
-            Tuple of (backward_payload, loss)
-        """
         if self.mode != 'client':
             raise RuntimeError("send_train_request() is only for client mode")
             
@@ -564,10 +488,6 @@ class GRPCBackend(CommunicationBackend):
             self._server = None
         logger.info("gRPC backend closed")
 
-
-# =============================================================================
-# Factory function
-# =============================================================================
 
 def create_backend(
     backend_type: str = 'local',

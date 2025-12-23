@@ -1,7 +1,9 @@
 #!/bin/bash -l
 #SBATCH --job-name=split_distributed
 #SBATCH --account=fl-het
-#SBATCH --partition=tier3
+#SBATCH --partition=interactive
+# Multi-GPU: 2x A100 40GB per node enables BS=64 with FO training
+# Memory is distributed across GPUs via device_map="auto"
 #SBATCH --gres=gpu:a100:1
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -10,7 +12,7 @@
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=40g
+#SBATCH --mem=120g
 
 # =============================================================================
 # Distributed Split Learning - Using run_distributed.py (DeComFL-style)
@@ -58,30 +60,35 @@ echo "=========================================="
 # Configuration Parameters (same as run_script_gpu.sh)
 # =============================================================================
 
-MODEL=${MODEL:-facebook/opt-1.3b}
+MODEL=${MODEL:-facebook/opt-125m}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
-
+MOMENTUM=${MOMENTUM:-0.9}
 TASK=${TASK:-SST2}
 BS=${BS:-64}
 SEED=${SEED:-0}
-TRAIN=${TRAIN:-32000}
-DEV=${DEV:-500}
+TRAIN=${TRAIN:-}  # Will be set per-task in case statement below
+DEV=${DEV:-0}
 EVAL=${EVAL:-1000}
-STEPS=${STEPS:-3000}
+STEPS=${STEPS:-}
 EVAL_STEPS=${EVAL_STEPS:-25}
 
-MODE=${MODE:-lora}
+MODE=${MODE:-ft}
 MOMENTUM=${MOMENTUM:-0.9}
 
 # ZO Configuration
-ZO_VARIANT=${ZO_VARIANT:-central}
+ZO_VARIANT=${ZO_VARIANT:-forward}
 ZO_PERTURBATION=${ZO_PERTURBATION:-coordinate}
 NUM_PERT=${NUM_PERT:-1}
 
-# Optimizer configuration (default: ZO/ZO for dimension-free like DeComFL)
-CLIENT_OPTIMIZER=${CLIENT_OPTIMIZER:-fo}
-SERVER_OPTIMIZER=${SERVER_OPTIMIZER:-fo}
+# Split layer configuration (for OPT/GPT-2 models)
+SPLIT_LAYER=${SPLIT_LAYER:-0}  # Layer index where to split the model (default: 3)
+
+# Optimizer configuration (default: FO/FO for full-param fine-tuning)
+# Clear any existing environment variables to ensure defaults take precedence
+unset CLIENT_OPTIMIZER SERVER_OPTIMIZER
+CLIENT_OPTIMIZER=${CLIENT_OPTIMIZER:-zo}
+SERVER_OPTIMIZER=${SERVER_OPTIMIZER:-zo}
 OPTIMIZER=${OPTIMIZER:-sgd}
 
 # Set trainer based on optimizer (zo if either is zo, else regular)
@@ -91,13 +98,22 @@ else
     TRAINER=regular
 fi
 
+# Debug output
+echo "Optimizer configuration:"
+echo "  CLIENT_OPTIMIZER: $CLIENT_OPTIMIZER"
+echo "  SERVER_OPTIMIZER: $SERVER_OPTIMIZER"
+echo "  TRAINER: $TRAINER"
+
 # Learning rates
 if [ "$MODE" == "lora" ]; then
     LR=${LR:-1e-4}
     ZOO_LR=${ZOO_LR:-5e-5}
+    # ZOO_LR=${ZOO_LR:-1e-6}
     EPS=${EPS:-5e-3}
 else
     LR=${LR:-1e-3}
+    # LR=${LR:-5e-4}
+    # LR=${LR:-1e-4}
     ZOO_LR=${ZOO_LR:-1e-6}
     EPS=${EPS:-1e-3}
 fi
@@ -128,8 +144,51 @@ fi
 
 TASK_ARGS=""
 case $TASK in
-    CB) # It has <1000 training examples. Only use 100 for dev
-        DEV=100
+    BoolQ)
+        TRAIN=${TRAIN:-9427}    # Full training set: 9,427 examples
+        if [ "$MODE" == "lora" ]; then
+            STEPS=${STEPS:-500}
+        else
+            STEPS=${STEPS:-1500}
+        fi
+        ;;
+    RTE)
+        TRAIN=${TRAIN:-2490}    # Full training set: 2,490 examples
+        STEPS=${STEPS:-1500}
+        ;;
+    CB) # Small dataset - validation only has 56 examples
+        TRAIN=${TRAIN:-250}     # Full training set: 250 examples
+        DEV=0                   # Dont carve dev from train; eval uses validation set
+        STEPS=${STEPS:-1000}
+        ;;
+    WIC)
+        TRAIN=${TRAIN:-5428}    # Full training set: 5,428 examples
+        if [ "$MODE" == "lora" ]; then
+            STEPS=${STEPS:-2000}
+        else
+            STEPS=${STEPS:-2000}
+        fi
+        ;;
+    WSC)
+        TRAIN=${TRAIN:-554}     # Full training set: 554 examples
+        if [ "$MODE" == "lora" ]; then
+            STEPS=${STEPS:-3000}
+        else
+            STEPS=${STEPS:-1000}
+        fi
+        ;;
+    SST2)
+        TRAIN=${TRAIN:-67349}   # Full training set: 67,349 examples
+        if [ "$MODE" == "lora" ]; then
+            STEPS=${STEPS:-2000}
+        else
+            STEPS=${STEPS:-3000}
+        fi
+        ;;
+    *)
+        # Default for unknown tasks
+        TRAIN=${TRAIN:-1000}
+        STEPS=${STEPS:-1000}
         ;;
 esac
 
@@ -163,10 +222,13 @@ echo "Trainer:     $TRAINER"
 echo ""
 echo "Client:      $CLIENT_OPTIMIZER (LR=$CLIENT_LR)"
 echo "Server:      $SERVER_OPTIMIZER (LR=$SERVER_LR)"
+echo "Number of Training Examples: $TRAIN"
+echo "Number of Evaluation Examples: $EVAL"
 echo "ZO Variant:  $ZO_VARIANT"
 echo "ZO Pert:     $ZO_PERTURBATION"
 echo "ZO Epsilon:  $EPS"
 echo "Num Pert:    $NUM_PERT"
+echo "Split Layer: $SPLIT_LAYER"
 echo "Extra args:  $EXTRA_ARGS $TASK_ARGS"
 echo "=========================================="
 
@@ -223,18 +285,23 @@ srun --nodes=1 --ntasks=1 -w $SERVER_NODE \
     bash -c "
         source ~/miniconda3/etc/profile.d/conda.sh
         conda activate mezo
-        export CUDA_VISIBLE_DEVICES=0
+        # Multi-GPU for split learning: use device_map for model sharding (large models)
+        # All GPUs visible to single process - model distributed via device_map='auto'
         export WANDB_MODE=disabled
+        # Help with CUDA memory fragmentation for FO training
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         spack unload cuda 2>/dev/null || true
         spack load /jmc4bek
         export CUDA_HOME=\$(spack location -i /jmc4bek)
         
-        echo '[SERVER] Loading model on '\$(hostname)' at '\$(date)'...'
+        echo '[SERVER] Loading model on '\$(hostname)' with '\$(nvidia-smi -L | wc -l)' GPUs at '\$(date)'...'
         echo '[SERVER] Will listen on 0.0.0.0:$PORT once model loaded'
         
         # Force unbuffered Python output and redirect stderr to stdout
         export PYTHONUNBUFFERED=1
         
+        # Note: For split learning, we use single-process multi-GPU via device_map
+        # accelerate launch with multiple processes won't work due to TCP connection model
         python -u run_distributed.py \
             --role server \
             --host 0.0.0.0 \
@@ -243,8 +310,10 @@ srun --nodes=1 --ntasks=1 -w $SERVER_NODE \
             --backend tcp \
             --model_name $MODEL \
             --task_name $TASK \
+            --split_layer $SPLIT_LAYER \
             --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
             --max_steps $STEPS \
+            --sgd_momentum $MOMENTUM \
             --trainer $TRAINER --client_optimizer $CLIENT_OPTIMIZER --server_optimizer $SERVER_OPTIMIZER \
             --learning_rate $LR --client_learning_rate $CLIENT_LR --server_learning_rate $SERVER_LR \
             --zo_variant $ZO_VARIANT --zo_perturbation $ZO_PERTURBATION --num_pert $NUM_PERT \
@@ -293,8 +362,11 @@ srun --nodes=1 --ntasks=1 -w $CLIENT_NODE \
     bash -c "
         source ~/miniconda3/etc/profile.d/conda.sh
         conda activate mezo
-        export CUDA_VISIBLE_DEVICES=0
+        # Multi-GPU for split learning: use device_map for model sharding (large models)
+        # All GPUs visible to single process - model distributed via device_map='auto'
         export WANDB_MODE=disabled
+        # Help with CUDA memory fragmentation for FO training
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         spack unload cuda 2>/dev/null || true
         spack load /jmc4bek
         export CUDA_HOME=\$(spack location -i /jmc4bek)
@@ -305,6 +377,8 @@ srun --nodes=1 --ntasks=1 -w $CLIENT_NODE \
         # Force unbuffered Python output
         export PYTHONUNBUFFERED=1
         
+        # Note: For split learning, we use single-process multi-GPU via device_map
+        # accelerate launch with multiple processes won't work due to TCP connection model
         python -u run_distributed.py \
             --role client \
             --server_host $SERVER_IP \
@@ -313,6 +387,8 @@ srun --nodes=1 --ntasks=1 -w $CLIENT_NODE \
             --backend tcp \
             --model_name $MODEL \
             --task_name $TASK \
+            --sgd_momentum $MOMENTUM \
+            --split_layer $SPLIT_LAYER \
             --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
             --max_steps $STEPS \
             --trainer $TRAINER --client_optimizer $CLIENT_OPTIMIZER --server_optimizer $SERVER_OPTIMIZER \

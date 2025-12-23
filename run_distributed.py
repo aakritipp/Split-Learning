@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """
-Distributed Split Learning with MeZO - DeComFL-style Implementation
+Distributed split learning implementation with TCP-based communication.
 
-This is a simplified multi-machine split learning implementation that:
-1. Follows the DeComFL pattern (single entry point, role-based execution)
-2. Reuses trainer.py logic for ZO optimization
-3. Minimizes code duplication
-4. Maintains all run.py functionality
+This module enables true split learning where client and server run as separate
+processes on different machines. It provides a single entry point that can run
+as either client or server based on the --role argument.
 
-Usage:
-    # Server (machine 1):
-    python run_distributed.py --role server --host 0.0.0.0 --port 50051 \
-        --model_name facebook/opt-125m --task_name SST2 --trainer zo
-
-    # Client (machine 2):
-    python run_distributed.py --role client --server_host <server_ip> --port 50051 \
-        --model_name facebook/opt-125m --task_name SST2 --trainer zo \
-        --num_train 1000 --max_steps 500 --learning_rate 1e-4
+Key components:
+- DistributedClient: Client-side model and training logic
+- DistributedServer: Server-side model and training logic
+- GPUMemoryTracker: Tracks GPU memory usage across training
+- TCP backend for inter-machine communication
 """
-
 import logging
 import os
 import sys
@@ -161,7 +154,7 @@ class DistributedArguments(TrainingArguments):
     Arguments for distributed split learning.
     Extends TrainingArguments to maintain compatibility with run.py
     """
-    # Role selection (DeComFL-style single entry point)
+    # Role selection
     role: str = "client"  # "client" or "server"
     
     # Network settings
@@ -1743,7 +1736,7 @@ class DistributedClient:
 
 
 # =============================================================================
-# MAIN ENTRY POINT (DeComFL-style)
+# MAIN ENTRY POINT
 # =============================================================================
 
 def parse_args():
@@ -1846,7 +1839,7 @@ def main():
             client_params = sum(p.numel() for p in client.client_model.parameters())
             trainable_params = sum(p.numel() for p in client.client_model.parameters() if p.requires_grad)
             
-            # Add communication cost metrics (DeComFL-style)
+            # Add communication cost metrics
             if hasattr(client.backend, 'comm_stats'):
                 comm_summary = client.backend.comm_stats.get_summary(
                     model_params=client_params,

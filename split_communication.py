@@ -1,17 +1,17 @@
-# ------------------------------------------------------------------------------------------
-# Serialization Helpers for Split Learning
-#
-# This module provides infrastructure for true split deployment where client and server
-# run as independent processes/machines. It includes:
-# 1. Dataclasses for structured payloads at the split boundary
-# 2. Serialization/deserialization functions using torch.save/torch.load
-# 3. Abstract communication backend interface for future implementations
-#
-# Usage:
-#   - Current simulation mode: No changes needed, existing code works as-is
-#   - Future deployment: Use payloads and serialize/deserialize for network transfer
-# ------------------------------------------------------------------------------------------
+"""
+Communication utilities for split learning.
 
+This module provides dataclasses and serialization functions for exchanging
+payloads between client and server in a split learning setup. It defines
+the protocol for forward/backward communication and ZO metadata exchange.
+
+Key components:
+- ForwardPayload: Client-to-server activations and metadata
+- BackwardPayload: Server-to-client gradients or loss values
+- ZOMetadata: Perturbation seeds and scaling for ZO optimization
+- CommunicationStats: Track communication costs
+- LocalBackend: In-memory simulation for testing
+"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Any, Union
@@ -123,7 +123,7 @@ class BackwardPayload:
 @dataclass
 class ZOMetadata:
     """
-    Metadata for zeroth-order (MeZO) optimization coordination.
+    Metadata for zeroth-order optimization coordination.
     
     This contains all the information needed for client and server to
     coordinate their perturbations in ZO mode.
@@ -340,23 +340,18 @@ def format_payload_size(size_bytes: int) -> str:
 
 
 # =============================================================================
-# Communication Cost Tracker (DeComFL-style)
+# Communication Cost Tracker
 # =============================================================================
 
 @dataclass
 class CommunicationStats:
     """
-    Track communication costs similar to DeComFL paper.
-    
-    DeComFL reduces communication from O(d) to O(1) by transmitting only
-    scalar values and seeds instead of full model parameters/gradients.
+    Track communication costs for split learning.
     
     This tracker measures actual bytes transferred to compare with:
     1. Traditional FL: O(d) - full model/gradient transmission
     2. Split Learning: O(activation_size) - intermediate activations
-    3. DeComFL-style ZO: O(1) - only scalars and seeds
-    
-    Reference: https://github.com/ZidongLiu/DeComFL
+    3. ZO with seeds: O(1) - only scalars and seeds
     """
     # Per-round statistics
     bytes_sent_per_round: List[int] = field(default_factory=list)
@@ -426,13 +421,13 @@ class CommunicationStats:
         per_round_cost = 2 * model_params * dtype_bytes  # Both directions
         return per_round_cost * self.num_rounds
     
-    def compute_decomfl_theoretical_cost(self, num_perturbations: int = 1,
-                                          scalar_bytes: int = 4,
-                                          seed_bytes: int = 8) -> int:
+    def compute_zo_theoretical_cost(self, num_perturbations: int = 1,
+                                      scalar_bytes: int = 4,
+                                      seed_bytes: int = 8) -> int:
         """
-        Compute theoretical DeComFL communication cost.
+        Compute theoretical ZO communication cost (scalar + seed only).
         
-        DeComFL transmits only:
+        Transmits only:
         - Client -> Server: P scalar values (projected gradients)
         - Server -> Client: Random seed
         
@@ -442,7 +437,7 @@ class CommunicationStats:
             seed_bytes: Bytes for random seed
             
         Returns:
-            Total theoretical bytes in DeComFL
+            Total theoretical bytes
         """
         per_round_cost = num_perturbations * scalar_bytes + seed_bytes
         return per_round_cost * self.num_rounds
@@ -482,7 +477,7 @@ class CommunicationStats:
         # Add comparisons if model_params provided
         if model_params > 0:
             traditional_fl_cost = self.compute_traditional_fl_cost(model_params)
-            decomfl_theoretical = self.compute_decomfl_theoretical_cost(num_perturbations)
+            zo_theoretical = self.compute_zo_theoretical_cost(num_perturbations)
             
             summary.update({
                 # Traditional FL comparison
@@ -491,9 +486,9 @@ class CommunicationStats:
                 "savings_vs_traditional_fl": 1 - (self.total_bytes / traditional_fl_cost) if traditional_fl_cost > 0 else 0,
                 "compression_ratio_vs_fl": traditional_fl_cost / self.total_bytes if self.total_bytes > 0 else 0,
                 
-                # DeComFL theoretical comparison
-                "decomfl_theoretical_bytes": decomfl_theoretical,
-                "decomfl_theoretical_formatted": format_payload_size(decomfl_theoretical),
+                # ZO theoretical comparison
+                "zo_theoretical_bytes": zo_theoretical,
+                "zo_theoretical_formatted": format_payload_size(zo_theoretical),
             })
         
         return summary
@@ -503,7 +498,7 @@ class CommunicationStats:
         summary = self.get_summary(model_params, num_perturbations)
         
         print("\n" + "=" * 60)
-        print("COMMUNICATION COST SUMMARY (DeComFL-style)")
+        print("COMMUNICATION COST SUMMARY")
         print("=" * 60)
         print(f"Total Communication Rounds:  {summary['num_communication_rounds']}")
         print(f"Total Bytes Transferred:     {summary['total_bytes_formatted']}")
@@ -524,6 +519,6 @@ class CommunicationStats:
             print(f"  Savings:                   {summary['savings_vs_traditional_fl']*100:.2f}%")
             print(f"  Compression Ratio:         {summary['compression_ratio_vs_fl']:.2f}x")
             print("-" * 60)
-            print(f"DeComFL Theoretical (pure):  {summary['decomfl_theoretical_formatted']}")
+            print(f"ZO Theoretical (pure):       {summary['zo_theoretical_formatted']}")
         print("=" * 60)
 

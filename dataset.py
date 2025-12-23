@@ -1,3 +1,15 @@
+"""
+Dataset classes for various NLP tasks.
+
+This module provides dataset loading and processing classes for classification
+and multiple-choice tasks. Each dataset class handles loading from HuggingFace
+datasets, sampling train/dev/test sets, and building samples.
+
+Key components:
+- Dataset: Base class with common sampling and loading logic
+- SST2Dataset, BoolQDataset, CBDataset, etc.: Task-specific implementations
+- Sample: Dataclass representing a single example with candidates
+"""
 from prompt import *
 from utils import temp_seed
 import json

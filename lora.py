@@ -1,7 +1,17 @@
-#  ------------------------------------------------------------------------------------------
-#  Copyright (c) Microsoft Corporation. All rights reserved.
-#  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
-#  ------------------------------------------------------------------------------------------
+"""
+LoRA (Low-Rank Adaptation) implementation for efficient fine-tuning.
+
+This module provides LoRA layers that can be applied to linear and embedding
+layers in transformer models. LoRA adds trainable low-rank matrices to frozen
+pretrained weights, enabling efficient fine-tuning with fewer parameters.
+
+Key components:
+- LoRALayer: Base class with LoRA hyperparameters
+- Linear: LoRA-enabled linear layer
+- Embedding: LoRA-enabled embedding layer
+- MergedLinear: LoRA for merged Q/K/V projections
+- apply_lora_opt: Utility to apply LoRA to OPT models
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -307,8 +317,6 @@ class Conv2d(ConvLoRA):
 class Conv1d(ConvLoRA):
     def __init__(self, *args, **kwargs):
         super(Conv1d, self).__init__(nn.Conv1d, *args, **kwargs)
-
-# Can Extend to other ones like this
 
 class Conv3d(ConvLoRA):
     def __init__(self, *args, **kwargs):

@@ -1,32 +1,16 @@
-#  ------------------------------------------------------------------------------------------
-#  Copyright (c) 2024, FDU
-#  All rights reserved.
-#  
-#  OPT Split Learning Implementation (GPT2-style architecture)
-#  
-#  This file implements OPT using the same pattern as GPT2 in splitmodel.py:
-#  - Custom attention with built-in causal mask
-#  - Custom blocks with LoRA support
-#  - Dynamic split layer configuration
-#  ------------------------------------------------------------------------------------------
 """
-OPT Split Learning Implementation (GPT2-style)
+Split learning model implementation for OPT architecture (GPT-2 style).
 
-This implementation mirrors the GPT2 split model architecture:
-1. Custom OPTAttention with built-in causal mask (no external mask preparation needed)
-2. Custom OPTBlock with LayerNorm and residual connections
-3. Dynamic split layer support
-4. Independent client/server modules for true split learning
+This module provides a custom OPT implementation optimized for split learning,
+with built-in causal masking and LoRA support. Unlike splitmodel.py which uses
+HuggingFace OPT backend, this provides full control over the architecture.
 
-Architecture:
-- Client: Embeddings + first N layers (configurable via split_layer)
-- Server: Remaining layers + LM head
-
-Communication Protocol:
-- Forward: Client -> Server: (hidden_states, presents)
-- Backward: Server -> Client: (grad_hidden_states,)
+Key components:
+- OPTAttention: Custom attention with built-in causal mask
+- OPTModel_Client/Server: Split OPT components
+- SplitOPT: Combined split OPT model
+- Weight loading from HuggingFace pretrained models
 """
-
 import logging
 import math
 import copy
@@ -873,14 +857,14 @@ def verify_split_correctness(client_module, server_module):
 
 class SplitOPT(nn.Module):
     """
-    True Split OPT model for split learning with MeZO support.
+    True Split OPT model for split learning with ZO support.
     
     Architecture (GPT2-style implementation):
     - Client: Embeddings + first N layers (configurable)
     - Server: Remaining layers + LM head
     
     Key Features:
-    1. Custom attention with built-in causal mask (no _prepare_decoder_attention_mask needed!)
+    1. Custom attention with built-in causal mask
     2. LoRA support on Q and V projections
     3. Dynamic split layer configuration
     4. Client and Server are truly INDEPENDENT
@@ -888,16 +872,6 @@ class SplitOPT(nn.Module):
     Args:
         config: OPTConfig object (or create from pretrained)
         split_layer: Layer index where to split (default: 3)
-        
-    Examples:
-        # From config
-        config = OPTConfig(num_hidden_layers=12, hidden_size=768)
-        model = SplitOPT(config, split_layer=3)
-        
-        # From pretrained (load weights separately)
-        config = OPTConfig.from_pretrained("facebook/opt-125m")
-        model = SplitOPT(config, split_layer=3)
-        model.load_weight("facebook/opt-125m")
     """
     
     def __init__(self, config, split_layer: int = 3):
