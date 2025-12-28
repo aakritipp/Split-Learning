@@ -100,7 +100,7 @@ def prepare_inputs_for_generation(
 
 class PrefixTuning:
 
-    def __init__(self, model, num_prefix, reparam=True, embed_dim=512, mid_dim=512, float16=False, init_by_real_act=False):
+    def __init__(self, model, num_prefix, reparam=True, embed_dim=None, mid_dim=None, float16=False, init_by_real_act=False):
         """
         Initialize prefix tuning for a model.
         
@@ -121,8 +121,8 @@ class PrefixTuning:
 
         # Reparameterization 
         self.reparam = reparam
-        self.embed_dim = embed_dim
-        self.mid_dim = mid_dim
+        self.embed_dim = embed_dim if embed_dim is not None else self.hidden_dim
+        self.mid_dim = mid_dim if mid_dim is not None else self.hidden_dim
 
         input_embeds = None # For reparameterization
         mtype = getattr(model.config, "model_type", None)

@@ -356,6 +356,8 @@ class OPTConfig:
         attention_dropout=0.0,
         activation_function="relu",
         layer_norm_epsilon=1e-5,
+        # Embedding projection (for OPT-350M+)
+        word_embed_proj_dim=None,  # If None, defaults to hidden_size
         # LoRA parameters
         lora_attn_dim=0,
         lora_attn_alpha=128,
@@ -375,6 +377,9 @@ class OPTConfig:
         self.attention_dropout = attention_dropout
         self.activation_function = activation_function
         self.layer_norm_epsilon = layer_norm_epsilon
+        
+        # Embedding projection dimension (OPT-350M+ uses different dim for embeddings)
+        self.word_embed_proj_dim = word_embed_proj_dim if word_embed_proj_dim is not None else hidden_size
         
         # LoRA
         self.lora_attn_dim = lora_attn_dim
@@ -414,6 +419,10 @@ class OPTConfig:
         """Create config from HuggingFace model"""
         from transformers import AutoConfig
         hf_config = AutoConfig.from_pretrained(model_name)
+        
+        # Get word_embed_proj_dim (differs from hidden_size for OPT-350M+)
+        word_embed_proj_dim = getattr(hf_config, 'word_embed_proj_dim', hf_config.hidden_size)
+        
         return cls(
             vocab_size=hf_config.vocab_size,
             max_position_embeddings=hf_config.max_position_embeddings,
@@ -425,6 +434,7 @@ class OPTConfig:
             attention_dropout=getattr(hf_config, 'attention_dropout', 0.0),
             activation_function=getattr(hf_config, 'activation_function', 'relu'),
             layer_norm_epsilon=1e-5,  # OPT uses 1e-5
+            word_embed_proj_dim=word_embed_proj_dim,
             pad_token_id=getattr(hf_config, 'pad_token_id', 1),
             bos_token_id=getattr(hf_config, 'bos_token_id', 2),
             eos_token_id=getattr(hf_config, 'eos_token_id', 2),
@@ -451,10 +461,19 @@ class OPTModel_Client(nn.Module):
         assert 0 <= split_layer <= config.num_hidden_layers, \
             f"split_layer must be between 0 and {config.num_hidden_layers}"
         
-        # Embeddings
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        # Get embedding dimension (may differ from hidden_size for OPT-350M+)
+        embed_dim = getattr(config, 'word_embed_proj_dim', config.hidden_size)
+        
+        # Embeddings use word_embed_proj_dim
+        self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, padding_idx=config.pad_token_id)
         # OPT uses offset=2 for position embeddings, so size is max_position_embeddings + 2
         self.embed_positions = nn.Embedding(config.max_position_embeddings + 2, config.hidden_size)
+        
+        # Projection layer (only for OPT-350M+ where word_embed_proj_dim != hidden_size)
+        if embed_dim != config.hidden_size:
+            self.project_in = nn.Linear(embed_dim, config.hidden_size, bias=False)
+        else:
+            self.project_in = None
         
         # Dropout
         self.dropout = nn.Dropout(config.dropout)
@@ -529,6 +548,11 @@ class OPTModel_Client(nn.Module):
         
         # Embeddings
         inputs_embeds = self.embed_tokens(input_ids)
+        
+        # Project token embeddings if needed (OPT-350M+ has different embed dim)
+        if self.project_in is not None:
+            inputs_embeds = self.project_in(inputs_embeds)
+        
         position_embeds = self.embed_positions(position_ids)
         hidden_states = inputs_embeds + position_embeds
         hidden_states = self.dropout(hidden_states)
@@ -560,8 +584,17 @@ class OPTModel_Server(nn.Module):
         
         server_layers = config.num_hidden_layers - split_layer
         
-        # For weight tying with LM head
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        # Get embedding dimension (may differ from hidden_size for OPT-350M+)
+        embed_dim = getattr(config, 'word_embed_proj_dim', config.hidden_size)
+        
+        # For weight tying with LM head (uses word_embed_proj_dim)
+        self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, padding_idx=config.pad_token_id)
+        
+        # Projection layer for LM head output (only for OPT-350M+)
+        if embed_dim != config.hidden_size:
+            self.project_out = nn.Linear(config.hidden_size, embed_dim, bias=False)
+        else:
+            self.project_out = None
         
         # Server layers
         if server_layers > 0:
@@ -740,6 +773,10 @@ class OPTLMModel_Server(nn.Module):
         hidden_states, presents = self.transformer_Server(
             hidden_states_client, presents_client, input_ids_shape, attention_mask=attention_mask
         )
+        
+        # Project out before LM head (for OPT-350M+ where word_embed_proj_dim != hidden_size)
+        if self.transformer_Server.project_out is not None:
+            hidden_states = self.transformer_Server.project_out(hidden_states)
         
         # LM head
         lm_logits = self.lm_head(hidden_states)
@@ -1060,6 +1097,16 @@ class SplitOPT(nn.Module):
             elif new_key.startswith("embed_positions."):
                 client_key = f"transformer_Client.{new_key}"
                 client_state_dict[client_key] = value.clone()
+            
+            # project_in goes to client (for OPT-350M+)
+            elif new_key.startswith("project_in."):
+                client_key = f"transformer_Client.{new_key}"
+                client_state_dict[client_key] = value.clone()
+            
+            # project_out goes to server (for OPT-350M+)
+            elif new_key.startswith("project_out."):
+                server_key = f"transformer_Server.{new_key}"
+                server_state_dict[server_key] = value.clone()
             
             # Final layer norm goes to server
             elif new_key.startswith("final_layer_norm."):

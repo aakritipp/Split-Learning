@@ -19,6 +19,7 @@ from io import BytesIO
 
 import grpc
 import torch
+from torch import device as torch_device
 
 from split_communication import (
     CommunicationBackend,
@@ -47,7 +48,7 @@ class SplitLearningServicer:
     the server portion of the model.
     """
     
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, device: torch_device = torch_device("cuda")):
         self.device = device
         self._forward_handler: Optional[Callable] = None
         self._train_handler: Optional[Callable] = None

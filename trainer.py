@@ -549,7 +549,7 @@ class OurTrainer(Trainer):
         """
         perturbation_type = getattr(self.args, 'zo_perturbation', 'coordinate')
         
-        if perturbation_type == "layer":
+        if perturbation_type == "coordinate":
             # Layer-wise: generate random direction, then normalize to unit norm
             z = torch.normal(mean=0, std=1, size=param.data.size(), 
                            device=param.data.device, dtype=param.data.dtype)
@@ -564,6 +564,12 @@ class OurTrainer(Trainer):
             # Coordinate-wise (default): each element gets independent N(0,1)
             z = torch.normal(mean=0, std=1, size=param.data.size(), 
                            device=param.data.device, dtype=param.data.dtype)
+            z_norm = z.norm()
+            if z_norm > 0:
+                z = z / z_norm
+            # Scale by sqrt(numel) to maintain similar magnitude to coordinate-wise
+            # This ensures the expected perturbation magnitude is comparable
+            z = z * (param.numel() ** 0.5)
         
         return z
 
@@ -824,6 +830,10 @@ class OurTrainer(Trainer):
         - num_pert=1: Single perturbation
         - num_pert>1: Average gradient estimates over K perturbations
         
+        IMPORTANT: All gradient estimates are computed at the SAME base point θ₀,
+        then accumulated and applied as a single update. This is essential for
+        proper variance reduction.
+        
         Two gradient estimation variants (controlled by --zo_variant):
         
         1. Central (default, --zo_variant="central"):
@@ -854,17 +864,30 @@ class OurTrainer(Trainer):
         # Generate seeds for all perturbations
         seeds = self.generate_multiple_seeds(num_pert)
         
+        # Initialize accumulated gradients for client and server
+        accumulated_client_grads = {}
+        accumulated_server_grads = {}
+        for name, param in inner_model.client.named_parameters():
+            if param.requires_grad:
+                accumulated_client_grads[name] = torch.zeros_like(param.data)
+        for name, param in inner_model.server.named_parameters():
+            if param.requires_grad:
+                accumulated_server_grads[name] = torch.zeros_like(param.data)
+        
+        loss_for_log = None
+        delta_loss = 0.0
+        
         if zo_variant == "forward":
             # ============ RGE-FORWARD with multiple perturbations ============
-            # Compute baseline loss once
+            # Compute baseline loss once at θ₀
             loss0 = self.zo_forward(model, inputs)
             loss_for_log = loss0
             
-            # For each perturbation, compute gradient and update
+            # For each perturbation, compute gradient estimate and ACCUMULATE
             for k, seed in enumerate(seeds):
                 self.zo_random_seed = seed
                 
-                # Perturb +ε
+                # Perturb +ε from θ₀
                 model.train()
                 if use_continuous_rng:
                     rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
@@ -875,7 +898,7 @@ class OurTrainer(Trainer):
                 
                 loss1 = self.zo_forward(model, inputs)
                 
-                # Restore parameters
+                # Restore parameters back to θ₀
                 model.train()
                 if use_continuous_rng:
                     rng_state = self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-1)
@@ -1096,43 +1119,52 @@ class OurTrainer(Trainer):
         - Client ZO uses self.client_lr (typically larger, e.g., 1e-3)
         - Server FO uses self.server_lr via optimizer (typically smaller, e.g., 5e-5)
         """
-        self.generate_shared_perturbation_seed()
+        num_pert = getattr(self.args, 'num_pert', 1)
+        seeds = self.generate_multiple_seeds(num_pert)
         
-        # ============ PHASE 1: POSITIVE PERTURBATION ============
-        model.train()
-        self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=1)
-
-        # Forward pass with gradient tracking for server
         inputs = self._prepare_inputs(inputs)
-        with self.compute_loss_context_manager():
-            loss1 = self.compute_loss(model, inputs)
-
-        if self.args.n_gpu > 1:
-            loss1 = loss1.mean()
-        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            loss1_scaled = loss1 / self.args.gradient_accumulation_steps
-        else:
-            loss1_scaled = loss1
+        loss_for_log = None
+        
+        for k, seed in enumerate(seeds):
+            self.zo_random_seed = seed
             
-        # Backward to compute server gradients (stored in .grad, but DON'T update yet!)
-        self.accelerator.backward(loss1_scaled)
+            # ============ PHASE 1: POSITIVE PERTURBATION ============
+            model.train()
+            self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
 
-        # ============ PHASE 2: NEGATIVE PERTURBATION ============
-        # Perturb client to negative direction (server weights unchanged!)
-        model.train()
-        self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=-2)
-        loss2 = self.zo_forward(model, inputs)
-        
-        # ============ PHASE 3: RESTORE & UPDATE ============
-        # Restore client parameters
-        model.train()
-        self.zo_perturb_module(inner_model.client, "client", self.zo_random_seed, scaling_factor=1)
+            # Forward pass with gradient tracking for server
+            with self.compute_loss_context_manager():
+                loss1 = self.compute_loss(model, inputs)
 
-        # Update client using ZO gradient estimate with CLIENT learning rate
-        projected_grad = (loss1.detach() - loss2) / (2 * self.args.zo_eps)
-        self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
+            if self.args.n_gpu > 1:
+                loss1 = loss1.mean()
+            
+            if loss_for_log is None:
+                loss_for_log = loss1.detach()
+            
+            # Scale loss for gradient accumulation across perturbations
+            loss1_scaled = loss1 / num_pert
+            if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                loss1_scaled = loss1_scaled / self.args.gradient_accumulation_steps
+                
+            # Backward to accumulate server gradients (stored in .grad)
+            self.accelerator.backward(loss1_scaled)
+
+            # ============ PHASE 2: NEGATIVE PERTURBATION ============
+            model.train()
+            self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=-2)
+            loss2 = self.zo_forward(model, inputs)
+            
+            # ============ PHASE 3: RESTORE & UPDATE CLIENT ============
+            model.train()
+            self.zo_perturb_module(inner_model.client, "client", seed, scaling_factor=1)
+
+            # Update client using ZO gradient estimate scaled by 1/num_pert
+            projected_grad = (loss1.detach() - loss2) / (2 * self.args.zo_eps * num_pert)
+            self.zo_update_module(inner_model.client, "client", projected_grad, lr=self.client_lr)
         
-        # Now update server using stored gradients from backward pass (uses server_lr via optimizer)
+        # ============ PHASE 4: UPDATE SERVER ============
+        # Server gradients have been accumulated across all perturbations (scaled by 1/num_pert)
         if self.server_optimizer_obj:
             self.server_optimizer_obj.step()
             self.server_optimizer_obj.zero_grad()
@@ -1141,14 +1173,13 @@ class OurTrainer(Trainer):
         if hasattr(self, 'state') and self.state.global_step % 100 == 0:
             logger.info(
                 f"[ZO/FO Hybrid] Step {self.state.global_step}: "
-                f"loss1={loss1.item():.4f}, loss2={loss2:.4f}, "
-                f"Δloss={loss1.item()-loss2:.6f}, client_projected_grad={projected_grad:.6f}, "
-                f"client_lr={self.client_lr:.2e}, server_lr={self.server_lr:.2e}, seed={self.zo_random_seed}"
+                f"num_pert={num_pert}, loss={loss_for_log:.4f}, "
+                f"client_lr={self.client_lr:.2e}, server_lr={self.server_lr:.2e}"
             )
 
         self.lr_scheduler.step()
 
-        return loss1.detach()
+        return loss_for_log
 
     def _fo_zo_step(self, model, inputs, inner_model):
         """
@@ -1171,31 +1202,40 @@ class OurTrainer(Trainer):
         Note: This mode requires careful handling of the split point gradients.
         The client backward happens after server ZO update to reflect the new server state.
         """
-        self.generate_shared_perturbation_seed()
+        num_pert = getattr(self.args, 'num_pert', 1)
+        seeds = self.generate_multiple_seeds(num_pert)
         
-        # ============ PHASE 1: POSITIVE PERTURBATION ============
-        model.train()
-        self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=1)
-
-        # Forward pass (inference mode for ZO)
-        loss1 = self.zo_forward(model, inputs)
-
-        # ============ PHASE 2: NEGATIVE PERTURBATION ============
-        model.train()
-        self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=-2)
-        loss2 = self.zo_forward(model, inputs)
+        loss_for_log = None
         
-        # ============ PHASE 3: RESTORE & UPDATE SERVER ============
-        model.train()
-        self.zo_perturb_module(inner_model.server, "server", self.zo_random_seed, scaling_factor=1)
+        for k, seed in enumerate(seeds):
+            self.zo_random_seed = seed
+            
+            # ============ PHASE 1: POSITIVE PERTURBATION ============
+            model.train()
+            self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=1)
 
-        # Update server using ZO gradient estimate with SERVER learning rate
-        projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps)
-        self.zo_update_module(inner_model.server, "server", projected_grad, lr=self.server_lr)
+            # Forward pass (inference mode for ZO)
+            loss1 = self.zo_forward(model, inputs)
+            
+            if loss_for_log is None:
+                loss_for_log = loss1
+
+            # ============ PHASE 2: NEGATIVE PERTURBATION ============
+            model.train()
+            self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=-2)
+            loss2 = self.zo_forward(model, inputs)
+            
+            # ============ PHASE 3: RESTORE & UPDATE SERVER ============
+            model.train()
+            self.zo_perturb_module(inner_model.server, "server", seed, scaling_factor=1)
+
+            # Update server using ZO gradient estimate scaled by 1/num_pert
+            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * num_pert)
+            self.zo_update_module(inner_model.server, "server", projected_grad, lr=self.server_lr)
         
         # ============ PHASE 4: CLIENT FO UPDATE ============
         # Now do a forward+backward pass for client FO update
-        # This uses the updated server parameters
+        # This uses the updated server parameters (after all ZO updates)
         inputs = self._prepare_inputs(inputs)
         with self.compute_loss_context_manager():
             loss_fo = self.compute_loss(model, inputs)
@@ -1227,15 +1267,14 @@ class OurTrainer(Trainer):
         if hasattr(self, 'state') and self.state.global_step % 100 == 0:
             logger.info(
                 f"[FO/ZO Hybrid] Step {self.state.global_step}: "
-                f"loss1={loss1:.4f}, loss2={loss2:.4f}, "
-                f"Δloss={loss1-loss2:.6f}, server_projected_grad={projected_grad:.6f}, "
+                f"num_pert={num_pert}, loss={loss_for_log:.4f}, "
                 f"fo_loss={loss_fo.item():.4f}, client_lr={self.client_lr:.2e}, "
-                f"server_lr={self.server_lr:.2e}, seed={self.zo_random_seed}"
+                f"server_lr={self.server_lr:.2e}"
             )
 
         self.lr_scheduler.step()
 
-        return loss1
+        return loss_for_log
 
 
     ################ Verification utilities ################

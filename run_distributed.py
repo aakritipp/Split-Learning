@@ -17,6 +17,7 @@ import os
 import sys
 import argparse
 import torch
+from torch import device as torch_device
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
@@ -137,7 +138,7 @@ from OPT_splitmodel import SplitOPT, OPTConfig, OPTLMModel_Client, OPTLMModel_Se
 from utils import apply_lora_to_opt, mark_only_lora_as_trainable
 from dataset import get_task
 from utils import encode_prompt, DataCollatorWithPaddingAndNesting, Prediction
-from metrics import calculate_metric
+from metrics import calculate_metric, print_confusion_matrix
 
 
 def set_seed(seed: int):
@@ -162,7 +163,7 @@ class DistributedArguments(TrainingArguments):
     host: str = "0.0.0.0"
     port: int = 50051
     backend: str = "tcp"
-    device: str = "cuda"
+    device: torch_device = torch_device("cuda")
     
     # Model settings (matching run.py OurArguments)
     model_name: str = "facebook/opt-125m"
@@ -195,7 +196,7 @@ class DistributedArguments(TrainingArguments):
     zo_eps: float = 1e-3
     zo_continuous_rng: bool = False
     zo_variant: str = "central"
-    zo_perturbation: str = "coordinate"
+    zo_perturbation: str = "layer"
     num_pert: int = 1
     
     # Optimizer
@@ -1721,6 +1722,12 @@ class DistributedClient:
             )
         
         metrics = {"accuracy": calculate_metric(predictions)}
+        
+        # Print confusion matrix for verification
+        cm_metrics = print_confusion_matrix(predictions, eval_samples)
+        metrics['macro_f1'] = cm_metrics['macro_f1']
+        metrics['weighted_f1'] = cm_metrics['weighted_f1']
+        
         return metrics
     
     def close(self):
