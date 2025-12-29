@@ -137,6 +137,13 @@ class TCPBackend(CommunicationBackend):
             
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEPORT allows multiple processes to bind to the same port (load balancing)
+        # and helps with quick restarts after crashes
+        try:
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            # SO_REUSEPORT not available on all platforms
+            pass
         self._socket.bind((self.host, self.port))
         self._socket.listen(1)
         logger.info(f"Split Learning Server listening on {self.host}:{self.port}")
@@ -168,18 +175,44 @@ class TCPBackend(CommunicationBackend):
         """Re-accept a new client connection (for handling probe connections)."""
         self._accept_client()
         
-    def connect(self):
-        """Connect to server (client mode only)."""
+    def connect(self, max_retries: int = 10, retry_delay: float = 5.0):
+        """Connect to server (client mode only) with retry logic.
+        
+        Args:
+            max_retries: Maximum number of connection attempts
+            retry_delay: Initial delay between retries (doubles each attempt, max 60s)
+        """
         if self.mode != 'client':
             raise RuntimeError("connect() is only for client mode")
-            
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.settimeout(self.timeout)
         
         logger.info(f"Connecting to server at {self.host}:{self.port}...")
-        self._socket.connect((self.host, self.port))
-        self._connected = True
-        logger.info("Connected to server")
+        
+        last_error = None
+        delay = retry_delay
+        
+        for attempt in range(max_retries):
+            try:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._socket.settimeout(self.timeout)
+                self._socket.connect((self.host, self.port))
+                self._connected = True
+                logger.info("Connected to server")
+                return
+            except (ConnectionRefusedError, OSError) as e:
+                last_error = e
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except:
+                        pass
+                    self._socket = None
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 60.0)  # Exponential backoff, max 60s
+        
+        raise ConnectionError(f"Failed to connect to server at {self.host}:{self.port} after {max_retries} attempts: {last_error}")
         
     def _get_socket(self) -> socket.socket:
         """Get the active socket for communication."""

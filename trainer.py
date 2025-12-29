@@ -554,12 +554,12 @@ class OurTrainer(Trainer):
             z = torch.normal(mean=0, std=1, size=param.data.size(), 
                            device=param.data.device, dtype=param.data.dtype)
             # Normalize to unit vector (Frobenius norm for matrices)
-            z_norm = z.norm()
-            if z_norm > 0:
-                z = z / z_norm
-            # Scale by sqrt(numel) to maintain similar magnitude to coordinate-wise
-            # This ensures the expected perturbation magnitude is comparable
-            z = z * (param.numel() ** 0.5)
+            # z_norm = z.norm()
+            # if z_norm > 0:
+            #     z = z / z_norm
+            # # Scale by sqrt(numel) to maintain similar magnitude to coordinate-wise
+            # # This ensures the expected perturbation magnitude is comparable
+            # z = z * (param.numel() ** 0.5)
         else:
             # Coordinate-wise (default): each element gets independent N(0,1)
             z = torch.normal(mean=0, std=1, size=param.data.size(), 

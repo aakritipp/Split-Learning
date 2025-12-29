@@ -138,7 +138,7 @@ from OPT_splitmodel import SplitOPT, OPTConfig, OPTLMModel_Client, OPTLMModel_Se
 from utils import apply_lora_to_opt, mark_only_lora_as_trainable
 from dataset import get_task
 from utils import encode_prompt, DataCollatorWithPaddingAndNesting, Prediction
-from metrics import calculate_metric, print_confusion_matrix
+from metrics import calculate_metric
 
 
 def set_seed(seed: int):
@@ -1724,9 +1724,9 @@ class DistributedClient:
         metrics = {"accuracy": calculate_metric(predictions)}
         
         # Print confusion matrix for verification
-        cm_metrics = print_confusion_matrix(predictions, eval_samples)
-        metrics['macro_f1'] = cm_metrics['macro_f1']
-        metrics['weighted_f1'] = cm_metrics['weighted_f1']
+        # cm_metrics = print_confusion_matrix(predictions, eval_samples)
+        # metrics['macro_f1'] = cm_metrics['macro_f1']
+        # metrics['weighted_f1'] = cm_metrics['weighted_f1']
         
         return metrics
     
