@@ -287,15 +287,22 @@ class OPTBlock(nn.Module):
     """
     OPT Transformer Block.
     
-    Architecture (Pre-LayerNorm):
-    - LayerNorm -> Self-Attention -> Residual
-    - LayerNorm -> FFN -> Residual
+    Architecture depends on do_layer_norm_before:
+    - Pre-LayerNorm (do_layer_norm_before=True, OPT-125M, OPT-1.3B, etc.):
+        LayerNorm -> Self-Attention -> Residual -> LayerNorm -> FFN -> Residual
+    - Post-LayerNorm (do_layer_norm_before=False, OPT-350M):
+        Self-Attention -> Residual -> LayerNorm -> FFN -> Residual -> LayerNorm
     """
     def __init__(self, hidden_size, num_heads, ffn_dim, max_positions, config, scale=True):
         super(OPTBlock, self).__init__()
         
         # Get layer norm epsilon from config (default 1e-5)
         layer_norm_eps = getattr(config, 'layer_norm_epsilon', 1e-5)
+        
+        # Store whether to apply layer norm before or after (Pre-LN vs Post-LN)
+        # OPT-350M uses do_layer_norm_before=False (Post-LN)
+        # OPT-125M, OPT-1.3B, etc. use do_layer_norm_before=True (Pre-LN)
+        self.do_layer_norm_before = getattr(config, 'do_layer_norm_before', True)
         
         self.self_attn_layer_norm = LayerNorm(hidden_size, eps=layer_norm_eps)
         self.self_attn = OPTAttention(hidden_size, num_heads, max_positions, config, scale)
@@ -319,17 +326,33 @@ class OPTBlock(nn.Module):
             hidden_states: Output tensor
             present: Attention cache for generation
         """
-        # Self-attention with residual
+        # ============ Self-Attention Block ============
         residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
+        
+        # Pre-LN: apply layer norm BEFORE attention (OPT-125M, OPT-1.3B, etc.)
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+        
         attn_output, present = self.self_attn(hidden_states, attention_mask=attention_mask, layer_past=layer_past, len_past=len_past)
         hidden_states = residual + self.dropout(attn_output)
         
-        # FFN with residual
+        # Post-LN: apply layer norm AFTER attention (OPT-350M)
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+        
+        # ============ FFN Block ============
         residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
+        
+        # Pre-LN: apply layer norm BEFORE FFN (OPT-125M, OPT-1.3B, etc.)
+        if self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+        
         mlp_output = self.mlp(hidden_states)
         hidden_states = residual + self.dropout(mlp_output)
+        
+        # Post-LN: apply layer norm AFTER FFN (OPT-350M)
+        if not self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
         
         return hidden_states, present
 
@@ -358,6 +381,8 @@ class OPTConfig:
         layer_norm_epsilon=1e-5,
         # Embedding projection (for OPT-350M+)
         word_embed_proj_dim=None,  # If None, defaults to hidden_size
+        # Layer norm position (OPT-350M uses Post-LN, others use Pre-LN)
+        do_layer_norm_before=True,  # True=Pre-LN (most models), False=Post-LN (OPT-350M)
         # LoRA parameters
         lora_attn_dim=0,
         lora_attn_alpha=128,
@@ -380,6 +405,10 @@ class OPTConfig:
         
         # Embedding projection dimension (OPT-350M+ uses different dim for embeddings)
         self.word_embed_proj_dim = word_embed_proj_dim if word_embed_proj_dim is not None else hidden_size
+        
+        # Layer norm position - critical for OPT-350M!
+        # OPT-350M uses do_layer_norm_before=False (Post-LN) and has NO decoder-level final_layer_norm
+        self.do_layer_norm_before = do_layer_norm_before
         
         # LoRA
         self.lora_attn_dim = lora_attn_dim
@@ -423,6 +452,10 @@ class OPTConfig:
         # Get word_embed_proj_dim (differs from hidden_size for OPT-350M+)
         word_embed_proj_dim = getattr(hf_config, 'word_embed_proj_dim', hf_config.hidden_size)
         
+        # Get do_layer_norm_before (OPT-350M uses False, others use True)
+        # This is CRITICAL: OPT-350M has no decoder-level final_layer_norm!
+        do_layer_norm_before = getattr(hf_config, 'do_layer_norm_before', True)
+        
         return cls(
             vocab_size=hf_config.vocab_size,
             max_position_embeddings=hf_config.max_position_embeddings,
@@ -435,6 +468,7 @@ class OPTConfig:
             activation_function=getattr(hf_config, 'activation_function', 'relu'),
             layer_norm_epsilon=1e-5,  # OPT uses 1e-5
             word_embed_proj_dim=word_embed_proj_dim,
+            do_layer_norm_before=do_layer_norm_before,
             pad_token_id=getattr(hf_config, 'pad_token_id', 1),
             bos_token_id=getattr(hf_config, 'bos_token_id', 2),
             eos_token_id=getattr(hf_config, 'eos_token_id', 2),
@@ -575,12 +609,19 @@ class OPTModel_Server(nn.Module):
     Server-side OPT model with remaining layers and final normalization.
     
     Like GPT2Model_Server but for OPT architecture.
+    
+    Note: OPT-350M uses do_layer_norm_before=False (Post-LN) and has NO 
+    decoder-level final_layer_norm in HuggingFace. We handle this by
+    skipping the final_layer_norm for such models.
     """
     def __init__(self, config, split_layer: int = 3):
         super(OPTModel_Server, self).__init__()
         
         self.config = config
         self.split_layer = split_layer
+        
+        # OPT-350M uses Post-LN (do_layer_norm_before=False) and has no decoder-level final_layer_norm
+        self.do_layer_norm_before = getattr(config, 'do_layer_norm_before', True)
         
         server_layers = config.num_hidden_layers - split_layer
         
@@ -611,8 +652,14 @@ class OPTModel_Server(nn.Module):
         else:
             self.h = nn.ModuleList([])
         
-        # Final layer norm
-        self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # Final layer norm - only used for Pre-LN models (do_layer_norm_before=True)
+        # OPT-350M (Post-LN) doesn't have this layer in HuggingFace
+        if self.do_layer_norm_before:
+            self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        else:
+            # For OPT-350M: no final_layer_norm needed
+            self.final_layer_norm = None
+            logging.info("OPT-350M detected (do_layer_norm_before=False): skipping decoder-level final_layer_norm")
 
     def forward(self, hidden_states, presents, input_shape, attention_mask=None, past=None, len_past=None):
         """
@@ -641,8 +688,9 @@ class OPTModel_Server(nn.Module):
             hidden_states, present = block(hidden_states, attention_mask=attention_mask, layer_past=layer_past, len_past=len_past)
             presents.append(present)
         
-        # Final layer norm
-        hidden_states = self.final_layer_norm(hidden_states)
+        # Final layer norm - only for Pre-LN models (not OPT-350M)
+        if self.final_layer_norm is not None:
+            hidden_states = self.final_layer_norm(hidden_states)
         
         # Derive shape from actual tensor dimensions (DataParallel-safe)
         # input_shape tuple doesn't get scattered, but hidden_states does
@@ -1067,11 +1115,17 @@ class SplitOPT(nn.Module):
 
     def _load_from_huggingface(self, model_name):
         """Load and split HuggingFace OPT weights"""
-        from transformers import OPTForCausalLM
+        from transformers import OPTForCausalLM, AutoConfig
         
         logging.info(f"Loading weights from HuggingFace: {model_name}")
         hf_model = OPTForCausalLM.from_pretrained(model_name)
         hf_state_dict = hf_model.state_dict()
+        hf_config = AutoConfig.from_pretrained(model_name)
+        
+        # Check if this is a model with projection layers (OPT-350M+)
+        has_projection = getattr(hf_config, 'word_embed_proj_dim', hf_config.hidden_size) != hf_config.hidden_size
+        if has_projection:
+            logging.info(f"OPT-350M+ detected: word_embed_proj_dim={hf_config.word_embed_proj_dim}, hidden_size={hf_config.hidden_size}")
         
         split_layer = self.split_layer
         client_state_dict = OrderedDict()
@@ -1079,6 +1133,10 @@ class SplitOPT(nn.Module):
         
         loaded_client_layers = set()
         loaded_server_layers = set()
+        
+        # Track critical keys for verification
+        loaded_final_layer_norm = False
+        loaded_lm_head = False
         
         for key, value in hf_state_dict.items():
             # Remove HF prefixes
@@ -1108,14 +1166,23 @@ class SplitOPT(nn.Module):
                 server_key = f"transformer_Server.{new_key}"
                 server_state_dict[server_key] = value.clone()
             
-            # Final layer norm goes to server
-            elif new_key.startswith("final_layer_norm."):
+            # Decoder-level final layer norm goes to server (NOT per-layer final_layer_norm!)
+            # This is the norm AFTER all transformer blocks, not inside each block
+            # Key: "final_layer_norm.weight" (after stripping "model.decoder.")
+            # NOT: "layers.X.final_layer_norm.weight" (these go through the layers branch)
+            elif new_key.startswith("final_layer_norm.") and not new_key.startswith("layers."):
                 server_key = f"transformer_Server.{new_key}"
                 server_state_dict[server_key] = value.clone()
+                loaded_final_layer_norm = True
+                logging.debug(f"Loaded decoder-level final_layer_norm: {key} -> {server_key}")
             
-            # LM head
-            elif key.startswith("lm_head."):
-                server_state_dict[key] = value.clone()
+            # LM head - FIX: Map to correct key name (lm_head.decoder.weight)
+            elif key.startswith("lm_head.") or new_key.startswith("lm_head."):
+                # Our model uses lm_head.decoder.weight (tied with embeddings)
+                server_key = "lm_head.decoder.weight"
+                server_state_dict[server_key] = value.clone()
+                loaded_lm_head = True
+                logging.debug(f"Loaded lm_head: {key} -> {server_key}")
             
             # Split layers
             elif new_key.startswith("layers."):
@@ -1152,6 +1219,29 @@ class SplitOPT(nn.Module):
                     server_state_dict[server_key] = value.clone()
                     loaded_server_layers.add(layer_idx)
         
+        # Check if this is a Post-LN model (OPT-350M) which has no decoder-level final_layer_norm
+        do_layer_norm_before = getattr(hf_config, 'do_layer_norm_before', True)
+        
+        # Verify critical keys were found in HF state dict
+        if not loaded_final_layer_norm:
+            if do_layer_norm_before:
+                # Pre-LN models SHOULD have final_layer_norm
+                logging.error(f"CRITICAL: final_layer_norm NOT found in HuggingFace state dict!")
+                logging.error(f"  Available keys with 'final': {[k for k in hf_state_dict.keys() if 'final' in k.lower()]}")
+            else:
+                # Post-LN models (OPT-350M) don't have decoder-level final_layer_norm - this is EXPECTED
+                logging.info(f"OPT-350M (Post-LN): No decoder-level final_layer_norm expected - OK")
+        
+        if not loaded_lm_head:
+            logging.warning(f"lm_head NOT found in HuggingFace state dict (may be tied with embeddings)")
+        
+        # Log what we're loading for debugging
+        if has_projection:
+            logging.info(f"OPT-350M+ weight loading summary:")
+            logging.info(f"  do_layer_norm_before: {do_layer_norm_before}")
+            logging.info(f"  final_layer_norm in server_state_dict: {'transformer_Server.final_layer_norm.weight' in server_state_dict}")
+            logging.info(f"  lm_head in server_state_dict: {'lm_head.decoder.weight' in server_state_dict}")
+        
         # Load into models with verification
         missing_c, unexpected_c = self.client.load_state_dict(client_state_dict, strict=False)
         missing_s, unexpected_s = self.server.load_state_dict(server_state_dict, strict=False)
@@ -1165,15 +1255,31 @@ class SplitOPT(nn.Module):
         if pos_embed_sum == 0:
             logging.error("CRITICAL: Client position embeddings not loaded properly!")
         
+        # Verify final_layer_norm loaded correctly (only for Pre-LN models)
+        if self.server.transformer_Server.final_layer_norm is not None:
+            final_norm_sum = self.server.transformer_Server.final_layer_norm.weight.abs().sum().item()
+            if final_norm_sum == 0 or abs(final_norm_sum - self.config.hidden_size) < 0.01:
+                # Weight sum of 0 means not loaded, sum ≈ hidden_size means default init (all 1s)
+                logging.error(f"CRITICAL: Server final_layer_norm may not be loaded properly! (weight sum={final_norm_sum})")
+            else:
+                logging.info(f"Server final_layer_norm loaded successfully (weight sum={final_norm_sum:.2f})")
+        else:
+            logging.info(f"OPT-350M: No final_layer_norm to verify (Post-LN architecture)")
+        
         # Log loading summary
         if missing_c:
-            # Filter out LoRA-related keys which are expected to be missing
-            real_missing = [k for k in missing_c if 'lora' not in k.lower()]
+            # Filter out LoRA-related keys and self_attn.bias (causal mask buffer, expected)
+            real_missing = [k for k in missing_c if 'lora' not in k.lower() and 'self_attn.bias' not in k]
             if real_missing:
                 logging.warning(f"Client missing keys (non-LoRA): {real_missing}")
         
         if missing_s:
-            real_missing = [k for k in missing_s if 'lora' not in k.lower()]
+            # Filter out expected missing keys
+            # For Post-LN models (OPT-350M), final_layer_norm is expected to be missing since it doesn't exist
+            real_missing = [k for k in missing_s if 'lora' not in k.lower() and 'self_attn.bias' not in k]
+            if not do_layer_norm_before:
+                # Post-LN: final_layer_norm doesn't exist, so it can't be "missing" - but PyTorch may still report it
+                real_missing = [k for k in real_missing if 'final_layer_norm' not in k]
             if real_missing:
                 logging.warning(f"Server missing keys (non-LoRA): {real_missing}")
         
