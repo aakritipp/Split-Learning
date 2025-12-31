@@ -1,13 +1,13 @@
 #!/bin/bash -l
 #SBATCH --job-name=split_distributed
 #SBATCH --account=fl-het
-#SBATCH --partition=interactive
+#SBATCH --partition=tier3
 # Multi-GPU: 2x A100 40GB per node enables BS=64 with FO training
 # Memory is distributed across GPUs via device_map="auto"
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:a100:3
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
-#SBATCH --time=0-10:00:00
+#SBATCH --time=2-10:00:00
 #SBATCH --nodes=2                    # 2 nodes: server + client
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
@@ -60,33 +60,52 @@ echo "=========================================="
 # Configuration Parameters (same as run_script_gpu.sh)
 # =============================================================================
 
+# =============================================================================
+# MEMORY PROFILING MODE: Set MEMORY_TEST=1 for quickest run to measure GPU memory
+# Example: MEMORY_TEST=1 sbatch run_distributed.sh
+# =============================================================================
+MEMORY_TEST=${MEMORY_TEST:-0}
+
 MODEL=${MODEL:-facebook/opt-125m}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 MOMENTUM=${MOMENTUM:-0.9}
-TASK=${TASK:-SST2}
-BS=${BS:-64}
+TASK=${TASK:-BoolQ}
 SEED=${SEED:-0}
-TRAIN=${TRAIN:-}  # Will be set per-task in case statement below
-DEV=${DEV:-0}
-EVAL=${EVAL:-1000}
-STEPS=${STEPS:-}
-EVAL_STEPS=${EVAL_STEPS:-25}
+
+if [ "$MEMORY_TEST" == "1" ]; then
+    echo ">>> MEMORY TEST MODE: Running minimal config to measure GPU memory <<<"
+    BS=${BS:-64}           # Smallest batch size
+    TRAIN=${TRAIN:-}     # Minimal training examples
+    DEV=${DEV:-0}         # No dev set
+    EVAL=${EVAL:-0}       # No evaluation
+    # STEPS=${STEPS:-85}     # Just 2 steps to see memory usage
+    # STEPS=${STEPS:-4} 
+    # STEPS=${STEPS:-39}
+    STEPS=${STEPS:-9} 
+    EVAL_STEPS=${EVAL_STEPS:-500}  # Effectively disable eval
+else
+    BS=${BS:-64}
+    TRAIN=${TRAIN:-}  # Will be set per-task in case statement below
+    DEV=${DEV:-0}
+    EVAL=${EVAL:-}
+    STEPS=${STEPS:-}
+    EVAL_STEPS=${EVAL_STEPS:-25}
+fi
 
 MODE=${MODE:-ft}
 MOMENTUM=${MOMENTUM:-0.9}
 
 # ZO Configuration
-ZO_VARIANT=${ZO_VARIANT:-forward}
-ZO_PERTURBATION=${ZO_PERTURBATION:-coordinate}
-NUM_PERT=${NUM_PERT:-1}
+ZO_VARIANT=${ZO_VARIANT:-central}
+ZO_PERTURBATION=${ZO_PERTURBATION:-layer}
+NUM_PERT=${NUM_PERT:-10}
 
 # Split layer configuration (for OPT/GPT-2 models)
 SPLIT_LAYER=${SPLIT_LAYER:-0}  # Layer index where to split the model (default: 3)
 
-# Optimizer configuration (default: FO/FO for full-param fine-tuning)
-# Clear any existing environment variables to ensure defaults take precedence
-unset CLIENT_OPTIMIZER SERVER_OPTIMIZER
+# Optimizer configuration (default: ZO/FO)
+# Uses environment variables if passed via sbatch --export, otherwise defaults
 CLIENT_OPTIMIZER=${CLIENT_OPTIMIZER:-zo}
 SERVER_OPTIMIZER=${SERVER_OPTIMIZER:-zo}
 OPTIMIZER=${OPTIMIZER:-sgd}
@@ -106,7 +125,9 @@ echo "  TRAINER: $TRAINER"
 
 # Learning rates
 if [ "$MODE" == "lora" ]; then
-    LR=${LR:-1e-4}
+    # LR=${LR:-5e-4}
+    LR=${LR:-1e-3}
+    # LR=${LR:-1e-4}
     ZOO_LR=${ZOO_LR:-5e-5}
     # ZOO_LR=${ZOO_LR:-1e-6}
     EPS=${EPS:-5e-3}
@@ -132,7 +153,16 @@ else
 fi
 
 # Network configuration
-PORT=${PORT:-50051}
+# Use dynamic port based on SLURM_JOB_ID to avoid port conflicts when multiple jobs run on same node
+# Port range: 50000-59999 (10000 ports available)
+if [ -n "$SLURM_JOB_ID" ]; then
+    BASE_PORT=50000
+    PORT_OFFSET=$((SLURM_JOB_ID % 10000))
+    DEFAULT_PORT=$((BASE_PORT + PORT_OFFSET))
+else
+    DEFAULT_PORT=50051
+fi
+PORT=${PORT:-$DEFAULT_PORT}
 
 # LoRA/Prefix configuration
 EXTRA_ARGS=""
@@ -143,54 +173,63 @@ elif [ "$MODE" == "lora" ]; then
 fi
 
 TASK_ARGS=""
-case $TASK in
-    BoolQ)
-        TRAIN=${TRAIN:-9427}    # Full training set: 9,427 examples
-        if [ "$MODE" == "lora" ]; then
-            STEPS=${STEPS:-500}
-        else
+# Skip task-specific overrides in memory test mode (values already set above)
+if [ "$MEMORY_TEST" != "2" ]; then
+    case $TASK in
+        BoolQ)
+            TRAIN=${TRAIN:-9427}    # Full training set: 9,427 examples
+            if [ "$MODE" == "lora" ]; then
+                STEPS=${STEPS:-500}
+            else
+                STEPS=${STEPS:-1500}
+            fi
+            EVAL=${EVAL:-3270}
+            ;;
+        RTE)
+            TRAIN=${TRAIN:-2490}    # Full training set: 2,490 examples
             STEPS=${STEPS:-1500}
-        fi
-        ;;
-    RTE)
-        TRAIN=${TRAIN:-2490}    # Full training set: 2,490 examples
-        STEPS=${STEPS:-1500}
-        ;;
-    CB) # Small dataset - validation only has 56 examples
-        TRAIN=${TRAIN:-250}     # Full training set: 250 examples
-        DEV=0                   # Dont carve dev from train; eval uses validation set
-        STEPS=${STEPS:-1000}
-        ;;
-    WIC)
-        TRAIN=${TRAIN:-5428}    # Full training set: 5,428 examples
-        if [ "$MODE" == "lora" ]; then
-            STEPS=${STEPS:-2000}
-        else
-            STEPS=${STEPS:-2000}
-        fi
-        ;;
-    WSC)
-        TRAIN=${TRAIN:-554}     # Full training set: 554 examples
-        if [ "$MODE" == "lora" ]; then
-            STEPS=${STEPS:-3000}
-        else
+            EVAL=${EVAL:-1000}
+            ;;
+        CB) # Small dataset - validation only has 56 examples
+            TRAIN=${TRAIN:-250}     # Full training set: 250 examples
+            DEV=100                   # Dont carve dev from train; eval uses validation set
             STEPS=${STEPS:-1000}
-        fi
-        ;;
-    SST2)
-        TRAIN=${TRAIN:-67349}   # Full training set: 67,349 examples
-        if [ "$MODE" == "lora" ]; then
-            STEPS=${STEPS:-2000}
-        else
-            STEPS=${STEPS:-3000}
-        fi
-        ;;
-    *)
-        # Default for unknown tasks
-        TRAIN=${TRAIN:-1000}
-        STEPS=${STEPS:-1000}
-        ;;
-esac
+            EVAL=${EVAL:-1000}
+            ;;
+        WIC)
+            TRAIN=${TRAIN:-5428}    # Full training set: 5,428 examples
+            if [ "$MODE" == "lora" ]; then
+                STEPS=${STEPS:-2000}
+            else
+                STEPS=${STEPS:-2000}
+            fi
+            EVAL=${EVAL:-1000}
+            ;;
+        WSC)
+            TRAIN=${TRAIN:-554}     # Full training set: 554 examples
+            if [ "$MODE" == "lora" ]; then
+                STEPS=${STEPS:-3000}
+            else
+                STEPS=${STEPS:-1000}
+            fi
+            EVAL=${EVAL:-1000}
+            ;;
+        SST2)
+            TRAIN=${TRAIN:-67349}   # Full training set: 67,349 examples
+            if [ "$MODE" == "lora" ]; then
+                STEPS=${STEPS:-2000}
+            else
+                STEPS=${STEPS:-3000}
+            fi
+            EVAL=${EVAL:-1000}
+            ;;
+        *)
+            # Default for unknown tasks
+            TRAIN=${TRAIN:-1000}
+            STEPS=${STEPS:-1000}
+            ;;
+    esac
+fi
 
 MAX_WAIT=${MAX_WAIT:-300}  # Max seconds to wait for server
 # =============================================================================
@@ -208,6 +247,10 @@ echo ""
 echo "=========================================="
 echo "  Configuration Summary"
 echo "=========================================="
+if [ "$MEMORY_TEST" == "1" ]; then
+    echo ">>> MEMORY TEST MODE ENABLED <<<"
+    echo ""
+fi
 echo "SERVER NODE: $SERVER_NODE"
 echo "SERVER IP:   $SERVER_IP:$PORT"
 echo "CLIENT NODE: $CLIENT_NODE"
