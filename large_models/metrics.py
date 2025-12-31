@@ -616,82 +616,82 @@ def calculate_answer_token_accuracy(predictions, labels, batch, tokenizer):
         return 0.0
 
 
-def calculate_client_answer_accuracy(predictions, labels, batch, tokenizer):
-    """Calculate accuracy only on answer portion tokens (client-side)"""
-    try:
-        if 'formatted_text' not in batch or tokenizer is None:
-            # Fallback to general accuracy on valid tokens
-            mask = (labels != -100) & (labels != 0)
+# def calculate_server_answer_accuracy(predictions, labels, batch, tokenizer):
+#     """Calculate accuracy only on answer portion tokens (server-side)"""
+#     try:
+#         if 'formatted_text' not in batch or tokenizer is None:
+#             # Fallback to general accuracy on valid tokens
+#             mask = (labels != -100) & (labels != 0)
             
-            if mask.sum() == 0:
-                # Try alternative: focus on non-prefix tokens
-                prefix_len = 5  # Typical prefix length
-                if labels.shape[1] > prefix_len:
-                    start_idx = prefix_len
-                    end_idx = min(labels.shape[1] - 1, start_idx + 50)  # Take next 50 tokens
+#             if mask.sum() == 0:
+#                 # Try alternative: focus on non-prefix tokens
+#                 prefix_len = 5  # Typical prefix length
+#                 if labels.shape[1] > prefix_len:
+#                     start_idx = prefix_len
+#                     end_idx = min(labels.shape[1] - 1, start_idx + 50)  # Take next 50 tokens
                     
-                    relevant_labels = labels[:, start_idx:end_idx]
-                    relevant_preds = predictions[:, start_idx:end_idx]
-                    mask = (relevant_labels != -100) & (relevant_labels != 0)
+#                     relevant_labels = labels[:, start_idx:end_idx]
+#                     relevant_preds = predictions[:, start_idx:end_idx]
+#                     mask = (relevant_labels != -100) & (relevant_labels != 0)
                     
-                    if mask.sum() > 0:
-                        correct = (relevant_preds == relevant_labels) & mask
-                        return correct.sum().float() / mask.sum().float()
-                    else:
-                        return 0.0
-                else:
-                    return 0.0
-            else:
-                correct = (predictions == labels) & mask
-                return correct.sum().float() / mask.sum().float()
+#                     if mask.sum() > 0:
+#                         correct = (relevant_preds == relevant_labels) & mask
+#                         return correct.sum().float() / mask.sum().float()
+#                     else:
+#                         return 0.0
+#                 else:
+#                     return 0.0
+#             else:
+#                 correct = (predictions == labels) & mask
+#                 return correct.sum().float() / mask.sum().float()
         
-        accuracies = []
+#         accuracies = []
         
-        for i in range(len(batch['formatted_text'])):
-            text = batch['formatted_text'][i]
+#         for i in range(len(batch['formatted_text'])):
+#             text = batch['formatted_text'][i]
             
-            # Find "Answer:" position
-            answer_start = text.find("Answer:")
-            if answer_start == -1:
-                continue
+#             # Find "Answer:" position
+#             answer_start = text.find("Answer:")
+#             if answer_start == -1:
+#                 continue
                 
-            # Get the answer part
-            answer_text = text[answer_start + len("Answer:"):].strip()
-            if not answer_text:
-                continue
+#             # Get the answer part
+#             answer_text = text[answer_start + len("Answer:"):].strip()
+#             if not answer_text:
+#                 continue
             
-            # Tokenize to find answer token positions
-            context_question = text[:answer_start + len("Answer:")]
+#             # Tokenize to find answer token positions
+#             context_question = text[:answer_start + len("Answer:")]
             
-            # Encode separately to find token boundaries
-            context_tokens = tokenizer.encode(context_question, add_special_tokens=False)
-            answer_tokens = tokenizer.encode(answer_text, add_special_tokens=False)
+#             # Encode separately to find token boundaries
+#             context_tokens = tokenizer.encode(context_question, add_special_tokens=False)
+#             answer_tokens = tokenizer.encode(answer_text, add_special_tokens=False)
             
-            if len(answer_tokens) == 0:
-                continue
+#             if len(answer_tokens) == 0:
+#                 continue
             
-            # Find answer token positions in the sequence
-            start_idx = len(context_tokens)
-            end_idx = min(start_idx + len(answer_tokens), predictions.shape[1])
+#             # Find answer token positions in the sequence
+#             start_idx = len(context_tokens)
+#             end_idx = min(start_idx + len(answer_tokens), predictions.shape[1])
             
-            if start_idx < end_idx and start_idx < predictions.shape[1]:
-                # Get predictions and labels for answer tokens
-                answer_preds = predictions[i, start_idx:end_idx]
-                answer_labels = labels[i, start_idx:end_idx]
+#             if start_idx < end_idx and start_idx < predictions.shape[1]:
+#                 # Get predictions and labels for answer tokens
+#                 answer_preds = predictions[i, start_idx:end_idx]
+#                 answer_labels = labels[i, start_idx:end_idx]
                 
-                if len(answer_preds) > 0:
-                    # Only count valid answer tokens (not -100)
-                    valid_mask = (answer_labels != -100)
-                    if valid_mask.sum() > 0:
-                        correct = (answer_preds == answer_labels) & valid_mask
-                        accuracy = correct.sum().float() / valid_mask.sum().float()
-                        accuracies.append(accuracy.item())
+#                 if len(answer_preds) > 0:
+#                     # Only count valid answer tokens (not -100)
+#                     valid_mask = (answer_labels != -100)
+#                     if valid_mask.sum() > 0:
+#                         correct = (answer_preds == answer_labels) & valid_mask
+#                         accuracy = correct.sum().float() / valid_mask.sum().float()
+#                         accuracies.append(accuracy.item())
         
-        return sum(accuracies) / len(accuracies) if accuracies else 0.0
+#         return sum(accuracies) / len(accuracies) if accuracies else 0.0
         
-    except Exception as e:
-        print(f"Client answer accuracy calculation failed: {e}")
-        return 0.0
+#     except Exception as e:
+#         print(f"Server answer accuracy calculation failed: {e}")
+#         return 0.0
 
 def calculate_generation_f1_em(model, batch, tokenizer, device, max_new_tokens=5):
     """
@@ -1385,3 +1385,4 @@ def print_squad_generations(model, tokenizer, batch, device, max_new_tokens=30, 
             print(f"Error processing example {i}: {e}")
     
     print("=== END SAMPLES ===\n")
+    
