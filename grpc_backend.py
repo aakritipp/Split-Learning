@@ -151,21 +151,50 @@ class TCPBackend(CommunicationBackend):
         # Wait for client connection
         self._accept_client()
         
-    def _accept_client(self):
-        """Accept a client connection. Can be called multiple times to re-accept."""
+    def _accept_client(self, max_attempts: int = 30):
+        """Accept a client connection. Can be called multiple times to re-accept.
+        
+        Args:
+            max_attempts: Maximum number of accept attempts before raising an error.
+                         Each attempt waits up to 60 seconds. Default 30 = 30 minutes total.
+        """
         if self._client_socket:
             try:
                 self._client_socket.close()
             except:
                 pass
             self._client_socket = None
-            self._connected = False
-            
-        logger.info("Waiting for client connection...")
-        self._client_socket, client_addr = self._socket.accept()
-        self._client_socket.settimeout(self.timeout)
-        self._connected = True
-        logger.info(f"Client connected from {client_addr}")
+        
+        # Always reset connection state before waiting for new client
+        self._connected = False
+        self._socket.settimeout(60.0)
+        attempt = 0
+        while not self._connected:
+            attempt += 1
+            try:
+                logger.info(f"Waiting for client connection... (attempt {attempt}/{max_attempts})")
+                self._client_socket, client_addr = self._socket.accept()
+                self._client_socket.settimeout(self.timeout)
+                self._connected = True
+                logger.info(f"Client connected from {client_addr}")
+            except socket.timeout:
+                if attempt >= max_attempts:
+                    raise ConnectionError(f"No client connected after {max_attempts} attempts ({max_attempts} minutes)")
+                logger.info(f"No client connection received within timeout, retrying...")
+                continue
+            except OSError as e:
+                # Socket-specific errors (e.g., socket closed, address in use)
+                logger.error(f"Socket error accepting client: {e}")
+                if attempt >= max_attempts:
+                    raise ConnectionError(f"Failed to accept client after {max_attempts} attempts: {e}")
+                time.sleep(5)
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error accepting client: {e}")
+                if attempt >= max_attempts:
+                    raise ConnectionError(f"Failed to accept client after {max_attempts} attempts: {e}")
+                time.sleep(5)
+                continue
     
     def wait_for_client(self):
         """Public method to wait for a new client connection (for reconnection after probe disconnects)."""
@@ -189,6 +218,7 @@ class TCPBackend(CommunicationBackend):
         
         last_error = None
         delay = retry_delay
+        # attempt = 0
         
         for attempt in range(max_retries):
             try:

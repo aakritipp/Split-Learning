@@ -43,6 +43,7 @@ class ForwardPayload:
         attention_mask: Attention mask for the input (optional)
         phase: ZO phase indicator ("perturb_pos", "perturb_neg", "restore", etc.)
         option_len: List of option lengths for partial loss computation (matching run.py)
+        num_options: List of num_options for classification-style training (train_as_classification)
         mode: "train" or "inference" - in inference mode, server returns logits instead of loss
     """
     activations: torch.Tensor
@@ -52,10 +53,14 @@ class ForwardPayload:
     seed: Optional[int] = None
     batch_id: Optional[int] = None
     labels: Optional[torch.Tensor] = None
+    input_ids: Optional[torch.Tensor] = None  # For classification mode loss computation
     attention_mask: Optional[torch.Tensor] = None
     phase: Optional[str] = None
     option_len: Optional[List[int]] = None
+    num_options: Optional[List[int]] = None  # For train_as_classification mode
     mode: str = "train"  # "train" or "inference"
+    num_perturbations: int = 1  # For ZO-FO: scale loss by 1/num_perturbations before backward
+    perturbation_idx: int = 0  # Current perturbation index (0 to num_perturbations-1)
     
     def to_device(self, device: Union[str, torch.device]) -> "ForwardPayload":
         """Move all tensors to the specified device."""
@@ -67,10 +72,14 @@ class ForwardPayload:
             seed=self.seed,
             batch_id=self.batch_id,
             labels=self.labels.to(device) if self.labels is not None else None,
+            input_ids=self.input_ids.to(device) if self.input_ids is not None else None,
             attention_mask=self.attention_mask.to(device) if self.attention_mask is not None else None,
             phase=self.phase,
             option_len=self.option_len,
+            num_options=self.num_options,
             mode=self.mode,
+            num_perturbations=self.num_perturbations,
+            perturbation_idx=self.perturbation_idx,
         )
     
     def detach(self) -> "ForwardPayload":
@@ -83,10 +92,14 @@ class ForwardPayload:
             seed=self.seed,
             batch_id=self.batch_id,
             labels=self.labels.detach() if self.labels is not None else None,
+            input_ids=self.input_ids.detach() if self.input_ids is not None else None,
             attention_mask=self.attention_mask.detach() if self.attention_mask is not None else None,
             phase=self.phase,
             option_len=self.option_len,
+            num_options=self.num_options,
             mode=self.mode,
+            num_perturbations=self.num_perturbations,
+            perturbation_idx=self.perturbation_idx,
         )
 
 
@@ -144,6 +157,8 @@ class ZOMetadata:
     step_phase: str = "perturb_pos"
     projected_grad: Optional[float] = None
     restore_scaling_factor: int = 1  # For restoring params before update
+    perturbation_idx: int = 0  # For ZO-FO: track which perturbation we're on
+    num_perturbations: int = 1  # For ZO-FO: total perturbations to know when to step
 
 
 # =============================================================================

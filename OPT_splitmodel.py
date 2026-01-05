@@ -383,6 +383,14 @@ class OPTConfig:
         word_embed_proj_dim=None,  # If None, defaults to hidden_size
         # Layer norm position (OPT-350M uses Post-LN, others use Pre-LN)
         do_layer_norm_before=True,  # True=Pre-LN (most models), False=Post-LN (OPT-350M)
+        # Backward compatibility flag from MeZO (for older fine-tuned checkpoints)
+        _remove_final_layer_norm=False,
+        # LayerDrop probability (MeZO feature for stochastic depth)
+        layerdrop=0.0,
+        # Weight initialization std
+        init_std=0.02,
+        # KV cache
+        use_cache=True,
         # LoRA parameters
         lora_attn_dim=0,
         lora_attn_alpha=128,
@@ -409,6 +417,18 @@ class OPTConfig:
         # Layer norm position - critical for OPT-350M!
         # OPT-350M uses do_layer_norm_before=False (Post-LN) and has NO decoder-level final_layer_norm
         self.do_layer_norm_before = do_layer_norm_before
+        
+        # Backward compatibility (MeZO feature)
+        self._remove_final_layer_norm = _remove_final_layer_norm
+        
+        # LayerDrop for stochastic depth (MeZO feature)
+        self.layerdrop = layerdrop
+        
+        # Weight initialization
+        self.init_std = init_std
+        
+        # KV cache
+        self.use_cache = use_cache
         
         # LoRA
         self.lora_attn_dim = lora_attn_dim
@@ -456,6 +476,9 @@ class OPTConfig:
         # This is CRITICAL: OPT-350M has no decoder-level final_layer_norm!
         do_layer_norm_before = getattr(hf_config, 'do_layer_norm_before', True)
         
+        # Backward compatibility flag from MeZO
+        _remove_final_layer_norm = getattr(hf_config, '_remove_final_layer_norm', False)
+        
         return cls(
             vocab_size=hf_config.vocab_size,
             max_position_embeddings=hf_config.max_position_embeddings,
@@ -469,6 +492,10 @@ class OPTConfig:
             layer_norm_epsilon=1e-5,  # OPT uses 1e-5
             word_embed_proj_dim=word_embed_proj_dim,
             do_layer_norm_before=do_layer_norm_before,
+            _remove_final_layer_norm=_remove_final_layer_norm,
+            layerdrop=getattr(hf_config, 'layerdrop', 0.0),
+            init_std=getattr(hf_config, 'init_std', 0.02),
+            use_cache=getattr(hf_config, 'use_cache', True),
             pad_token_id=getattr(hf_config, 'pad_token_id', 1),
             bos_token_id=getattr(hf_config, 'bos_token_id', 2),
             eos_token_id=getattr(hf_config, 'eos_token_id', 2),
@@ -654,12 +681,17 @@ class OPTModel_Server(nn.Module):
         
         # Final layer norm - only used for Pre-LN models (do_layer_norm_before=True)
         # OPT-350M (Post-LN) doesn't have this layer in HuggingFace
-        if self.do_layer_norm_before:
+        # _remove_final_layer_norm is for backward compat with older fine-tuned checkpoints
+        _remove_final_layer_norm = getattr(config, '_remove_final_layer_norm', False)
+        if self.do_layer_norm_before and not _remove_final_layer_norm:
             self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         else:
             # For OPT-350M: no final_layer_norm needed
             self.final_layer_norm = None
-            logging.info("OPT-350M detected (do_layer_norm_before=False): skipping decoder-level final_layer_norm")
+            if not self.do_layer_norm_before:
+                logging.info("OPT-350M detected (do_layer_norm_before=False): skipping decoder-level final_layer_norm")
+            elif _remove_final_layer_norm:
+                logging.info("_remove_final_layer_norm=True: skipping decoder-level final_layer_norm (backward compat)")
 
     def forward(self, hidden_states, presents, input_shape, attention_mask=None, past=None, len_past=None):
         """
@@ -998,7 +1030,7 @@ class SplitOPT(nn.Module):
     def _log_split_info(self):
         """Log split configuration"""
         num_layers = self.config.num_hidden_layers
-        logging.info(f"SplitOPT (GPT2-style) initialized:")
+        logging.info(f"SplitOPT initialized:")
         logging.info(f"  - Total layers: {num_layers}")
         logging.info(f"  - Client: Embeddings + {self.split_layer} layers")
         logging.info(f"  - Server: {num_layers - self.split_layer} layers + LM head")

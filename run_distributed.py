@@ -16,6 +16,8 @@ import logging
 import os
 import sys
 import argparse
+import json
+import shutil
 import torch
 from torch import device as torch_device
 import torch.nn as nn
@@ -23,7 +25,7 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 import random
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm import tqdm
@@ -48,62 +50,171 @@ logger = logging.getLogger(__name__)
 class GPUMemoryTracker:
     """Track GPU memory usage and peak memory on a device."""
     
-    def __init__(self, device=None, role="unknown"):
+    def __init__(self, device=None, role="unknown", track_all_devices: bool = False):
         self.role = role
         self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.peak_memory_bytes = 0
-        self.peak_memory_allocated_bytes = 0
-        self.peak_memory_reserved_bytes = 0
-        self.tracking = False
+        self.track_all_devices = track_all_devices
         
-        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
-            # Reset peak stats at initialization
-            torch.cuda.reset_peak_memory_stats(self.device)
+        # Delta-based tracking (works with multiple trackers on same GPU)
+        # NOTE: In DataParallel, allocations happen across multiple GPUs in ONE process.
+        # If track_all_devices=True, we track per-device baselines/peaks and report the max.
+        self._devices_to_track: List[torch.device] = []
+
+        # Primary device values (kept for backward compatibility with existing prints/metrics)
+        self.baseline_allocated = 0
+        self.baseline_reserved = 0
+        self.max_allocated_seen = 0
+        self.max_reserved_seen = 0
+
+        # Per-device values (used when track_all_devices=True)
+        self.baseline_allocated_by_device = {}
+        self.baseline_reserved_by_device = {}
+        self.max_allocated_seen_by_device = {}
+        self.max_reserved_seen_by_device = {}
+
+        # Track the max delta across tracked devices (bottleneck GPU for this process)
+        self.max_delta_allocated_seen = 0
+        self.max_delta_reserved_seen = 0
+        self.tracking = False
+
+    def _resolve_devices_to_track(self) -> List[torch.device]:
+        """Resolve which CUDA devices this tracker should sample."""
+        if not torch.cuda.is_available() or self.device.type != 'cuda':
+            return []
+
+        # Normalize primary device (cuda -> cuda:0)
+        primary = self.device
+        if primary.index is None:
+            primary = torch.device('cuda:0')
+
+        if self.track_all_devices and torch.cuda.device_count() > 1:
+            # Track all *visible* CUDA devices (respects CUDA_VISIBLE_DEVICES)
+            return [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+
+        return [primary]
     
     def start_tracking(self):
-        """Start/reset memory tracking."""
-        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
-            torch.cuda.reset_peak_memory_stats(self.device)
-            self.tracking = True
-    
-    def update_peak(self):
-        """Update peak memory stats by checking current peak values."""
-        if not torch.cuda.is_available() or not str(self.device).startswith('cuda'):
+        """Start memory tracking by recording baseline memory."""
+        if not torch.cuda.is_available() or self.device.type != 'cuda':
             return
         
-        # Get current peak memory stats
-        current_allocated = torch.cuda.max_memory_allocated(self.device)
-        current_reserved = torch.cuda.max_memory_reserved(self.device)
+        if self.tracking:
+            # Already tracking, don't reset baseline unless we want to restart
+            # This ensures we capture model loading even if start_tracking is called again in train()
+            return
+
+        self._devices_to_track = self._resolve_devices_to_track()
+        if not self._devices_to_track:
+            return
+
+        # Clear per-device state
+        self.baseline_allocated_by_device = {}
+        self.baseline_reserved_by_device = {}
+        self.max_allocated_seen_by_device = {}
+        self.max_reserved_seen_by_device = {}
+        self.max_delta_allocated_seen = 0
+        self.max_delta_reserved_seen = 0
+
+        # Synchronize and reset peak stats to ensure we capture the peak from THIS point forward
+        for dev in self._devices_to_track:
+            torch.cuda.synchronize(dev)
+            torch.cuda.reset_peak_memory_stats(dev)
+            
+            base_alloc = torch.cuda.memory_allocated(dev)
+            base_res = torch.cuda.memory_reserved(dev)
+            self.baseline_allocated_by_device[str(dev)] = base_alloc
+            self.baseline_reserved_by_device[str(dev)] = base_res
+            self.max_allocated_seen_by_device[str(dev)] = base_alloc
+            self.max_reserved_seen_by_device[str(dev)] = base_res
+
+        # Primary-device fields (for compatibility)
+        primary = self._devices_to_track[0]
+        self.baseline_allocated = self.baseline_allocated_by_device[str(primary)]
+        self.baseline_reserved = self.baseline_reserved_by_device[str(primary)]
+        self.max_allocated_seen = self.max_allocated_seen_by_device[str(primary)]
+        self.max_reserved_seen = self.max_reserved_seen_by_device[str(primary)]
+        self.tracking = True
+    
+    def update_peak(self):
+        """Update peak memory using PyTorch's built-in peak tracking."""
+        if not self.tracking or not torch.cuda.is_available() or self.device.type != 'cuda':
+            return
+
+        if not self._devices_to_track:
+            self._devices_to_track = self._resolve_devices_to_track()
         
-        # Update our tracked peaks
-        if current_allocated > self.peak_memory_allocated_bytes:
-            self.peak_memory_allocated_bytes = current_allocated
-        if current_reserved > self.peak_memory_reserved_bytes:
-            self.peak_memory_reserved_bytes = current_reserved
-        
-        # Track overall peak (using allocated as the primary metric)
-        self.peak_memory_bytes = self.peak_memory_allocated_bytes
+        for dev in self._devices_to_track:
+            dev_key = str(dev)
+            
+            # Use PyTorch's built-in peak tracking which is more accurate than sampling
+            # as it captures peaks that occur between calls to update_peak().
+            current_max_allocated = torch.cuda.max_memory_allocated(dev)
+            current_max_reserved = torch.cuda.max_memory_reserved(dev)
+
+            # Track maximum absolute memory seen during tracking period (per device)
+            if current_max_allocated > self.max_allocated_seen_by_device.get(dev_key, 0):
+                self.max_allocated_seen_by_device[dev_key] = current_max_allocated
+            if current_max_reserved > self.max_reserved_seen_by_device.get(dev_key, 0):
+                self.max_reserved_seen_by_device[dev_key] = current_max_reserved
+
+            # Track maximum delta seen across all tracked devices (bottleneck)
+            base_alloc = self.baseline_allocated_by_device.get(dev_key, 0)
+            base_res = self.baseline_reserved_by_device.get(dev_key, 0)
+            
+            self.max_delta_allocated_seen = max(self.max_delta_allocated_seen, self.max_allocated_seen_by_device[dev_key] - base_alloc)
+            self.max_delta_reserved_seen = max(self.max_delta_reserved_seen, self.max_reserved_seen_by_device[dev_key] - base_res)
+
+        # Update primary-device absolute fields (for compatibility with existing prints)
+        primary = self._devices_to_track[0] if self._devices_to_track else self.device
+        primary_key = str(primary)
+        self.max_allocated_seen = self.max_allocated_seen_by_device.get(primary_key, self.max_allocated_seen)
+        self.max_reserved_seen = self.max_reserved_seen_by_device.get(primary_key, self.max_reserved_seen)
     
     def get_current_memory(self):
         """Get current memory usage."""
-        if not torch.cuda.is_available() or not str(self.device).startswith('cuda'):
-            return {'allocated': 0, 'reserved': 0}
+        if not torch.cuda.is_available() or self.device.type != 'cuda':
+            return {'allocated': 0, 'reserved': 0, 'delta_allocated': 0}
         
+        primary = self._devices_to_track[0] if self._devices_to_track else (torch.device('cuda:0') if self.device.index is None else self.device)
+        current = torch.cuda.memory_allocated(primary)
         return {
-            'allocated': torch.cuda.memory_allocated(self.device),
-            'reserved': torch.cuda.memory_reserved(self.device),
+            'allocated': current,
+            'reserved': torch.cuda.memory_reserved(primary),
+            'delta_allocated': current - self.baseline_allocated,
         }
     
     def get_peak_memory(self):
         """Get peak memory usage tracked so far."""
         self.update_peak()
+        
+        # Calculate peak as the maximum delta from baseline.
+        # - If tracking multiple devices, report the max delta across devices (bottleneck GPU).
+        # - Otherwise, report primary device delta (historical behavior).
+        if self.track_all_devices and self._devices_to_track:
+            peak_allocated_delta = self.max_delta_allocated_seen
+            peak_reserved_delta = self.max_delta_reserved_seen
+        else:
+            peak_allocated_delta = self.max_allocated_seen - self.baseline_allocated
+            peak_reserved_delta = self.max_reserved_seen - self.baseline_reserved
+        
+        # Ensure non-negative (in case of memory pressure causing baseline to be high)
+        peak_allocated_delta = max(0, peak_allocated_delta)
+        peak_reserved_delta = max(0, peak_reserved_delta)
+        
         return {
-            'peak_allocated_bytes': self.peak_memory_allocated_bytes,
-            'peak_reserved_bytes': self.peak_memory_reserved_bytes,
-            'peak_allocated_gb': self.peak_memory_allocated_bytes / (1024**3),
-            'peak_reserved_gb': self.peak_memory_reserved_bytes / (1024**3),
-            'peak_allocated_mb': self.peak_memory_allocated_bytes / (1024**2),
-            'peak_reserved_mb': self.peak_memory_reserved_bytes / (1024**2),
+            'peak_allocated_bytes': peak_allocated_delta,
+            'peak_reserved_bytes': peak_reserved_delta,
+            'peak_allocated_gb': peak_allocated_delta / (1024**3),
+            'peak_reserved_gb': peak_reserved_delta / (1024**3),
+            'peak_allocated_mb': peak_allocated_delta / (1024**2),
+            'peak_reserved_mb': peak_reserved_delta / (1024**2),
+            # Also include absolute values for debugging
+            'baseline_allocated_bytes': self.baseline_allocated,
+            'max_allocated_seen_bytes': self.max_allocated_seen,
+            # Multi-GPU debug (strings for JSON-serializable metrics)
+            'tracked_devices': [str(d) for d in self._devices_to_track],
+            'baseline_allocated_by_device_bytes': dict(self.baseline_allocated_by_device),
+            'max_allocated_seen_by_device_bytes': dict(self.max_allocated_seen_by_device),
         }
     
     def get_summary(self):
@@ -115,6 +226,8 @@ class GPUMemoryTracker:
             'peak_gpu_memory_reserved_bytes': peak['peak_reserved_bytes'],
             'peak_gpu_memory_allocated_gb': peak['peak_allocated_gb'],
             'peak_gpu_memory_reserved_gb': peak['peak_reserved_gb'],
+            # Extra fields (won't break existing consumers)
+            'tracked_devices': peak.get('tracked_devices', []),
         }
     
     def print_summary(self):
@@ -123,8 +236,19 @@ class GPUMemoryTracker:
         print(f"\n{'='*60}")
         print(f"GPU MEMORY USAGE - {self.role.upper()}")
         print(f"{'='*60}")
-        print(f"Peak GPU Memory Allocated:   {peak['peak_allocated_gb']:.2f} GB ({peak['peak_allocated_mb']:.2f} MB)")
-        print(f"Peak GPU Memory Reserved:    {peak['peak_reserved_gb']:.2f} GB ({peak['peak_reserved_mb']:.2f} MB)")
+        if self.track_all_devices and self._devices_to_track and len(self._devices_to_track) > 1:
+            print(f"Tracking Devices:            {', '.join(str(d) for d in self._devices_to_track)}")
+            # Print per-device baselines/peaks (allocated only; reserved is similar)
+            for dev in self._devices_to_track:
+                k = str(dev)
+                base_mb = self.baseline_allocated_by_device.get(k, 0) / (1024**2)
+                max_mb = self.max_allocated_seen_by_device.get(k, 0) / (1024**2)
+                print(f"  {k} baseline/max:          {base_mb:.2f} MB / {max_mb:.2f} MB")
+        else:
+            print(f"Baseline Memory:             {self.baseline_allocated / (1024**2):.2f} MB")
+            print(f"Max Memory Seen:             {self.max_allocated_seen / (1024**2):.2f} MB")
+        print(f"Peak Delta Allocated:        {peak['peak_allocated_gb']:.2f} GB ({peak['peak_allocated_mb']:.2f} MB)")
+        print(f"Peak Delta Reserved:         {peak['peak_reserved_gb']:.2f} GB ({peak['peak_reserved_mb']:.2f} MB)")
         print(f"{'='*60}")
 
 # Add parent directory to path
@@ -135,7 +259,7 @@ from grpc_backend import TCPBackend, create_backend
 from split_communication import ForwardPayload, BackwardPayload, ZOMetadata
 from splitmodel import GPT2Config, GPT2LMModel_Client, GPT2LMModel_Server
 from OPT_splitmodel import SplitOPT, OPTConfig, OPTLMModel_Client, OPTLMModel_Server
-from utils import apply_lora_to_opt, mark_only_lora_as_trainable
+from utils import apply_lora_to_opt, mark_only_lora_as_trainable, count_time
 from dataset import get_task
 from utils import encode_prompt, DataCollatorWithPaddingAndNesting, Prediction
 from metrics import calculate_metric
@@ -194,7 +318,7 @@ class DistributedArguments(TrainingArguments):
     
     # ZO settings
     zo_eps: float = 1e-3
-    zo_continuous_rng: bool = False
+    zo_continuous_rng: bool = True  # Use continuous RNG across client/server (matching run.py)
     zo_variant: str = "central"
     zo_perturbation: str = "layer"
     num_pert: int = 1
@@ -336,9 +460,11 @@ class DistributedServer:
         self.backend = None
         self._sorted_params = None
         self._fo_optimizer = None  # FO optimizer (initialized if server_mode == "fo")
+        self.config = None  # Model config (for pad_token_id, vocab_size, etc.)
         
         # GPU memory tracking
-        self.memory_tracker = GPUMemoryTracker(device=self.device, role="server")
+        # Track all visible GPUs when using DataParallel, otherwise track only primary device.
+        self.memory_tracker = GPUMemoryTracker(device=self.device, role="server", track_all_devices=self.use_data_parallel)
         
     def load_model(self):
         """Load server portion of split model - matching run.py Framework.load_model()"""
@@ -361,6 +487,7 @@ class DistributedServer:
             # Create split model and load weights
             self.server_model = SplitOPT(opt_config, split_layer=split_layer)
             self.server_model.load_weight(self.args.model_name)
+            self.config = opt_config  # Store config for pad_token_id access
 
             if self.args.lora:
                 logger.info(f"Applying LoRA (r={self.args.lora_r}, alpha={self.args.lora_alpha})")
@@ -382,6 +509,7 @@ class DistributedServer:
                     lora_attn_alpha=self.args.lora_alpha, lora_dropout=0.0)
             
             self.server_model = GPT2LMModel_Server(config)
+            self.config = config  # Store config for pad_token_id access
             
             if "gpt2" in self.args.model_name.lower():
                 self._load_gpt2_pretrained_weights()
@@ -580,16 +708,50 @@ class DistributedServer:
             model = model.module
         return model.server
     
-    def _perturb_parameters(self, seed: int, scaling_factor: float):
-        """Perturb server parameters - matching trainer.py"""
-        torch.manual_seed(seed)
+    def _perturb_parameters(self, seed: int, scaling_factor: float, 
+                             use_rng_state: bool = False, rng_state: torch.Tensor = None):
+        """
+        Perturb server parameters - matching trainer.py with continuous RNG support.
+        
+        Args:
+            seed: Random seed for perturbation
+            scaling_factor: Perturbation direction (+1, -2, etc.)
+            use_rng_state: If True, restore rng_state instead of using seed
+            rng_state: RNG state to restore (required if use_rng_state=True)
+            
+        Returns:
+            Current RNG state after perturbation (for continuous RNG chaining)
+        """
+        if use_rng_state and rng_state is not None:
+            torch.set_rng_state(rng_state)
+        else:
+            torch.manual_seed(seed)
+        
         for name, param in self._sorted_params:
             z = self._generate_perturbation(param)
             param.data = param.data + scaling_factor * z * self.args.zo_eps
+        
+        return torch.get_rng_state()
             
-    def _update_parameters(self, seed: int, projected_grad: float):
-        """Update server parameters - matching trainer.py"""
-        torch.manual_seed(seed)
+    def _update_parameters(self, seed: int, projected_grad: float,
+                           use_rng_state: bool = False, rng_state: torch.Tensor = None):
+        """
+        Update server parameters - matching trainer.py with continuous RNG support.
+        
+        Args:
+            seed: Random seed for perturbation
+            projected_grad: The computed gradient estimate
+            use_rng_state: If True, restore rng_state instead of using seed
+            rng_state: RNG state to restore (required if use_rng_state=True)
+            
+        Returns:
+            Current RNG state after update (for continuous RNG chaining)
+        """
+        if use_rng_state and rng_state is not None:
+            torch.set_rng_state(rng_state)
+        else:
+            torch.manual_seed(seed)
+        
         for name, param in self._sorted_params:
             z = self._generate_perturbation(param)
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
@@ -597,6 +759,100 @@ class DistributedServer:
                     projected_grad * z + self.args.weight_decay * param.data)
             else:
                 param.data = param.data - self.server_lr * (projected_grad * z)
+        
+        return torch.get_rng_state()
+    
+    def _compute_loss(self, logits, labels, option_len, num_options, input_ids=None):
+        """
+        Compute loss with support for LM-style training with option_len masking.
+        
+        This matches the logic in utils.forward_wrap_with_option_len from run.py
+        for the only_train_option case (LM loss with partial sequence masking).
+        
+        Note: For LM training (the current working mode), labels == input_ids,
+        so using labels here is correct. Classification mode (train_as_classification)
+        would require sending input_ids separately since labels become class indices.
+        
+        Args:
+            logits: Model output logits (batch, seq_len, vocab_size)
+            labels: Target labels (for LM mode, this equals input_ids)
+            option_len: List of option lengths for partial loss computation
+            num_options: Reserved for future classification mode support (currently unused)
+            
+        Returns:
+            loss: Computed loss value (scalar tensor)
+        """
+        loss_fct = CrossEntropyLoss(ignore_index=-100)
+        vocab_size = logits.size(-1)
+        
+        # Shift logits and labels for next-token prediction
+        # Note: In LM mode (only_train_option), labels == input_ids
+        # This matches line 122-123 of utils.forward_wrap_with_option_len
+        shift_logits = logits[..., :-1, :].contiguous()
+        
+        # Use input_ids for shift_labels if available (critical for classification mode)
+        # because labels may contain candidate indices, not token IDs.
+        # This matches line 122-123 of utils.forward_wrap_with_option_len:
+        # "Here we use input_ids (which should always = labels) bc sometimes labels are correct candidate IDs"
+        if input_ids is not None:
+            shift_labels = input_ids[..., 1:].contiguous().clone()
+        else:
+            # Fallback to labels (LM mode where labels == input_ids)
+            shift_labels = labels[..., 1:].contiguous().clone()
+        
+        # Mask out pad tokens (line 127-129 of utils.forward_wrap_with_option_len)
+        # Some models (e.g., GPT-2) don't define pad_token_id in their config.
+        # In that case, skip this step.
+        pad_token_id = getattr(self.config, "pad_token_id", None) if self.config else None
+        if pad_token_id is not None:
+            shift_labels[shift_labels == pad_token_id] = -100
+        
+        # Apply option_len masking (do not calculate loss on non-option part)
+        # This matches line 131-133 of utils.forward_wrap_with_option_len
+        if option_len is not None:
+            for _i, _len in enumerate(option_len):
+                if _len > 0:
+                    shift_labels[_i, :-_len] = -100
+        
+        # Calculate the loss
+        if num_options is not None:
+            # Classification-style training (line 137-163 of utils.forward_wrap_with_option_len)
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            mask = shift_labels != -100  # Option part only
+            shift_labels[~mask] = 0  # Avoid indexing issues with -100
+            
+            # Gather log probs for target tokens: (bsz x num_options, seq_len)
+            selected_log_probs = torch.gather(
+                log_probs, dim=-1, index=shift_labels.unsqueeze(-1)
+            ).squeeze(-1)
+            # Average log prob per option (normalized by option length)
+            selected_log_probs = (selected_log_probs * mask).sum(-1) / mask.sum(-1).clamp(min=1)
+            
+            if any(x != num_options[0] for x in num_options):
+                # Multi-choice tasks with different number of options per example
+                loss = 0
+                start_id = 0
+                count = 0
+                while start_id < len(num_options):
+                    end_id = start_id + num_options[start_id]
+                    _logits = selected_log_probs[start_id:end_id].unsqueeze(0)  # (1, num_options)
+                    _labels = labels[start_id:end_id][0].unsqueeze(0)  # (1,)
+                    loss = loss_fct(_logits, _labels) + loss
+                    count += 1
+                    start_id = end_id
+                loss = loss / count
+            else:
+                # Uniform number of options
+                n_options = num_options[0]
+                selected_log_probs = selected_log_probs.view(-1, n_options)  # (bsz, num_options)
+                labels_reshaped = labels.view(-1, n_options)[:, 0]  # Labels repeat, take first
+                loss = loss_fct(selected_log_probs, labels_reshaped)
+        else:
+            # Standard LM loss with masking
+            # This matches line 165 of utils.forward_wrap_with_option_len
+            loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+        
+        return loss
     
     def _process_forward(self, forward_payload: ForwardPayload) -> BackwardPayload:
         """Process forward pass from client
@@ -616,10 +872,15 @@ class DistributedServer:
         labels = getattr(forward_payload, 'labels', None)
         if labels is not None:
             labels = labels.to(self.device)
+        # Extract input_ids for correct loss computation (needed for classification mode)
+        input_ids = getattr(forward_payload, 'input_ids', None)
+        if input_ids is not None:
+            input_ids = input_ids.to(self.device)
         lm_mask = getattr(forward_payload, 'attention_mask', None)
         if lm_mask is not None:
             lm_mask = lm_mask.to(self.device)
         option_len = getattr(forward_payload, 'option_len', None)
+        num_options = getattr(forward_payload, 'num_options', None)  # For train_as_classification
         
         # Determine processing mode based on phase and server_mode
         # ZO/FO hybrid phases:
@@ -634,43 +895,46 @@ class DistributedServer:
             # ZO/FO hybrid: compute and store gradients, don't update
             return self._process_forward_fo_no_update(
                 hidden_states, presents, input_shape, labels, lm_mask,
-                option_len, forward_payload.batch_id, mode
+                option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
         elif phase == 'zo_fo_inference':
             # ZO/FO hybrid: inference only
             return self._process_forward_zo(
                 hidden_states, presents, input_shape, labels, lm_mask,
-                option_len, forward_payload.batch_id, mode
+                option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
         elif phase == 'fo_backward':
             # FO/ZO hybrid or pure FO: compute gradients and return them
             return self._process_forward_fo(
                 hidden_states, presents, input_shape, labels, lm_mask, 
-                option_len, forward_payload.batch_id, mode
+                option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
         elif self.server_mode == "fo" and phase not in ['perturb_pos', 'perturb_neg', 'restore']:
             # Pure FO mode: compute gradients and update
             return self._process_forward_fo(
                 hidden_states, presents, input_shape, labels, lm_mask, 
-                option_len, forward_payload.batch_id, mode
+                option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
         else:
             # ZO mode (including FO/ZO hybrid with perturbation phases): no gradients needed
             return self._process_forward_zo(
                 hidden_states, presents, input_shape, labels, lm_mask,
-                option_len, forward_payload.batch_id, mode
+                option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
     
     def _process_forward_zo(self, hidden_states, presents, input_shape, labels, lm_mask,
-                            option_len, batch_id, mode):
+                            option_len, num_options, batch_id, mode, input_ids=None):
         """ZO mode forward: inference only, no gradients"""
         server_module = self._get_server_module()
         with torch.inference_mode():
+            # For classification mode, we compute loss externally so don't pass lm_labels
+            compute_loss_externally = (num_options is not None) or (option_len is not None and self.args.only_train_option)
+            
             outputs = server_module(
                 input_ids_shape=input_shape,
                 hidden_states_client=hidden_states,
                 presents_client=presents,
-                lm_labels=labels if mode == "train" else None,
+                lm_labels=labels if (mode == "train" and not compute_loss_externally) else None,
                 lm_mask=lm_mask,
                 attention_mask=lm_mask,
             )
@@ -680,20 +944,15 @@ class DistributedServer:
                 return BackwardPayload(logits=logits.cpu(), batch_id=batch_id)
             
             if labels is not None:
-                logits, loss = outputs
-                
-                # Apply option_len masking if needed (matching run.py)
-                if option_len is not None and self.args.only_train_option:
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous().clone()
-                    
-                    for _i, _len in enumerate(option_len):
-                        if _len > 0:
-                            shift_labels[_i, :-_len] = -100
-                    
-                    loss_fct = CrossEntropyLoss(ignore_index=-100)
-                    vocab_size = logits.size(-1)
-                    loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+                if compute_loss_externally:
+                    # Get logits (model didn't compute loss)
+                    logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                    # Compute loss with classification/option_len support
+                    # Pass input_ids for correct shift_labels in classification mode
+                    loss = self._compute_loss(logits, labels, option_len, num_options, input_ids=input_ids)
+                else:
+                    # Model computed loss internally
+                    logits, loss = outputs
                 
                 # Ensure loss is a scalar (average if batch dimension present)
                 if isinstance(loss, torch.Tensor) and loss.ndim > 0:
@@ -706,7 +965,7 @@ class DistributedServer:
         return BackwardPayload(loss=loss_value, batch_id=batch_id)
     
     def _process_forward_fo_no_update(self, hidden_states, presents, input_shape, labels, lm_mask,
-                                       option_len, batch_id, mode):
+                                       option_len, num_options, batch_id, mode, input_ids=None):
         """ZO/FO hybrid: compute and store gradients but DON'T update
         
         Gradients are accumulated in .grad and applied later when update signal received.
@@ -717,31 +976,29 @@ class DistributedServer:
         server_module = self._get_server_module()
         server_module.train()
         # Note: Don't zero gradients - we'll accumulate and update later
+        
+        # For classification/option_len mode, compute loss externally
+        compute_loss_externally = (num_options is not None) or (option_len is not None and self.args.only_train_option)
 
         outputs = server_module(
             input_ids_shape=input_shape,
             hidden_states_client=hidden_states,
             presents_client=presents,
-            lm_labels=labels if mode == "train" else None,
+            lm_labels=labels if (mode == "train" and not compute_loss_externally) else None,
             lm_mask=lm_mask,
             attention_mask=lm_mask,
         )
         
         if labels is not None:
-            logits, loss = outputs
-            
-            # Apply option_len masking
-            if option_len is not None and self.args.only_train_option:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().clone()
-                
-                for _i, _len in enumerate(option_len):
-                    if _len > 0:
-                        shift_labels[_i, :-_len] = -100
-                
-                loss_fct = CrossEntropyLoss(ignore_index=-100)
-                vocab_size = logits.size(-1)
-                loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+            if compute_loss_externally:
+                # Get logits (model didn't compute loss)
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                # Compute loss with classification/option_len support
+                # Pass input_ids for correct shift_labels in classification mode
+                loss = self._compute_loss(logits, labels, option_len, num_options, input_ids=input_ids)
+            else:
+                # Model computed loss internally
+                logits, loss = outputs
             
             # Ensure loss is a scalar (average if batch dimension present)
             if isinstance(loss, torch.Tensor) and loss.ndim > 0:
@@ -759,7 +1016,7 @@ class DistributedServer:
         return BackwardPayload(loss=loss_value, batch_id=batch_id)
     
     def _process_forward_fo(self, hidden_states, presents, input_shape, labels, lm_mask,
-                            option_len, batch_id, mode):
+                            option_len, num_options, batch_id, mode, input_ids=None):
         """FO mode forward: compute gradients and return grad_activations"""
         # Enable gradient tracking on hidden_states (the split point)
         hidden_states = hidden_states.clone().detach().requires_grad_(True)
@@ -768,12 +1025,15 @@ class DistributedServer:
         server_module.train()
         if self._fo_optimizer:
             self._fo_optimizer.zero_grad()
+        
+        # For classification/option_len mode, compute loss externally
+        compute_loss_externally = (num_options is not None) or (option_len is not None and self.args.only_train_option)
 
         outputs = server_module(
             input_ids_shape=input_shape,
             hidden_states_client=hidden_states,
             presents_client=presents,
-            lm_labels=labels if mode == "train" else None,
+            lm_labels=labels if (mode == "train" and not compute_loss_externally) else None,
             lm_mask=lm_mask,
             attention_mask=lm_mask,
         )
@@ -783,20 +1043,15 @@ class DistributedServer:
             return BackwardPayload(logits=logits.cpu(), batch_id=batch_id)
         
         if labels is not None:
-            logits, loss = outputs
-            
-            # Apply option_len masking if needed (matching run.py)
-            if option_len is not None and self.args.only_train_option:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().clone()
-                
-                for _i, _len in enumerate(option_len):
-                    if _len > 0:
-                        shift_labels[_i, :-_len] = -100
-                
-                loss_fct = CrossEntropyLoss(ignore_index=-100)
-                vocab_size = logits.size(-1)
-                loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+            if compute_loss_externally:
+                # Get logits (model didn't compute loss)
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                # Compute loss with classification/option_len support
+                # Pass input_ids for correct shift_labels in classification mode
+                loss = self._compute_loss(logits, labels, option_len, num_options, input_ids=input_ids)
+            else:
+                # Model computed loss internally
+                logits, loss = outputs
             
             # Ensure loss is a scalar (average if batch dimension present)
             if isinstance(loss, torch.Tensor) and loss.ndim > 0:
@@ -824,20 +1079,22 @@ class DistributedServer:
     def run(self):
         """Main server loop"""
         logger.info("Starting Distributed Server...")
-        self.load_model()
         
-        # Start GPU memory tracking
+        # Start GPU memory tracking BEFORE model loading to capture full memory usage
         self.memory_tracker.start_tracking()
         
-        self.backend = create_backend(
-            backend_type=self.args.backend,
-            mode='server',
-            host=self.args.host,
-            port=self.args.port,
-            device=str(self.device),
-        )
+        with count_time("Loading server model"):
+            self.load_model()
         
-        self.backend.start()
+        with count_time("Starting backend server"):
+            self.backend = create_backend(
+                backend_type=self.args.backend,
+                mode='server',
+                host=self.args.host,
+                port=self.args.port,
+                device=str(self.device),
+            )
+            self.backend.start()
         step = 0
         received_data = False  # Track if we received actual training data
         
@@ -892,8 +1149,10 @@ class DistributedServer:
                     update_phase = "perturb_pos" if self.args.zo_variant == "forward" else "perturb_neg"
                     wait_for_update = (phase == update_phase)
                 elif self.server_mode == "fo" and phase == "zo_fo_inference":
-                    # ZO/FO hybrid: client finished both forwards, waiting for update
-                    wait_for_update = True
+                    # ZO/FO hybrid: only wait for update on the LAST perturbation
+                    pert_idx = getattr(forward_payload, 'perturbation_idx', 0)
+                    num_perts = getattr(forward_payload, 'num_perturbations', 1)
+                    wait_for_update = (pert_idx == num_perts - 1)
                 
                 if wait_for_update:
                     try:
@@ -912,6 +1171,9 @@ class DistributedServer:
                                 self._fo_optimizer.zero_grad()
                     except Exception as e:
                         logger.warning(f"Failed to receive update signal: {e}")
+                
+                # Update GPU memory peak tracking after potential optimizer step
+                self.memory_tracker.update_peak()
                 
                 if step % self.args.logging_steps == 0:
                     loss_str = f"loss={backward_payload.loss:.4f}" if backward_payload.loss else ""
@@ -973,7 +1235,8 @@ class DistributedClient:
         self._fo_optimizer = None  # FO optimizer (initialized if client_mode == "fo")
         
         # GPU memory tracking
-        self.memory_tracker = GPUMemoryTracker(device=self.device, role="client")
+        # Track all visible GPUs when using DataParallel, otherwise track only primary device.
+        self.memory_tracker = GPUMemoryTracker(device=self.device, role="client", track_all_devices=self.use_data_parallel)
         
         # Resolve server mode for hybrid modes
         self.server_mode = args.server_optimizer
@@ -982,6 +1245,12 @@ class DistributedClient:
         
     def load_model(self):
         """Load client portion of split model"""
+        # Start GPU memory tracking BEFORE any CUDA allocations for accurate peak measurement.
+        # Note: client/server are separate processes, so each process can only measure its own
+        # allocations (still correct per-role peak, even on a single physical GPU).
+        if not self.memory_tracker.tracking:
+            self.memory_tracker.start_tracking()
+
         logger.info(f"Loading client model: {self.args.model_name}")
         
         if "opt" in self.args.model_name.lower():
@@ -1231,6 +1500,8 @@ class DistributedClient:
         for name, param in self._sorted_params:
             z = self._generate_perturbation(param)
             param.data = param.data + scaling_factor * z * self.args.zo_eps
+        
+        return torch.get_rng_state()
             
     def _update_parameters(self, seed: int, projected_grad: float):
         """Update client parameters - matching trainer.py"""
@@ -1242,15 +1513,21 @@ class DistributedClient:
                     projected_grad * z + self.args.weight_decay * param.data)
             else:
                 param.data = param.data - self.client_lr * (projected_grad * z)
+        
+        return torch.get_rng_state()
     
     def _forward_to_server(self, input_ids, labels, attention_mask, step, 
-                          seed=None, phase=None, option_len=None, mode="train",
-                          requires_grad=False):
+                          seed=None, phase=None, option_len=None, num_options=None,
+                          mode="train", requires_grad=False, rng_state=None,
+                          perturbation_idx=0, num_perturbations=1):
         """Send forward through client to server, return loss/logits (and optionally grad_activations)
         
         Args:
             requires_grad: If True, enable gradient tracking for FO mode.
                           Client will store output for backward pass.
+            num_options: List of num_options for classification-style training (train_as_classification)
+            perturbation_idx: Current perturbation index (0 to num_perturbations-1)
+            num_perturbations: Total number of perturbations in this step
         """
         # Get the actual client module (handles Accelerate/DDP wrapping)
         client_module = self._get_client_module()
@@ -1273,12 +1550,17 @@ class DistributedClient:
             presents=[p.detach().cpu() if p is not None else None for p in presents] if presents else None,
             input_shape=input_ids.shape,
             seed=seed,
+            rng_state=rng_state,  # For continuous RNG mode
             batch_id=step,
             labels=labels.cpu(),
+            input_ids=input_ids.cpu(),  # Always send input_ids for correct loss computation
             attention_mask=attention_mask.cpu() if attention_mask is not None else None,
             phase=phase,
             option_len=option_len,
+            num_options=num_options,
             mode=mode,
+            perturbation_idx=perturbation_idx,
+            num_perturbations=num_perturbations,
         )
         
         self.backend.send_forward(forward_payload)
@@ -1323,6 +1605,10 @@ class DistributedClient:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         option_len = inputs.get('option_len', None)
+        num_options = inputs.get('num_options', None)  # For train_as_classification
+        
+        # Check for continuous RNG mode
+        use_continuous_rng = getattr(self.args, 'zo_continuous_rng', False)
         
         # Generate seeds for all perturbations
         seeds = [np.random.randint(1000000000) for _ in range(self.args.num_pert)]
@@ -1330,13 +1616,19 @@ class DistributedClient:
         if self.args.zo_variant == 'forward':
             # RGE-forward: baseline + perturbed
             loss0 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=None, phase=None, option_len=option_len)
+                                           seed=None, phase=None, option_len=option_len,
+                                           num_options=num_options)
             loss_for_log = loss0
             
             for seed in seeds:
-                self._perturb_parameters(seed, scaling_factor=1)
+                # Perturb client +ε and get RNG state
+                rng_state = self._perturb_parameters(seed, scaling_factor=1)
+                
+                # Send to server with RNG state for continuous mode
                 loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                               seed=seed, phase='perturb_pos', option_len=option_len)
+                                               seed=seed, phase='perturb_pos', option_len=option_len,
+                                               num_options=num_options,
+                                               rng_state=rng_state if use_continuous_rng else None)
                 
                 # Restore client parameters
                 self._perturb_parameters(seed, scaling_factor=-1)
@@ -1350,15 +1642,23 @@ class DistributedClient:
             loss_for_log = None
             
             for seed in seeds:
-                self._perturb_parameters(seed, scaling_factor=1)
+                # Perturb client +ε and get RNG state
+                rng_state_pos = self._perturb_parameters(seed, scaling_factor=1)
+                
                 loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                               seed=seed, phase='perturb_pos', option_len=option_len)
+                                               seed=seed, phase='perturb_pos', option_len=option_len,
+                                               num_options=num_options,
+                                               rng_state=rng_state_pos if use_continuous_rng else None)
                 if loss_for_log is None:
                     loss_for_log = loss1
                 
-                self._perturb_parameters(seed, scaling_factor=-2)
+                # Perturb client to -ε and get RNG state
+                rng_state_neg = self._perturb_parameters(seed, scaling_factor=-2)
+                
                 loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                               seed=seed, phase='perturb_neg', option_len=option_len)
+                                               seed=seed, phase='perturb_neg', option_len=option_len,
+                                               num_options=num_options,
+                                               rng_state=rng_state_neg if use_continuous_rng else None)
                 
                 # Restore client parameters (no forward pass needed - just local restore)
                 self._perturb_parameters(seed, scaling_factor=1)
@@ -1391,6 +1691,7 @@ class DistributedClient:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         option_len = inputs.get('option_len', None)
+        num_options = inputs.get('num_options', None)  # For train_as_classification
         
         # Zero gradients
         if self._fo_optimizer:
@@ -1403,7 +1704,7 @@ class DistributedClient:
             # Forward with gradient tracking
             loss, grad_activations = self._forward_to_server(
                 input_ids, labels, attention_mask, step,
-                option_len=option_len, requires_grad=True
+                option_len=option_len, num_options=num_options, requires_grad=True
             )
             
             # Backward through client using gradient from server
@@ -1416,7 +1717,7 @@ class DistributedClient:
             # No trainable params on client, just forward (server still trains via FO)
             loss = self._forward_to_server(
                 input_ids, labels, attention_mask, step,
-                option_len=option_len, requires_grad=False
+                option_len=option_len, num_options=num_options, requires_grad=False
             )
         
         # Update client parameters (if optimizer exists)
@@ -1445,33 +1746,51 @@ class DistributedClient:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         option_len = inputs.get('option_len', None)
+        num_options = inputs.get('num_options', None)  # For train_as_classification
         
         seeds = [np.random.randint(1000000000) for _ in range(self.args.num_pert)]
+        num_pert = self.args.num_pert
         
         loss_for_log = None
         
-        for seed in seeds:
-            # Phase 1: Perturb client +ε, server computes gradients (no update)
+        # Accumulate gradient contributions for client ZO update
+        accumulated_grads = []  # List of (seed, projected_grad) pairs
+        
+        for k, seed in enumerate(seeds):
+            # Phase 1: Perturb client +ε, server computes gradients (scaled by 1/num_pert, no update)
             self._perturb_parameters(seed, scaling_factor=1)
             loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='zo_fo_compute_grad', option_len=option_len)
+                                           seed=seed, phase='zo_fo_inference', option_len=option_len,
+                                           num_options=num_options,
+                                           perturbation_idx=k, num_perturbations=num_pert)
             if loss_for_log is None:
                 loss_for_log = loss1
             
             # Phase 2: Perturb client to -ε, server inference only
             self._perturb_parameters(seed, scaling_factor=-2)
             loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='zo_fo_inference', option_len=option_len)
+                                           seed=seed, phase='zo_fo_inference', option_len=option_len,
+                                           num_options=num_options,
+                                           perturbation_idx=k, num_perturbations=num_pert)
             
             # Restore client
             self._perturb_parameters(seed, scaling_factor=1)
             
             # Update client with ZO gradient
-            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * self.args.num_pert)
+            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * num_pert)
+            accumulated_grads.append((seed, projected_grad))
+        
+        # Apply all client ZO updates at once (mean gradient applied)
+        for seed, projected_grad in accumulated_grads:
             self._update_parameters(seed, projected_grad)
-            
-            # Signal server to update with stored gradients
-            self._send_update_signal(seed, projected_grad, restore_scaling_factor=1)
+        
+        # ONE server backward pass with updated client state
+        # Server does: forward → backward → optimizer.step()
+        # grad_activations returned but ignored (client uses ZO, not FO)
+        self._forward_to_server(input_ids, labels, attention_mask, step,
+                               phase='fo_backward', option_len=option_len,
+                               num_options=num_options,
+                               perturbation_idx=0, num_perturbations=1)
         
         return loss_for_log
     
@@ -1486,6 +1805,7 @@ class DistributedClient:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         option_len = inputs.get('option_len', None)
+        num_options = inputs.get('num_options', None)  # For train_as_classification
         
         seeds = [np.random.randint(1000000000) for _ in range(self.args.num_pert)]
         loss_for_log = None
@@ -1493,13 +1813,15 @@ class DistributedClient:
         for seed in seeds:
             # Server perturbs +ε (indicated by phase)
             loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='perturb_pos', option_len=option_len)
+                                           seed=seed, phase='perturb_pos', option_len=option_len,
+                                           num_options=num_options)
             if loss_for_log is None:
                 loss_for_log = loss1
             
             # Server perturbs to -ε
             loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='perturb_neg', option_len=option_len)
+                                           seed=seed, phase='perturb_neg', option_len=option_len,
+                                           num_options=num_options)
             
             # Send update signal to server for ZO update
             projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * self.args.num_pert)
@@ -1515,7 +1837,7 @@ class DistributedClient:
             # Forward with gradient tracking for client FO
             loss, grad_activations = self._forward_to_server(
                 input_ids, labels, attention_mask, step,
-                option_len=option_len, requires_grad=True, phase='fo_backward'
+                option_len=option_len, num_options=num_options, requires_grad=True, phase='fo_backward'
             )
             
             # Backward through client using gradient from server
@@ -1533,10 +1855,12 @@ class DistributedClient:
     def train(self, train_samples, eval_samples):
         """Training loop - matching run.py Framework.train()"""
         if self.client_model is None:
+            # load_model() will ensure tracking is started before any model CUDA allocations.
             self.load_model()
-        
-        # Start GPU memory tracking
-        self.memory_tracker.start_tracking()
+        elif not self.memory_tracker.tracking:
+            # Fallback: if model was loaded elsewhere without starting tracking, start now.
+            # (This cannot retroactively include model-load allocations, but avoids crashing.)
+            self.memory_tracker.start_tracking()
         
         # Store eval_samples for periodic evaluation
         self._eval_samples = eval_samples
@@ -1583,8 +1907,8 @@ class DistributedClient:
                     })
             return data
         
-        logger.info(f"Converting {len(train_samples)} training samples...")
-        train_dataset = HFDataset(_convert(train_samples))
+        with count_time("Tokenizing training samples"):
+            train_dataset = HFDataset(_convert(train_samples))
         
         if self.args.train_as_classification:
             collator = DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8)
@@ -1692,6 +2016,13 @@ class DistributedClient:
     
     def one_step_pred(self, train_samples, eval_sample, verbose=False):
         """Single prediction - matching run.py Framework.one_step_pred()"""
+        verbose = verbose or self.args.verbose
+        
+        if verbose:
+            logger.info("========= Example =========")
+            logger.info(f"Candidate: {eval_sample.candidates}")
+            logger.info(f"Correct candidate: {eval_sample.correct_candidate}")
+        
         encoded_candidates, option_lens = encode_prompt(
             self.task, self.task.get_template(), train_samples, eval_sample, 
             self.tokenizer, max_length=self.args.max_length
@@ -1700,9 +2031,22 @@ class DistributedClient:
         outputs = []
         for candidate_id, encoded_candidate in enumerate(encoded_candidates):
             selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
+            
+            if verbose:
+                if candidate_id == 0:
+                    logger.info("=== Candidate %d ===" % candidate_id)
+                    logger.info(self.tokenizer.decode(encoded_candidate))
+                else:
+                    logger.info("=== Candidate %d (without context)===" % candidate_id)
+                    logger.info(self.tokenizer.decode(encoded_candidate).split(self.task.train_sep)[-1])
+                logger.info(f"Log probabilities of the option tokens: {selected_log_probs}")
+            
             outputs.append(selected_log_probs)
         
         scores = [x.mean().item() for x in outputs]
+        
+        if verbose:
+            logger.info(f"Prediction scores: {scores}")
         
         if isinstance(eval_sample.correct_candidate, list):
             correct_candidate_id = [eval_sample.candidates.index(c) for c in eval_sample.correct_candidate]
@@ -1720,6 +2064,12 @@ class DistributedClient:
             predictions.append(
                 self.one_step_pred(train_samples, eval_sample, verbose=(eval_id < 3))
             )
+            # Update peak during evaluation too
+            if eval_id % 10 == 0:
+                self.memory_tracker.update_peak()
+        
+        # Final update after all samples
+        self.memory_tracker.update_peak()
         
         metrics = {"accuracy": calculate_metric(predictions)}
         
@@ -1799,19 +2149,26 @@ def main():
         logger.info(f"Loaded {len(train_samples)} train, {len(dev_samples) if dev_samples else 0} dev, {len(eval_samples)} eval")
         
         client = DistributedClient(args, task)
-        client.load_model()
+        
+        # Start GPU memory tracking BEFORE model loading to capture full memory usage
+        client.memory_tracker.start_tracking()
+        with count_time("Loading client model"):
+            client.load_model()
         
         try:
-            client.connect()
+            with count_time("Connecting to server"):
+                client.connect()
             
             if args.trainer != "none":
-                client.train(train_samples, dev_samples if dev_samples else eval_samples)
+                with count_time("Training"):
+                    client.train(train_samples, dev_samples if dev_samples else eval_samples)
             
-            logger.info("Running evaluation...")
-            metrics = client.evaluate([], eval_samples)
+            with count_time("Evaluation"):
+                metrics = client.evaluate([], eval_samples)
             
             if dev_samples:
-                dev_metrics = client.evaluate([], dev_samples)
+                with count_time("Dev evaluation"):
+                    dev_metrics = client.evaluate([], dev_samples)
                 for m in dev_metrics:
                     metrics["dev_" + m] = dev_metrics[m]
             
