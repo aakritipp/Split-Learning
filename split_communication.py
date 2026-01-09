@@ -149,6 +149,7 @@ class ZOMetadata:
         step_phase: Current phase ("perturb_pos", "perturb_neg", "restore", "update")
         projected_grad: The computed gradient estimate for update phase
         restore_scaling_factor: Scaling factor to restore params before update
+        accumulated_updates: List of (seed, projected_grad) tuples for batch update
     """
     seed: int
     rng_state: Optional[torch.Tensor] = None
@@ -159,6 +160,7 @@ class ZOMetadata:
     restore_scaling_factor: int = 1  # For restoring params before update
     perturbation_idx: int = 0  # For ZO-FO: track which perturbation we're on
     num_perturbations: int = 1  # For ZO-FO: total perturbations to know when to step
+    accumulated_updates: Optional[List[Tuple[int, float]]] = None  # For batched ZO updates
 
 
 # =============================================================================

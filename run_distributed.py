@@ -461,6 +461,7 @@ class DistributedServer:
         self._sorted_params = None
         self._fo_optimizer = None  # FO optimizer (initialized if server_mode == "fo")
         self.config = None  # Model config (for pad_token_id, vocab_size, etc.)
+        self._pending_zo_updates = []  # Collect ZO updates to apply after all perturbations
         
         # GPU memory tracking
         # Track all visible GPUs when using DataParallel, otherwise track only primary device.
@@ -762,6 +763,38 @@ class DistributedServer:
         
         return torch.get_rng_state()
     
+    def _update_parameters_accumulated(self, seed_grad_pairs: list):
+        """
+        Apply all ZO gradient updates as a single step with proper weight decay handling.
+        
+        Instead of applying K separate updates (which applies weight decay K times),
+        this accumulates all gradient contributions first, then applies one update.
+        
+        Args:
+            seed_grad_pairs: List of (seed, projected_grad) tuples
+        """
+        if not seed_grad_pairs:
+            return
+        
+        # First pass: accumulate all gradient contributions per parameter
+        param_updates = {}
+        for name, param in self._sorted_params:
+            param_updates[name] = torch.zeros_like(param.data)
+        
+        for seed, projected_grad in seed_grad_pairs:
+            torch.manual_seed(seed)
+            for name, param in self._sorted_params:
+                z = self._generate_perturbation(param)
+                param_updates[name] += projected_grad * z
+        
+        # Second pass: apply one update with weight decay applied once
+        for name, param in self._sorted_params:
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.data = param.data - self.server_lr * (
+                    param_updates[name] + self.args.weight_decay * param.data)
+            else:
+                param.data = param.data - self.server_lr * param_updates[name]
+    
     def _compute_loss(self, logits, labels, option_len, num_options, input_ids=None):
         """
         Compute loss with support for LM-style training with option_len masking.
@@ -897,8 +930,8 @@ class DistributedServer:
                 hidden_states, presents, input_shape, labels, lm_mask,
                 option_len, num_options, forward_payload.batch_id, mode, input_ids
             )
-        elif phase == 'zo_fo_inference':
-            # ZO/FO hybrid: inference only
+        elif phase in ('zo_fo_inference', 'zo_fo_last_inference'):
+            # ZO/FO hybrid: inference only (zo_fo_last_inference triggers update wait in run loop)
             return self._process_forward_zo(
                 hidden_states, presents, input_shape, labels, lm_mask,
                 option_len, num_options, forward_payload.batch_id, mode, input_ids
@@ -1148,11 +1181,9 @@ class DistributedServer:
                 if self.server_mode == "zo" and seed is not None:
                     update_phase = "perturb_pos" if self.args.zo_variant == "forward" else "perturb_neg"
                     wait_for_update = (phase == update_phase)
-                elif self.server_mode == "fo" and phase == "zo_fo_inference":
-                    # ZO/FO hybrid: only wait for update on the LAST perturbation
-                    pert_idx = getattr(forward_payload, 'perturbation_idx', 0)
-                    num_perts = getattr(forward_payload, 'num_perturbations', 1)
-                    wait_for_update = (pert_idx == num_perts - 1)
+                elif self.server_mode == "fo" and phase == "zo_fo_last_inference":
+                    # ZO/FO hybrid (Option 2): last forward done, apply stored gradients ONCE
+                    wait_for_update = True
                 
                 if wait_for_update:
                     try:
@@ -1164,7 +1195,18 @@ class DistributedServer:
                                 if projected_grad is not None and zo_metadata.seed is not None:
                                     restore_factor = getattr(zo_metadata, 'restore_scaling_factor', 1)
                                     self._perturb_parameters(zo_metadata.seed, restore_factor)
-                                    self._update_parameters(zo_metadata.seed, projected_grad)
+                                    
+                                    # Collect update for later (don't apply yet)
+                                    self._pending_zo_updates.append((zo_metadata.seed, projected_grad))
+                                    
+                                    # Check if this is the last perturbation
+                                    pert_idx = getattr(zo_metadata, 'perturbation_idx', 0)
+                                    num_pert = getattr(zo_metadata, 'num_perturbations', 1)
+                                    
+                                    if pert_idx == num_pert - 1:
+                                        # Last perturbation: apply all collected updates as ONE step
+                                        self._update_parameters_accumulated(self._pending_zo_updates)
+                                        self._pending_zo_updates = []  # Clear for next step
                             elif self.server_mode == "fo" and self._fo_optimizer:
                                 # FO mode (ZO/FO hybrid): apply stored gradients
                                 self._fo_optimizer.step()
@@ -1516,6 +1558,38 @@ class DistributedClient:
         
         return torch.get_rng_state()
     
+    def _update_parameters_accumulated(self, seed_grad_pairs: list):
+        """
+        Apply all ZO gradient updates as a single step with proper weight decay handling.
+        
+        Instead of applying K separate updates (which applies weight decay K times),
+        this accumulates all gradient contributions first, then applies one update.
+        
+        Args:
+            seed_grad_pairs: List of (seed, projected_grad) tuples
+        """
+        if not seed_grad_pairs:
+            return
+        
+        # First pass: accumulate all gradient contributions per parameter
+        param_updates = {}
+        for name, param in self._sorted_params:
+            param_updates[name] = torch.zeros_like(param.data)
+        
+        for seed, projected_grad in seed_grad_pairs:
+            torch.manual_seed(seed)
+            for name, param in self._sorted_params:
+                z = self._generate_perturbation(param)
+                param_updates[name] += projected_grad * z
+        
+        # Second pass: apply one update with weight decay applied once
+        for name, param in self._sorted_params:
+            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                param.data = param.data - self.client_lr * (
+                    param_updates[name] + self.args.weight_decay * param.data)
+            else:
+                param.data = param.data - self.client_lr * param_updates[name]
+    
     def _forward_to_server(self, input_ids, labels, attention_mask, step, 
                           seed=None, phase=None, option_len=None, num_options=None,
                           mode="train", requires_grad=False, rng_state=None,
@@ -1574,7 +1648,8 @@ class DistributedClient:
             return backward_payload.loss, backward_payload.grad_activations
         return backward_payload.loss
     
-    def _send_update_signal(self, seed: int, projected_grad: float, restore_scaling_factor: int = 1):
+    def _send_update_signal(self, seed: int, projected_grad: float, restore_scaling_factor: int = 1,
+                            perturbation_idx: int = 0, num_perturbations: int = 1):
         """Send update signal to server with restore info
         
         Args:
@@ -1583,6 +1658,8 @@ class DistributedClient:
             restore_scaling_factor: Scaling factor to restore parameters before update
                 - For central variant (after -2ε): use +1 to go back to θ
                 - For forward variant (after +ε): use -1 to go back to θ
+            perturbation_idx: Current perturbation index (0 to num_perturbations-1)
+            num_perturbations: Total number of perturbations
         """
         zo_metadata = ZOMetadata(
             seed=seed,
@@ -1591,6 +1668,8 @@ class DistributedClient:
             step_phase='update',
             projected_grad=projected_grad,
             restore_scaling_factor=restore_scaling_factor,
+            perturbation_idx=perturbation_idx,
+            num_perturbations=num_perturbations,
         )
         self.backend.send_zo_metadata(zo_metadata)
     
@@ -1620,7 +1699,11 @@ class DistributedClient:
                                            num_options=num_options)
             loss_for_log = loss0
             
-            for seed in seeds:
+            # Collect updates to apply after all perturbations
+            pending_updates = []
+            num_pert = len(seeds)
+            
+            for pert_idx, seed in enumerate(seeds):
                 # Perturb client +ε and get RNG state
                 rng_state = self._perturb_parameters(seed, scaling_factor=1)
                 
@@ -1628,27 +1711,38 @@ class DistributedClient:
                 loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
                                                seed=seed, phase='perturb_pos', option_len=option_len,
                                                num_options=num_options,
-                                               rng_state=rng_state if use_continuous_rng else None)
+                                               rng_state=rng_state if use_continuous_rng else None,
+                                               perturbation_idx=pert_idx, num_perturbations=num_pert)
                 
                 # Restore client parameters
                 self._perturb_parameters(seed, scaling_factor=-1)
                 
                 projected_grad = (loss1 - loss0) / (self.args.zo_eps * self.args.num_pert)
-                self._update_parameters(seed, projected_grad)
+                pending_updates.append((seed, projected_grad))
                 # For forward variant: after +1 perturbation, restore with -1
-                self._send_update_signal(seed, projected_grad, restore_scaling_factor=-1)
+                # Send update signal so server can restore (update applied only on last perturbation)
+                self._send_update_signal(seed, projected_grad, restore_scaling_factor=-1,
+                                        perturbation_idx=pert_idx, num_perturbations=num_pert)
+            
+            # Apply all client updates as ONE step after all perturbations
+            self._update_parameters_accumulated(pending_updates)
         else:
             # RGE-central (default)
             loss_for_log = None
             
-            for seed in seeds:
+            # Collect updates to apply after all perturbations
+            pending_updates = []
+            num_pert = len(seeds)
+            
+            for pert_idx, seed in enumerate(seeds):
                 # Perturb client +ε and get RNG state
                 rng_state_pos = self._perturb_parameters(seed, scaling_factor=1)
                 
                 loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
                                                seed=seed, phase='perturb_pos', option_len=option_len,
                                                num_options=num_options,
-                                               rng_state=rng_state_pos if use_continuous_rng else None)
+                                               rng_state=rng_state_pos if use_continuous_rng else None,
+                                               perturbation_idx=pert_idx, num_perturbations=num_pert)
                 if loss_for_log is None:
                     loss_for_log = loss1
                 
@@ -1658,16 +1752,22 @@ class DistributedClient:
                 loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
                                                seed=seed, phase='perturb_neg', option_len=option_len,
                                                num_options=num_options,
-                                               rng_state=rng_state_neg if use_continuous_rng else None)
+                                               rng_state=rng_state_neg if use_continuous_rng else None,
+                                               perturbation_idx=pert_idx, num_perturbations=num_pert)
                 
                 # Restore client parameters (no forward pass needed - just local restore)
                 self._perturb_parameters(seed, scaling_factor=1)
                 # Tell server to restore via update signal (not forward pass)
                 
                 projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * self.args.num_pert)
-                self._update_parameters(seed, projected_grad)
+                pending_updates.append((seed, projected_grad))
                 # For central variant: after -2ε perturbation (at -ε), restore with +1
-                self._send_update_signal(seed, projected_grad, restore_scaling_factor=1)
+                # Send update signal so server can restore (update applied only on last perturbation)
+                self._send_update_signal(seed, projected_grad, restore_scaling_factor=1,
+                                        perturbation_idx=pert_idx, num_perturbations=num_pert)
+            
+            # Apply all client updates as ONE step after all perturbations
+            self._update_parameters_accumulated(pending_updates)
         
         return loss_for_log
     
@@ -1747,51 +1847,57 @@ class DistributedClient:
             attention_mask = attention_mask.to(self.device)
         option_len = inputs.get('option_len', None)
         num_options = inputs.get('num_options', None)  # For train_as_classification
-        
+
         seeds = [np.random.randint(1000000000) for _ in range(self.args.num_pert)]
-        num_pert = self.args.num_pert
-        
+        num_pert = len(seeds)
+
         loss_for_log = None
-        
-        # Accumulate gradient contributions for client ZO update
-        accumulated_grads = []  # List of (seed, projected_grad) pairs
-        
-        for k, seed in enumerate(seeds):
-            # Phase 1: Perturb client +ε, server computes gradients (scaled by 1/num_pert, no update)
+
+        for pert_idx, seed in enumerate(seeds):
+            is_first_pert = (pert_idx == 0)
+            is_last_pert = (pert_idx == num_pert - 1)
+
+            # Phase 1: Perturb client +ε
             self._perturb_parameters(seed, scaling_factor=1)
+            
+            if is_first_pert:
+                # First perturbation: server computes and stores gradients (snapshot)
+                phase1 = 'zo_fo_compute_grad'
+            else:
+                # Subsequent perturbations: server does inference only
+                phase1 = 'zo_fo_inference'
+            
             loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='zo_fo_inference', option_len=option_len,
+                                           seed=seed, phase=phase1, option_len=option_len,
                                            num_options=num_options,
-                                           perturbation_idx=k, num_perturbations=num_pert)
+                                           perturbation_idx=pert_idx, num_perturbations=num_pert)
             if loss_for_log is None:
                 loss_for_log = loss1
-            
+
             # Phase 2: Perturb client to -ε, server inference only
             self._perturb_parameters(seed, scaling_factor=-2)
-            loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
-                                           seed=seed, phase='zo_fo_inference', option_len=option_len,
-                                           num_options=num_options,
-                                           perturbation_idx=k, num_perturbations=num_pert)
             
+            # Mark if this is the last forward (triggers server to wait for update)
+            if is_last_pert:
+                phase2 = 'zo_fo_last_inference'
+            else:
+                phase2 = 'zo_fo_inference'
+            
+            loss2 = self._forward_to_server(input_ids, labels, attention_mask, step,
+                                           seed=seed, phase=phase2, option_len=option_len,
+                                           num_options=num_options,
+                                           perturbation_idx=pert_idx, num_perturbations=num_pert)
+
             # Restore client
             self._perturb_parameters(seed, scaling_factor=1)
-            
-            # Update client with ZO gradient
+
+            # Update client with ZO gradient (per-perturbation is correct for ZO)
             projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * num_pert)
-            accumulated_grads.append((seed, projected_grad))
-        
-        # Apply all client ZO updates at once (mean gradient applied)
-        for seed, projected_grad in accumulated_grads:
             self._update_parameters(seed, projected_grad)
-        
-        # ONE server backward pass with updated client state
-        # Server does: forward → backward → optimizer.step()
-        # grad_activations returned but ignored (client uses ZO, not FO)
-        self._forward_to_server(input_ids, labels, attention_mask, step,
-                               phase='fo_backward', option_len=option_len,
-                               num_options=num_options,
-                               perturbation_idx=0, num_perturbations=1)
-        
+
+        # After ALL perturbations: signal server to apply stored gradients ONCE
+        self._send_update_signal(seeds[-1], projected_grad, restore_scaling_factor=1)
+
         return loss_for_log
     
     def _hybrid_fo_zo_step(self, inputs, step):
@@ -1808,9 +1914,10 @@ class DistributedClient:
         num_options = inputs.get('num_options', None)  # For train_as_classification
         
         seeds = [np.random.randint(1000000000) for _ in range(self.args.num_pert)]
+        num_pert = len(seeds)
         loss_for_log = None
         
-        for seed in seeds:
+        for pert_idx, seed in enumerate(seeds):
             # Server perturbs +ε (indicated by phase)
             loss1 = self._forward_to_server(input_ids, labels, attention_mask, step,
                                            seed=seed, phase='perturb_pos', option_len=option_len,
@@ -1823,9 +1930,10 @@ class DistributedClient:
                                            seed=seed, phase='perturb_neg', option_len=option_len,
                                            num_options=num_options)
             
-            # Send update signal to server for ZO update
-            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * self.args.num_pert)
-            self._send_update_signal(seed, projected_grad, restore_scaling_factor=1)
+            # Send update signal to server for ZO update (server applies ONE step at the end)
+            projected_grad = (loss1 - loss2) / (2 * self.args.zo_eps * num_pert)
+            self._send_update_signal(seed, projected_grad, restore_scaling_factor=1,
+                                    perturbation_idx=pert_idx, num_perturbations=num_pert)
         
         # Now do FO update for client (with updated server)
         has_trainable = any(p.requires_grad for p in self.client_model.parameters())
